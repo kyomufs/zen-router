@@ -96,5 +96,5 @@ Reviewer 2eeaea21, package /tmp/zen-review-whole-branch-2.txt (467KB, base 95897
 - Traces A (429 both counters → stages → envelope+metadata+Retry-After), B (transport → false → 502 no metadata), C (non-streaming both lanes → one JSON, no SSE) all green in code+pins.
 - Gates 5/5 green at HEAD cf4f92d; package byte-identical to repo diff; scope clean (C/D/E absent); hermeticity intact.
 - 3 new nits (non-blocking): force-pin attribution note, empty PLAN SLICE header in package generator, no omitted-stream responses-lane test (redundant coverage).
-- Deferred minors now total 13 (7 from first run + 6 from T14-re) → Phase E checklist.
+- Deferred minors now total 13 (7 from first run + 6 from T14-re) → docs/superpowers/checklists/phase-e.md (DM-1..DM-13 + N-1..N-3, committed 893ea80).
 PLAN 1 CLOSED: all 14 ledger entries + APPROVE-PLAN1. Ready for user review of Plan 2 (docs/superpowers/plans/2026-10-07-zen-router-phase-c-tui.md) and Plan 3 (2026-10-07-dsh-opencode-zen-thin.md).
