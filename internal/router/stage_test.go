@@ -36,9 +36,11 @@ func writePoolFile(t *testing.T, ks []string) string {
 
 // fakeSwitch records which identity NextAttempt activated and hands back a
 // marker transport, so no WireGuard tunnel (root) is ever needed in tests.
+// calls counts invocations so churn can be asserted (finding 3).
 type fakeSwitch struct {
-	id *quota.WarpIdentity
-	rt http.RoundTripper
+	id    *quota.WarpIdentity
+	rt    http.RoundTripper
+	calls int
 }
 
 // testRouter bundles a Router with its test seams.
@@ -67,6 +69,7 @@ func newTestRouter(t *testing.T, opts Options) *testRouter {
 	sw := &fakeSwitch{rt: &http.Transport{}}
 	opts.IdentitySwitch = func(id *quota.WarpIdentity) (http.RoundTripper, error) {
 		sw.id = id
+		sw.calls++
 		return sw.rt, nil
 	}
 	registered := make(chan struct{}, 8)
@@ -280,6 +283,81 @@ func TestNextAttemptIdentityStep(t *testing.T) {
 		case <-tr.registered:
 			t.Error("spare registration scheduled inside cooldown")
 		case <-time.After(100 * time.Millisecond):
+		}
+
+		// A second report inside the same window must NOT churn the tunnel
+		// again: only the first in-window switch is persisted.
+		if _, ok := tr.NextAttempt(rep); ok {
+			t.Error("second inside-cooldown NextAttempt = true, want false")
+		}
+		if tr.sw.calls != 1 {
+			t.Errorf("identity switch called %d times, want 1 (one switch per window)", tr.sw.calls)
+		}
+		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
+			t.Errorf("active identity after second report = %v, want id1 unchanged", id)
+		}
+		if got := tr.store.Current(); got != "warp" {
+			t.Errorf("Current after second report = %s, want warp", got)
+		}
+		if snap := tr.store.Snapshot(); len(snap.Rotations) != 1 {
+			t.Errorf("Rotations after second report = %d, want 1 (no ping-pong)", len(snap.Rotations))
+		}
+	})
+
+	t.Run("warp reports spend identities so rotation reaches direct", func(t *testing.T) {
+		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
+		addIdentity(t, tr.store, "id0", time.Time{}) // active
+		addIdentity(t, tr.store, "id1", time.Time{})
+		tr.setWarpEgress(t)
+
+		// Report 1 (step 0): key stage — and the warp 429 stamps the ACTIVE
+		// identity id0 spent (spec §6: the limited IP belongs to it).
+		if _, ok := tr.NextAttempt(Report{
+			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
+			Key: "k1", Step: 0, RetryAfter: time.Hour,
+		}); !ok {
+			t.Fatal("report 1: expected key re-issue")
+		}
+		id := tr.store.ActiveIdentity()
+		if id == nil || id.SpentUntil <= time.Now().UnixMilli() {
+			t.Fatalf("active identity not stamped spent: %v", id)
+		}
+
+		// Report 2 (step 1): rotation to id1 — id0 leaves the active slot
+		// already spent.
+		att, ok := tr.NextAttempt(Report{
+			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
+			Key: "k2", Step: 1, RetryAfter: time.Hour,
+		})
+		if !ok || att.Step != 2 {
+			t.Fatalf("report 2: attempt = %+v ok=%v, want step 2", att, ok)
+		}
+		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
+			t.Fatalf("active identity after rotation = %v, want id1", id)
+		}
+
+		// Report 3 (step 0 again): stamps id1 spent too.
+		if _, ok := tr.NextAttempt(Report{
+			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
+			Key: "k1", Step: 0, RetryAfter: time.Hour,
+		}); !ok {
+			t.Fatal("report 3: expected key re-issue")
+		}
+
+		// Report 4 (step 1): id0 (non-active) spent and id1 (active on warp)
+		// spent → no fresh identity → stage 3 direct.
+		att, ok = tr.NextAttempt(Report{
+			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
+			Key: "k2", Step: 1, RetryAfter: time.Hour,
+		})
+		if !ok {
+			t.Fatal("report 4: expected direct attempt, got false")
+		}
+		if att.Step != 3 || att.Egress != proxy.EgressDirect {
+			t.Errorf("report 4: attempt = %+v, want step 3 direct", att)
+		}
+		if got := tr.store.Current(); got != "direct" {
+			t.Errorf("Current = %s, want direct", got)
 		}
 	})
 }
@@ -533,6 +611,71 @@ func TestReportRecordsBothCounters(t *testing.T) {
 		}
 		if ks.SpentUntil != eg.SpentUntil {
 			t.Errorf("key spentUntil = %d, want %d (same window)", ks.SpentUntil, eg.SpentUntil)
+		}
+	})
+
+	t.Run("empty egress defaults to current path", func(t *testing.T) {
+		// An Egress-less report must record against the router's current
+		// egress (the decision already treats it as the failed path) — not
+		// silently drop the egress counter.
+		tr := newTestRouter(t, Options{})
+		tr.NextAttempt(Report{
+			Kind:       zen.KindDailyLimit,
+			Key:        "k1",
+			Step:       0,
+			RetryAfter: time.Hour,
+		})
+		snap := tr.store.Snapshot()
+		if eg := snap.Egress["direct"]; eg == nil || eg.Daily429 != 1 {
+			t.Errorf("egress direct = %v, want Daily429=1 for the defaulted egress", eg)
+		}
+		if ks := snap.Keys["k1"]; ks == nil || ks.Daily429 != 1 {
+			t.Errorf("key k1 = %v, want Daily429=1", ks)
+		}
+	})
+
+	t.Run("warp report stamps the active identity", func(t *testing.T) {
+		tr := newTestRouter(t, Options{})
+		addIdentity(t, tr.store, "id0", time.Time{}) // active
+		tr.setWarpEgress(t)
+
+		before := time.Now()
+		tr.NextAttempt(Report{
+			Kind:       zen.KindDailyLimit,
+			Egress:     proxy.EgressWarp,
+			Key:        "k1",
+			Step:       0,
+			RetryAfter: 45 * time.Minute,
+		})
+		id := tr.store.ActiveIdentity()
+		if id == nil {
+			t.Fatal("active identity = nil")
+		}
+		if id.SpentUntil <= before.UnixMilli() {
+			t.Errorf("active identity SpentUntil = %d, want stamped to now+45m", id.SpentUntil)
+		}
+		if id.Last429At < before.UnixMilli() {
+			t.Errorf("active identity Last429At = %d, want stamped", id.Last429At)
+		}
+	})
+
+	t.Run("exhausted report still records both counters", func(t *testing.T) {
+		tr := newTestRouter(t, Options{})
+		if _, ok := tr.NextAttempt(Report{
+			Kind:       zen.KindDailyLimit,
+			Egress:     proxy.EgressDirect,
+			Key:        "k1",
+			Step:       3,
+			RetryAfter: time.Hour,
+		}); ok {
+			t.Error("NextAttempt at Step 3 = true, want false")
+		}
+		snap := tr.store.Snapshot()
+		if eg := snap.Egress["direct"]; eg == nil || eg.Daily429 != 1 {
+			t.Errorf("egress direct = %v, want Daily429=1 recorded before the false decision", eg)
+		}
+		if ks := snap.Keys["k1"]; ks == nil || ks.Daily429 != 1 {
+			t.Errorf("key k1 = %v, want Daily429=1 recorded before the false decision", ks)
 		}
 	})
 }

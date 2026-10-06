@@ -87,9 +87,11 @@ func (r *Router) Attempt() Attempt {
 //	                   stage and go straight to the rotation decision.
 //	  Step 1 → Step 2: switch to WARP with a fresh (unspent) pre-registered
 //	                   identity, synchronously — no registration. Inside
-//	                   RotationCooldown of the last rotation the switch is
-//	                   still PERSISTED for later requests, but this request
-//	                   gets no re-issue (false).
+//	                   RotationCooldown of the last rotation only the FIRST
+//	                   switch of the window is persisted for later requests
+//	                   (this request still gets no re-issue, and subsequent
+//	                   in-window reports return false without touching the
+//	                   tunnel — no A→B→A churn).
 //	  Step 2 → Step 3: direct, respecting the configured address family.
 //	                   No fresh identity left → fall through to Step 3.
 //	  Step ≥ 3        → false.
@@ -103,12 +105,15 @@ func (r *Router) Attempt() Attempt {
 // Every KindDailyLimit report is recorded against BOTH the egress and the
 // key before the decision (spec §6.1), even when it ends in false.
 func (r *Router) NextAttempt(rep Report) (Attempt, bool) {
+	// Default the failed egress BEFORE recording so an Egress-less report
+	// still increments the egress counter (the decision treats Current() as
+	// the failed path either way).
+	if rep.Egress == "" {
+		rep.Egress = r.Current()
+	}
 	now := time.Now()
 	if rep.Kind == zen.KindDailyLimit {
 		r.recordReport(rep, now)
-	}
-	if rep.Egress == "" {
-		rep.Egress = r.Current()
 	}
 
 	switch rep.Kind {
@@ -162,7 +167,12 @@ func accountScoped(rep Report) bool {
 
 // recordReport persists one daily-limit report against the egress it failed
 // on and the key it failed with (spec §6.1), with the spent window taken
-// from RetryAfter or synthesized to the next UTC midnight.
+// from RetryAfter or synthesized to the next UTC midnight. A warp-egress
+// report additionally stamps the ACTIVE identity's SpentUntil/Last429At —
+// the limited IP belongs to it, and without this the spent filter in
+// freshIdentityIndex could never trigger (spec §6 step 3, "warp fully spent
+// → direct", would be dead code). Workspace/account limits are exempt: they
+// are not IP-scoped (spec §4), so their identities stay usable.
 func (r *Router) recordReport(rep Report, now time.Time) {
 	until := quota.NextReset(now)
 	if rep.RetryAfter > 0 {
@@ -174,6 +184,13 @@ func (r *Router) recordReport(rep Report, now time.Time) {
 	if rep.Key != "" {
 		r.store.RecordKeyDaily429(rep.Key)
 		r.store.SetKeySpent(rep.Key, until)
+	}
+	if rep.Egress == proxy.EgressWarp && !accountScoped(rep) {
+		if id := r.store.ActiveIdentity(); id != nil {
+			id.SpentUntil = until.UnixMilli()
+			id.Last429At = now.UnixMilli()
+			r.store.SetWarp(*id) // replaces the active pool entry, persists
+		}
 	}
 }
 
@@ -206,9 +223,20 @@ func (r *Router) otherKey(current string) (string, bool) {
 // identityStep (stage 2): switch to WARP with a fresh pre-registered
 // identity from the pool. With no fresh identity left the decision falls
 // through to direct (stage 3). Cooldown: inside RotationCooldown of the last
-// rotation the synchronous switch is still executed and persisted (so later
-// requests start on the fresh identity), but THIS request gets no re-issue.
+// rotation only the FIRST switch of the window is persisted (so later
+// requests start on the fresh identity) and it yields no re-issue; further
+// in-window reports return false without switching — a cooldown burst must
+// not reconfigure the tunnel per request or ping-pong A→B→A.
 func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
+	r.mu.Lock()
+	inside := time.Since(r.lastRotate) < r.rotationCooldown
+	already := r.cooldownSwapped
+	from := r.egress
+	r.mu.Unlock()
+	if inside && already {
+		return Attempt{}, false
+	}
+
 	idx := r.freshIdentityIndex(now)
 	if idx < 0 {
 		return r.directStep(rep)
@@ -217,11 +245,6 @@ func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
 	if id == nil {
 		return r.directStep(rep)
 	}
-
-	r.mu.Lock()
-	inside := time.Since(r.lastRotate) < r.rotationCooldown
-	from := r.egress
-	r.mu.Unlock()
 
 	rt, err := r.switchIdentity(idx, id)
 	if err != nil {
@@ -237,10 +260,14 @@ func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
 		r.store.RecordRotation(string(from), string(proxy.EgressWarp), "fresh warp identity")
 	}
 	if inside {
+		r.mu.Lock()
+		r.cooldownSwapped = true
+		r.mu.Unlock()
 		return Attempt{}, false
 	}
 	r.mu.Lock()
 	r.lastRotate = time.Now()
+	r.cooldownSwapped = false
 	r.mu.Unlock()
 	r.scheduleSpareRegistration()
 	return Attempt{Key: rep.Key, Egress: proxy.EgressWarp, Transport: rt, Step: 2}, true

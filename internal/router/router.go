@@ -46,6 +46,10 @@ type Router struct {
 	identitySwitch func(*quota.WarpIdentity) (http.RoundTripper, error)
 	spareRegistrar func(context.Context) error
 	registering    bool
+	// cooldownSwapped records that the first identity switch inside the
+	// current rotation-cooldown window was already persisted, so further
+	// reports in the window return false without churning the tunnel.
+	cooldownSwapped bool
 }
 
 // Options configures a Router.
