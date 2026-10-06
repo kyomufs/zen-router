@@ -81,40 +81,98 @@ New packages: `internal/gateway` (OpenAI shim + Zen wire), `internal/tui`
 
 ## 4. External wire contract (daemon → opencode.ai)
 
-Ported from `dsh-opencode-zen` lib/index.js (live-audited 2026-10-02 against
-`sst/opencode` sources; an independent cross-check against upstream
-`sst/opencode` is running in the background for this spec — claims marked
-unverified stay TBD and will be folded in when it reports):
+Two sources: (a) live-audited behavior of `dsh-opencode-zen` lib/index.js
+(v0.15.1, works in production); (b) independent cross-check against upstream
+sources at `anomalyco/opencode` (repo moved from `sst/opencode`; branch `dev`,
+HEAD `3f393d78bfc3f0826b2c7080e57964c235704695`, fetched 2026-10-06).
+Where they disagree, both readings are recorded with a decision note.
 
 - **Endpoints**: `POST https://opencode.ai/zen/v1/chat/completions`,
-  `POST .../responses`, `GET .../models`. Auth: `Authorization: Bearer <key>`
-  with key pool round-robin (`public` fallback).
-- **Disguise headers** (union of every header the real CLI can send):
-  `user-agent: opencode/1.18.34`, `x-opencode-session-id`, `x-opencode-client: cli`,
-  `x-opencode-session`, `x-session-affinity`, `X-Session-Id`, `x-opencode-request`,
-  `x-opencode-project`.
-- **Canonical session id**: `ses_<6 hex timestamp><14 base62>` derived from
-  sha256("ses\x00" + conversation seed); stable per conversation, refreshed
-  request id per attempt (`req_<hex>`).
-- **Gate tools**: the anonymous lane 403s bodies without a bash+read agent shape;
-  `ensureFreeLaneShape` injects reserved `bash`/`read` function tools
-  ("Reserved for the host runtime; do not call it."), `tool_choice: none` only
-  when the caller had zero tools.
+  `POST .../responses`, `GET .../models` (GET/OPTIONS return CORS
+  `*`, `Allow-Methods: GET, POST, OPTIONS`). Auth: `Authorization: Bearer <key>`,
+  bare `public` == anonymous (`util/handler.ts:103-104`). Other lanes exist
+  upstream (`/messages` Anthropic, `/systemone`, Google
+  `/zen/v1/models/[model]`, Go tier `/zen/go/v1/*`) — **out of scope**, noted
+  for future agents that need them.
+- **Request headers** (`packages/opencode/src/session/llm/request.ts:187-206`,
+  server reads at `util/handler.ts:101-136`): the CLI sends
+  `x-opencode-session-id`, `x-opencode-session`, `x-opencode-request`,
+  `x-opencode-client` (default `cli`), `x-opencode-project`,
+  `user-agent: opencode/<version>`. **Server-side only** `x-opencode-session`,
+  `x-opencode-request`, `x-opencode-client`, `x-opencode-project`,
+  `user-agent` are read (metrics + headerModifier placeholders);
+  `x-opencode-session-id` is client-side only. The other union members the
+  plugin sends (`x-session-affinity`, `X-Session-Id`) are sent by the CLI only
+  for non-Zen providers — harmless, keep for max compatibility. Docs
+  (`go.mdx:110-116`) explicitly bless third-party use of a stable
+  `x-opencode-session` + own user-agent. **Routing side effect**: the gateway
+  derives `stickyId = session || workspace || ip` and hash-selects the upstream
+  provider from its tail (`handler.ts:172,639-646`) — stable session ids give
+  cache/provider stickiness; changing them per request hurts.
+- **Session id format** (confirmed): `ses_` + 12 lowercase hex (inverted
+  descending `ms*0x1000+counter` timestamp, 6 bytes) + 14 base62 = 26 chars
+  (`packages/schema/src/session-id.ts:5-14`, `identifier.ts:14-29`); schema
+  only checks the `ses` prefix. The plugin's derivation (sha256 of conversation
+  seed → same shape) is format-valid; descend-timestamp exactness is not
+  required server-side.
+- **Gate tools — DISCREPANCY (decision: keep)**: upstream source contains NO
+  bash/read tool injection and no `FreeTierError` (whole-tree search; only a
+  `_noop` copilot tool at `request.ts:159-175`). The anonymous-lane 403 that
+  motivated `ensureFreeLaneShape` was observed live against the production
+  gateway, which is not fully identical to this repo snapshot. Decision: keep
+  injecting reserved `bash`/`read` tools (`tool_choice: none` only when the
+  caller had zero tools) — it costs nothing and preserves live-working
+  behavior; revisit only if tests show it is unnecessary.
+- **Body handling**: gateway splices only the top-level `model` string and
+  appends `stream_options: {include_usage: true}` for `stream:true` on
+  oa-compat routes (`util/requestBody.ts`); everything else — including
+  `reasoning_effort` — passes through untouched (variant parsing is dead code
+  at this commit). Client-side effort clamping (below) remains required:
+  the Zen gateway historically 400s effort values outside a model's ladder,
+  and providers may reject them regardless.
 - **Models table** (9 ids, verified against `GET /zen/v1/models`): per-model
   `contextWindow`, `maxOutput`, `efforts` ladder, `vision`, `reasoningRequired`,
   `responses` flag (muse-spark-* answers only on `/responses`).
   `resolveReasoningEffort` clamps to the declared ladder (`off → none` on the
   chat wire, omitted on Responses; `reasoningRequired` models default to `high`).
-- **Error classification**: `FreeUsageLimitError|GoUsageLimitError|BlackUsageLimitError`
-  → daily-limit (429, `Retry-After` honored, midnight-UTC window), `ModelError`,
-  `RegionError`, 401 → invalid credential, 5xx → server, network/abort →
-  transport/timeout/aborted. `Retry-After` > 60s ⇒ long daily window, do not
-  sleep-and-retry inside the request — surface to the caller.
-- **Quota bucket key**: raw `x-real-ip`, truncated to the first four IPv6 groups —
-  IPv4 and IPv6 egresses are independent daily buckets; addresses in one /64 share
-  a bucket. Models without their own `rateLimit` share one per-IP bucket.
-  The gateway publishes **no** rate-limit headers; counters are observed
-  successes before the first daily-429 (lower bound), keyed by UTC day, kept 3 days.
+- **Error envelopes** (confirmed, `util/error.ts:1-29`, `handler.ts:455-543`):
+  `{"type":"error","error":{"type":"<Class>","message":"..."}}` with
+  `metadata` only on 429. Status map: 403 = `RegionError`/`DataPolicyError`;
+  401 = `AuthError`/`CreditsError`/`MonthlyLimitError`/`UserLimitError`/
+  `ModelError` (so "unknown model" is 401, not 400!); 429 =
+  `RateLimitError`/`FreeUsageLimitError`/`GoUsageLimitError`/
+  `BlackUsageLimitError` with `retry-after: <seconds>` only when the error
+  carries one (Go: `metadata.{workspace,limitName}`); 500 fallback; 499 client
+  abort. **Provider-originated errors** are relayed with `Error from provider
+  (Name): ` message prefix, provider-shaped body, status kept (404→400), and
+  upstream `retry-after` is **scrubbed** (only `content-type`/`cache-control`
+  forwarded) — so classification must parse the JSON `error.type`, never rely
+  on `Retry-After` alone; a 429 without `Retry-After` still means daily-window
+  for `*UsageLimitError` bodies.
+- **SSE**: raw byte passthrough (route format == provider format), gateway
+  appends one final cost chunk: oa-compat → `data: {"choices":[],"cost":...}`;
+  openai/anthropic → `event: ping` + `data: {"type":"ping","cost":...}`.
+  **The gateway never emits `data: [DONE]` itself** — terminators come from the
+  upstream provider and may be absent; the daemon's parser must treat
+  stream-close as terminator (plugin probe already does). Custom cost lines
+  (`"cost"` field, ping frames) must be ignored by the chat translator.
+- **Quota semantics** (confirmed, `util/ipRateLimiter.ts`,
+  `util/keyRateLimiter.ts`): IP lane for `allowAnonymous` models — bucket
+  `YYYYMMDD` UTC, `retry-after` = seconds to next UTC midnight, counter
+  increments only on **completed** responses (failed requests don't count);
+  a "new IP" (`lifetimeCount < 7×dailyLimit`) gets a **2× daily cap**;
+  models with a custom `rateLimit` get their own sub-bucket
+  (`YYYYMMDD+modelId[0:2]`). Key lane (non-anonymous): 1000 req/min per
+  key per model. Go/black quotas are rolling/weekly/monthly windows
+  (`handler.ts:832-930`). Numeric limits live in secret `Resource.ZEN_LIMITS`
+  — **not in repo, unverified**. IPv6 truncation to first 4 hextets confirmed
+  (`handler.ts:101-102`); counters are observed successes before the first
+  daily-429 (lower bound), keyed by UTC day, kept 3 days.
+- **Client retry reference** (opencode CLI, `session/retry.ts`): initial 2s,
+  ×2 backoff, ±25% jitter, max 30s without headers, 5 retries; honors
+  `retry-after-ms`/`retry-after`; `FreeUsageLimitError` → upsell
+  `https://opencode.ai/go`, not a plain retry. Our staged rotation (§6) is a
+  strict superset: rotate BEFORE sleeping through a daily window.
 
 ## 5. Client wire contract (agents → daemon)
 
@@ -124,7 +182,15 @@ unverified stay TBD and will be folded in when it reports):
 - `GET /v1/models` — OpenAI model list, served from the daemon's models table.
 - `POST /v1/responses` — passed through for agents that speak Responses natively (optional, low priority).
 - Errors: OpenAI-style JSON errors (`{"error": {"message", "type", "code"}}`)
-  mapped from Zen classification; `429` carries `Retry-After`.
+  mapped from Zen classification; `429` carries `Retry-After` **always** when
+  the daemon knows the daily window (computable to UTC midnight even when the
+  upstream scrubbed the header).
+- The daemon normalizes upstream quirks so clients see plain OpenAI behavior:
+  - emits `data: [DONE]` at stream end even though the gateway never does;
+  - drops gateway cost-chunk lines (`"cost"` field / `event: ping`) from
+    translated chat streams (usage comes from the real usage chunk);
+  - rewrites provider-shaped 429/401 bodies (`Error from provider (Name): …`)
+    into the OpenAI error envelope with a machine-readable `code`.
 - Loopback only by default (`127.0.0.1:8787`, override `ZEN_ROUTER_LISTEN`).
 
 ## 6. Staged rotation (approved strategy: pooled identity + keys, staged)
@@ -279,7 +345,7 @@ Until then the installed plugin v0.15.1 keeps running untouched.
 
 - **Protocol drift** (upstream changes Zen behavior): all protocol knowledge in
   one Go package; verified against the live-audited plugin behavior and a
-  background cross-check of `sst/opencode` sources (§4); models table
+  background cross-check of upstream `anomalyco/opencode` sources (§4); models table
   refreshable from `GET /models`.
 - **Cloudflare rate-limits identity registration**: lazy spare registration with
   jitter; on registration failure fall back to direct and surface in TUI.
