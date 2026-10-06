@@ -842,9 +842,11 @@ func TestResponsesAutoRoute(t *testing.T) {
 		h := New(rot, config.Default())
 		h.Upstream = up.srv.URL
 
-		// Client omits stream and over-asks effort: the handler must force
-		// stream:true and clamp "max" → "xhigh" before ChatToResponses.
-		clientBody := `{"model":"` + responsesModel + `",` +
+		// Client requests SSE explicitly while over-asking effort: the
+		// handler must still force stream:true upstream (and clamp "max" →
+		// "xhigh" before ChatToResponses) — the client flag only chooses
+		// the LOCAL rendering (buffered JSON when false/omitted).
+		clientBody := `{"model":"` + responsesModel + `","stream":true,` +
 			`"messages":[{"role":"user","content":"hello"}],"reasoning_effort":"max"}`
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, newChatRequest(clientBody))
@@ -863,7 +865,7 @@ func TestResponsesAutoRoute(t *testing.T) {
 
 		b := decodeJSONMap(t, u.Body)
 		if s, _ := b["stream"].(bool); !s {
-			t.Errorf("upstream stream = %v, want true (forced: client omitted it)", b["stream"])
+			t.Errorf("upstream stream = %v, want true (forced upstream regardless of the client flag)", b["stream"])
 		}
 		if _, ok := b["messages"]; ok {
 			t.Errorf("responses body carries chat-only key messages: %s", truncate(u.Body))

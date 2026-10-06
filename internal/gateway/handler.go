@@ -117,7 +117,9 @@ func (h *Handler) serveModels(w http.ResponseWriter) {
 
 // serveChat is the attempt loop: buffer ≤4 MiB, resolve the model, clamp
 // effort, shape the lane body, then execute attempts until the stream ends
-// or the failure path surfaces an envelope (plan Task 12 line 185).
+// or the failure path surfaces an envelope (plan Task 12 line 185). The
+// client's stream flag selects the sink only: SSE, or a buffered single
+// JSON completion when the client asked for no streaming (spec §5:179).
 func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -137,6 +139,17 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 			"zen: malformed JSON body: "+err.Error(), nil)
 		return
 	}
+
+	// Client stream flag: it decides ONLY the local rendering (spec §5:179
+	// standard OpenAI chat, whose default is false — only an explicit true
+	// gets SSE). Captured here, before lane shaping forces stream:true
+	// upstream: the upstream ALWAYS streams (relay framing, first-event and
+	// stall watchdogs, staged rotation and translation are unchanged, and
+	// the watchdogs still govern the UPSTREAM read below) — the flag only
+	// switches the client sink between SSE and the buffered JSON completion
+	// (buffer.go: frames accumulate in memory; ONE application/json body is
+	// written on a clean end, so only the CLIENT write is deferred).
+	streamReq, _ := body["stream"].(bool)
 
 	// Model first: spec §4 parity says unknown/gated model ids are a 401
 	// ModelError (not 400), mirrored locally since the daemon resolves the
@@ -179,7 +192,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 				"zen: "+err.Error(), nil)
 			return
 		}
-		respBody["stream"] = true // force SSE (carry-over bullet: pinned)
+		respBody["stream"] = true // upstream always streams (carry-over bullet: pinned)
 		if payload, err = json.Marshal(respBody); err != nil {
 			writeError(w, http.StatusInternalServerError, "InternalError",
 				"zen: encoding responses body: "+err.Error(), nil)
@@ -187,7 +200,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 		}
 		upPath = "/zen/v1/responses"
 	} else {
-		body["stream"] = true // force SSE so the relay always sees frames
+		body["stream"] = true // upstream always streams, whatever the client flag said
 		body["stream_options"] = map[string]any{"include_usage": true}
 		body = zen.EnsureFreeLaneShape(body)
 		var err error
@@ -213,13 +226,30 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 
 	// The stream latch lives for the whole request: a failure after the
 	// first byte may never re-issue, even if rotation offers an attempt.
+	// Sink selection: SSE goes straight to the clientStream; a client that
+	// did not ask for streaming gets a completionBuffer — nothing is
+	// written to the client before its single JSON flush, so the latch
+	// stays false there and the FULL rotation budget applies pre-flush
+	// (an exhausted budget or terminal failure then surfaces as a standard
+	// error envelope instead of a partial body).
 	stream := newClientStream(w)
+	var (
+		buf  *completionBuffer
+		sink relaySink = stream
+	)
+	if !streamReq {
+		buf = newCompletionBuffer(model.ID)
+		sink = buf
+	}
 	ctx := r.Context()
 	executed := 0
 	att := h.Rot.Attempt()
 
 	for {
 		executed++
+		if buf != nil {
+			buf.reset() // a failed attempt's frames must not leak into a re-issue
+		}
 
 		// One attempt: fresh req_ id, per-attempt transport, watchdog-wrapped
 		// body, lane relay with flush-per-frame.
@@ -308,7 +338,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 			defer resp.Body.Close()
 			wrapped := zen.NewWatchdog(attemptCtx, resp.Body, firstEvent, idle)
 			if useResponses {
-				st := newStampWriter(stream, zen.RandomID("chatcmpl", 16),
+				st := newStampWriter(sink, zen.RandomID("chatcmpl", 16),
 					model.ID, time.Now().Unix())
 				if err := zen.TranslateResponsesStream(wrapped, st); err != nil {
 					return false, streamFailure(err), "", nil
@@ -316,17 +346,23 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 				if err := st.close(); err != nil {
 					return false, streamFailure(err), "", nil
 				}
-			} else if err := zen.FilterChatStream(wrapped, stream); err != nil {
+			} else if err := zen.FilterChatStream(wrapped, sink); err != nil {
 				return false, streamFailure(err), "", nil
 			}
-			if err := stream.close(); err != nil {
+			if err := sink.close(); err != nil {
 				return false, streamFailure(err), "", nil
 			}
 			return true, nil, "", nil
 		}(att)
 
 		if done {
-			return // clean stream end (or the client vanished)
+			// Clean stream end. Buffered client: write the ONE
+			// chat.completion body (application/json, no SSE markers).
+			// Skipped when the client vanished (ctx.Err): nothing to write.
+			if buf != nil && ctx.Err() == nil {
+				buf.flush(w)
+			}
+			return // (or the client vanished)
 		}
 		if ctx.Err() != nil {
 			return
