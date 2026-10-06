@@ -43,6 +43,10 @@ const (
 	KindServer
 	// KindClient is the catch-all for other 4xx (and generic 403s).
 	KindClient
+	// KindTransport is a local transport failure — dial error, broken
+	// response body, or stream watchdog timeout — where the attempt never
+	// received a classifiable HTTP answer (Task 12).
+	KindTransport
 )
 
 // String returns a stable snake_case name for logs and client-facing codes.
@@ -66,6 +70,8 @@ func (k Kind) String() string {
 		return "server"
 	case KindClient:
 		return "client"
+	case KindTransport:
+		return "transport"
 	default:
 		return fmt.Sprintf("kind(%d)", int(k))
 	}
@@ -131,7 +137,7 @@ func (e *UpstreamError) IsRetryable() bool {
 		return false
 	}
 	switch e.Kind {
-	case KindDailyLimit, KindKeyRateLimit, KindServer, KindProviderRelay:
+	case KindDailyLimit, KindKeyRateLimit, KindServer, KindProviderRelay, KindTransport:
 		return true
 	default:
 		return false
