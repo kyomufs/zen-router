@@ -79,10 +79,6 @@ func (m Model) Ladder() []string {
 	return slices.Clone(src)
 }
 
-// ResponsesOnly reports whether the model answers only on the Responses
-// wire (POST /zen/v1/responses), requiring auto-routing from chat.
-func ResponsesOnly(m Model) bool { return m.Responses }
-
 // ClampEffort maps a client-requested reasoning effort onto the model's
 // declared ladder.
 //
@@ -90,28 +86,36 @@ func ResponsesOnly(m Model) bool { return m.Responses }
 //  1. Absent effort: reasoningRequired models must always receive an effort
 //     (Zen 400s otherwise) and default to "high"; everything else returns
 //     "" so the caller decides whether to send the field at all.
-//  2. An effort already on the ladder passes through unchanged.
-//  3. Otherwise both the request and every ladder entry are located in the
+//  2. The exact request "off" short-circuits to "off" unconditionally —
+//     never clamped into the ladder (mirrors plugin resolveReasoningEffort:
+//     disabling reasoning must survive even on ladders that start higher).
+//  3. An effort already on the ladder passes through unchanged.
+//  4. Otherwise both the request and every ladder entry are located in the
 //     canonical global order (effortOrder: off minimal low medium high xhigh
 //     max); the request's global index is clamped into the ladder's
 //     [first, last] global-index bounds, and the ladder entry nearest to
 //     the clamped index wins — ties go to the earlier ladder entry (e.g.
-//     mimo "minimal" → "off", muse "off" → "minimal", space-bunny "off" →
-//     "low", mimo "xhigh" → "high").
-//  4. A word outside the global vocabulary falls back to "high" when the
+//     mimo "minimal" → "off", mimo "xhigh" → "high", default-ladder
+//     "medium" → "low").
+//  5. A word outside the global vocabulary falls back to "high" when the
 //     ladder declares it, else the ladder's first entry — mirroring the
 //     plugin clampEffort fallback.
 //
-// The chat wire converts a returned "off" with ToChatWire ("none"); the
-// Responses wire omits reasoning_effort entirely when the result is "off".
+// Composition contract (spec §4): ClampEffort("off") → "off" on every
+// model; the chat lane sends ToChatWire(result) ("off" → "none") at call
+// time; the Responses lane omits the reasoning_effort key entirely when the
+// result is "off". Absent-effort handling above is unchanged by this rule.
 func ClampEffort(m Model, effort string) string {
-	ladder := m.Ladder()
 	if effort == "" {
 		if m.ReasoningRequired {
 			return "high"
 		}
 		return ""
 	}
+	if effort == "off" {
+		return "off"
+	}
+	ladder := m.Ladder()
 	if slices.Contains(ladder, effort) {
 		return effort
 	}

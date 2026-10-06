@@ -134,9 +134,6 @@ func TestResolveModel(t *testing.T) {
 			if got := m.Ladder(); !reflect.DeepEqual(got, tt.ladder) {
 				t.Errorf("Ladder() = %v, want %v", got, tt.ladder)
 			}
-			if got := ResponsesOnly(m); got != tt.responses {
-				t.Errorf("ResponsesOnly(m) = %v, want %v", got, tt.responses)
-			}
 		})
 	}
 
@@ -147,9 +144,11 @@ func TestResolveModel(t *testing.T) {
 	})
 }
 
-// TestClampEffort verifies clamping against every declared ladder: exact
-// ladder members pass through; out-of-ladder requests clamp to the nearest
-// declared level (plugin resolveReasoningEffort semantics).
+// TestClampEffort verifies clamping against every declared ladder: the exact
+// request "off" short-circuits to "off" on every model (spec §4 — the chat
+// lane maps it to "none" via ToChatWire, the Responses lane omits the key),
+// other exact ladder members pass through, and out-of-ladder requests clamp
+// to the nearest declared level (plugin resolveReasoningEffort semantics).
 func TestClampEffort(t *testing.T) {
 	tests := []struct {
 		model string
@@ -168,7 +167,7 @@ func TestClampEffort(t *testing.T) {
 		{model: "mimo-v2.5-free", input: "max", want: "high"},
 
 		// muse ladder: [minimal low medium high xhigh].
-		{model: "muse-spark-1.3-contributor-free", input: "off", want: "minimal"},
+		{model: "muse-spark-1.3-contributor-free", input: "off", want: "off"},
 		{model: "muse-spark-1.3-contributor-free", input: "minimal", want: "minimal"},
 		{model: "muse-spark-1.3-contributor-free", input: "low", want: "low"},
 		{model: "muse-spark-1.3-contributor-free", input: "medium", want: "medium"},
@@ -177,7 +176,7 @@ func TestClampEffort(t *testing.T) {
 		{model: "muse-spark-1.3-contributor-free", input: "max", want: "xhigh"},
 
 		// space-bunny ladder: [low medium high xhigh max].
-		{model: "space-bunny-free", input: "off", want: "low"},
+		{model: "space-bunny-free", input: "off", want: "off"},
 		{model: "space-bunny-free", input: "minimal", want: "low"},
 		{model: "space-bunny-free", input: "low", want: "low"},
 		{model: "space-bunny-free", input: "medium", want: "medium"},
