@@ -322,6 +322,11 @@ func TestResponsesSSEToChat(t *testing.T) {
 	if usage.Usage.PromptTokensDetails == nil || usage.Usage.PromptTokensDetails.CachedTokens != 3 {
 		t.Errorf("usage.prompt_tokens_details = %+v, want cached_tokens 3", usage.Usage.PromptTokensDetails)
 	}
+	// OpenAI usage chunks always carry an empty choices array; clients doing
+	// chunk.choices[0]?.delta throw when choices is undefined.
+	if !strings.Contains(ps[4], `"choices":[]`) {
+		t.Errorf("usage frame must carry \"choices\":[]: %s", ps[4])
+	}
 }
 
 // Prompt minimum: TestTranslateResponsesDelta — output_text.delta becomes a
@@ -550,6 +555,64 @@ func TestSSEPartialFrames(t *testing.T) {
 			t.Errorf("flush without newline:\n got %q\nwant %q", out, want)
 		}
 	})
+
+	t.Run("comment lines", func(t *testing.T) {
+		// `:` comment lines (standalone frames and inside data frames) are
+		// skipped by the parser but preserved byte-for-byte in passthrough.
+		in := ": stream-start\n\n" +
+			": keep-alive\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"c\"}}]}\n\n"
+		var buf bytes.Buffer
+		if err := FilterChatStream(iotest.OneByteReader(strings.NewReader(in)), &buf); err != nil {
+			t.Fatalf("FilterChatStream: %v", err)
+		}
+		want := in + "data: [DONE]\n\n"
+		if got := buf.String(); got != want {
+			t.Errorf("comment lines not preserved:\n got %q\nwant %q", got, want)
+		}
+	})
+
+	t.Run("multibyte runes split across reads", func(t *testing.T) {
+		// UTF-8 runes arrive split across reader boundaries; both lanes must
+		// reassemble them untouched.
+		frame := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"héllo ✓ мир\"}}]}\n\n"
+		var buf bytes.Buffer
+		if err := FilterChatStream(iotest.OneByteReader(strings.NewReader(frame)), &buf); err != nil {
+			t.Fatalf("FilterChatStream: %v", err)
+		}
+		if got, want := buf.String(), frame+"data: [DONE]\n\n"; got != want {
+			t.Errorf("passthrough corrupted multibyte runes:\n got %q\nwant %q", got, want)
+		}
+
+		in := "event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","output_index":0,"delta":"héllo ✓ мир"}` + "\n\n"
+		var out bytes.Buffer
+		if err := TranslateResponsesStream(iotest.OneByteReader(strings.NewReader(in)), &out); err != nil {
+			t.Fatalf("TranslateResponsesStream: %v", err)
+		}
+		c := decodeChunk(t, payloads(t, out.String())[0])
+		if len(c.Choices) != 1 || c.Choices[0].Delta.Content == nil ||
+			*c.Choices[0].Delta.Content != "héllo ✓ мир" {
+			t.Errorf("translated content = %s, want \"héllo ✓ мир\"", payloads(t, out.String())[0])
+		}
+	})
+}
+
+// A frame beyond maxSSEFrameBytes must fail fast instead of buffering
+// without bound — including a newline-free stream, which previously grew
+// memory until EOF.
+func TestSSEFrameSizeCap(t *testing.T) {
+	in := "data: " + strings.Repeat("x", maxSSEFrameBytes) + "\n\n"
+	var buf bytes.Buffer
+	err := FilterChatStream(strings.NewReader(in), &buf)
+	if err == nil {
+		t.Fatalf("expected a size-cap error for a %d-byte frame, got nil", len(in))
+	}
+	if !strings.Contains(err.Error(), "SSE frame exceeds") {
+		t.Errorf("error = %q, want the frame size cap message", err)
+	}
+	if strings.Contains(buf.String(), "[DONE]") {
+		t.Errorf("no terminator may follow a cap failure: %q", buf.String())
+	}
 }
 
 // Plugin parity (index.js:1179-1182): response.failed aborts the stream with
@@ -577,7 +640,7 @@ func TestTranslateResponsesFailed(t *testing.T) {
 	}
 }
 
-// Plugin parity (index.js:1186-1189): a stream that opened zero output
+// Plugin parity (index.js:1187): a stream that opened zero output
 // blocks is an error (EMPTY_RESPONSE), never a silent success — even when it
 // ended with response.completed and usage.
 func TestTranslateResponsesEmpty(t *testing.T) {

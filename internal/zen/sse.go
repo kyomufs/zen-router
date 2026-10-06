@@ -5,9 +5,11 @@ package zen
 // composes in Task 12 — raw chat passthrough with cost filtering and a single
 // synthesized [DONE], and Responses-vocabulary → chat.completion.chunk
 // translation. Semantics are ported from the golden plugin
-// (dsh-opencode-zen lib/index.js): parseSse 860-893, translateStream
-// finish/usage yields 982-983, mapResponsesUsage 995-1003,
-// translateResponsesStream 1090-1212. No http, no goroutines, no flushing —
+// (dsh-opencode-zen lib/index.js): parseSse 860-892, translateStream yields
+// usage@982 THEN finish@983 (Go emits finish→usage instead — that is the
+// correct order on the OpenAI wire), mapResponsesUsage 995-1003,
+// translateResponsesStream 1090-1213 (same usage-then-finish order at
+// 1211-1212). No http, no goroutines, no flushing —
 // every frame is written to w as it is parsed (Task 12 wraps w with the
 // http.Flusher).
 //
@@ -34,13 +36,48 @@ type sseFrame struct {
 	terminated bool
 }
 
+// maxSSEFrameBytes caps how much raw input one frame may buffer. Real
+// frames are KiB-scale (SSE data lines carry single deltas); 4 MiB is a
+// generous ceiling matched to the buffering budget Task 12 gives the
+// handler, and it bounds memory against newline-free or overlong input.
+const maxSSEFrameBytes = 4 << 20
+
+// errSSEFrameTooLarge reports a frame (or a single line inside it) that
+// blew past maxSSEFrameBytes.
+func errSSEFrameTooLarge() error {
+	return fmt.Errorf("zen: SSE frame exceeds %d bytes", maxSSEFrameBytes)
+}
+
+// readSSELine reads one line including its terminator, refusing to buffer
+// more than limit bytes total: fragments from bufio.ReadSlice are checked
+// as they arrive, so a stream with no newlines at all cannot grow memory
+// past the cap (a plain ReadString would balloon until EOF).
+func readSSELine(r *bufio.Reader, limit int) (string, error) {
+	var b strings.Builder
+	for {
+		frag, err := r.ReadSlice('\n')
+		b.Write(frag)
+		if b.Len() > limit {
+			return "", errSSEFrameTooLarge()
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // no newline yet — keep draining the reader
+		}
+		if err != nil {
+			return b.String(), err // partial line + io.EOF handled by caller
+		}
+		return b.String(), nil
+	}
+}
+
 // readSSEFrame reads the next frame from r. The blank line ends a frame; a
 // stream that ends mid-frame flushes what accumulated (terminated = false);
 // a stream with no pending frame yields io.EOF. Lines tolerate CRLF, `:`
 // comments are skipped (their bytes stay in raw for passthrough), and data
 // lines are joined per the SSE spec with "\n". Field values are trimmed of
 // surrounding whitespace, mirroring the plugin's line.slice(5).trim()
-// (index.js:877) — which also makes CRLF streams parse identically.
+// (index.js:877) — which also makes CRLF streams parse identically. Frame
+// growth is capped at maxSSEFrameBytes.
 func readSSEFrame(r *bufio.Reader) (*sseFrame, error) {
 	var (
 		raw       []byte
@@ -48,7 +85,7 @@ func readSSEFrame(r *bufio.Reader) (*sseFrame, error) {
 		dataLines []string
 	)
 	for {
-		line, err := r.ReadString('\n')
+		line, err := readSSELine(r, maxSSEFrameBytes-len(raw))
 		if len(line) > 0 {
 			raw = append(raw, line...)
 			body := strings.TrimSuffix(line, "\n")
@@ -214,11 +251,13 @@ type responsesUsage struct {
 	} `json:"input_tokens_details"`
 }
 
-// chatChunk is a generated chat.completion.chunk frame. Object is stamped by
-// emit; Choices is omitted on the usage frame, Usage on all others.
+// chatChunk is a generated chat.completion.chunk frame. Object is stamped
+// by emit; every frame carries "choices" — non-empty on delta/finish frames,
+// `"choices":[]` on the usage frame, like real OpenAI usage chunks (clients
+// doing chunk.choices[0]?.delta throw on undefined choices).
 type chatChunk struct {
 	Object  string       `json:"object"`
-	Choices []chatChoice `json:"choices,omitempty"`
+	Choices []chatChoice `json:"choices"`
 	Usage   *chatUsage   `json:"usage,omitempty"`
 }
 
@@ -320,7 +359,7 @@ func (tr *responsesTranslator) emit(c chatChunk) error {
 // and writes the equivalent chat.completion.chunk stream to w, terminated by
 // exactly one `data: [DONE]` when the input ends cleanly.
 //
-// Ported from the plugin translateResponsesStream (index.js:1090-1212):
+// Ported from the plugin translateResponsesStream (index.js:1090-1213):
 //
 //   - event selection uses the data payload's JSON "type" only — the
 //     plugin's parser ignores `event:` lines (index.js:876);
@@ -362,7 +401,7 @@ func TranslateResponsesStream(r io.Reader, w io.Writer) error {
 		}
 		var ev responsesEvent
 		if err := json.Unmarshal([]byte(f.data), &ev); err != nil {
-			continue // non-JSON payloads ignored (index.js:888-891)
+			continue // non-JSON payloads ignored (index.js:880-883)
 		}
 		if err := tr.handle(ev); err != nil {
 			return err
@@ -470,7 +509,7 @@ func (tr *responsesTranslator) onItemDone(ev responsesEvent) error {
 	}
 	tool := tr.tools[ev.OutputIndex]
 	if tool == nil {
-		return nil // plugin only completes an already-open block (index.js:1160)
+		return nil // plugin only completes an already-open block (index.js:1162)
 	}
 	if !tool.metaSent {
 		if ev.Item.CallID != "" {
@@ -562,7 +601,7 @@ func (tr *responsesTranslator) finish() error {
 		return err
 	}
 	if tr.usage != nil {
-		if err := tr.emit(chatChunk{Usage: tr.usage}); err != nil {
+		if err := tr.emit(chatChunk{Choices: []chatChoice{}, Usage: tr.usage}); err != nil {
 			return err
 		}
 	}
