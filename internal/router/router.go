@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
+	"zen-router/internal/keys"
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/warp"
@@ -34,6 +36,16 @@ type Router struct {
 	// rotationCooldown throttles how often we mint a new WARP identity, so a
 	// burst of 429s does not spam the Cloudflare API.
 	rotationCooldown time.Duration
+
+	// Staged rotation state (stage.go): key pool, identity-pool sizing and
+	// the test seams for the two privileged operations (WARP identity swap,
+	// Cloudflare spare registration).
+	pool           *keys.Pool
+	poolSize       int
+	poolSpare      int
+	identitySwitch func(*quota.WarpIdentity) (http.RoundTripper, error)
+	spareRegistrar func(context.Context) error
+	registering    bool
 }
 
 // Options configures a Router.
@@ -44,6 +56,24 @@ type Options struct {
 	Device string
 	// Cooldown between automatic rotations.
 	RotationCooldown time.Duration
+	// Pool is the API key pool behind stage-1 key rotation. Nil means the
+	// single-key fallback (keys.New("")).
+	Pool *keys.Pool
+	// Family pins the direct transport's dialing to "auto", "v4" or "v6"
+	// (stage 3 "direct" attempts must respect the configured family).
+	Family string
+	// PoolSize and PoolSpare size the WARP identity pool target
+	// (spec §6: 4 live + 1 spare); background spare registration stops at
+	// PoolSize+PoolSpare identities.
+	PoolSize  int
+	PoolSpare int
+	// IdentitySwitch overrides the synchronous WARP identity swap (tests):
+	// it must reconfigure the transport for the given PRE-REGISTERED identity
+	// without performing any registration. Nil uses the real tunnel swap.
+	IdentitySwitch func(*quota.WarpIdentity) (http.RoundTripper, error)
+	// SpareRegistrar overrides background spare registration (tests). Nil
+	// registers a fresh spare against Cloudflare in the background.
+	SpareRegistrar func(context.Context) error
 }
 
 // New builds a Router and restores its egress from persisted state.
@@ -57,6 +87,15 @@ func New(opts Options) (*Router, error) {
 	if opts.RotationCooldown == 0 {
 		opts.RotationCooldown = 30 * time.Second
 	}
+	if opts.Pool == nil {
+		opts.Pool = keys.New("")
+	}
+	if opts.PoolSize <= 0 {
+		opts.PoolSize = 4
+	}
+	if opts.PoolSpare <= 0 {
+		opts.PoolSpare = 1
+	}
 	if opts.Store == nil {
 		st, err := quota.Open("")
 		if err != nil {
@@ -68,8 +107,13 @@ func New(opts Options) (*Router, error) {
 		log:              opts.Logger,
 		store:            opts.Store,
 		client:           warp.NewClient(),
-		directRT:         proxy.DirectTransport(),
+		directRT:         directTransportFor(opts.Family),
 		rotationCooldown: opts.RotationCooldown,
+		pool:             opts.Pool,
+		poolSize:         opts.PoolSize,
+		poolSpare:        opts.PoolSpare,
+		identitySwitch:   opts.IdentitySwitch,
+		spareRegistrar:   opts.SpareRegistrar,
 		egress:           proxy.EgressDirect,
 	}
 	// Restore the active egress from state; default to direct.
@@ -80,6 +124,34 @@ func New(opts Options) (*Router, error) {
 		r.egress = proxy.EgressDirect
 	}
 	return r, nil
+}
+
+// directTransportFor builds the direct transport, pinning its dialer to the
+// configured address family ("v4"/"v6") so stage-3 direct attempts honor
+// config.Family; "auto" (or anything else) leaves the dialer untouched.
+func directTransportFor(family string) http.RoundTripper {
+	rt := proxy.DirectTransport()
+	t, ok := rt.(*http.Transport)
+	if !ok {
+		return rt
+	}
+	var netw string
+	switch family {
+	case "v4":
+		netw = "tcp4"
+	case "v6":
+		netw = "tcp6"
+	default:
+		return rt
+	}
+	base := t.DialContext
+	if base == nil {
+		return rt
+	}
+	t.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return base(ctx, netw, addr)
+	}
+	return t
 }
 
 // Egress returns the current path name and its transport. It is called per
