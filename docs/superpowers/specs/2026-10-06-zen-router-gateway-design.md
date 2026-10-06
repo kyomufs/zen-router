@@ -212,6 +212,26 @@ Uninstall via `zen-router install-systemd --remove`.
 - Live state as of check: `mode=direct`, warp `spentUntil` elapsed; the
   `zenwarp` interface is currently down (direct mode).
 
+## 9d. DSH provider API — host-verified anchors (checked 2026-10-06)
+
+All paths under `DSH_LIB = /nix/store/qph9ndg6jv1q0gd819j7am0h7nhs8kpy-dsh-0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh`:
+
+- `ctx.llm.registerAdapter(providers[], adapter)` — `dsh-llm/lib/types/index.d.ts:126`.
+- `LlmAdapter` abstract: single required method
+  `stream(options): AsyncIterable<StreamChunk>` — `index.d.ts:187`.
+- `resolveRetryPolicy(config, path)` is exported from `dsh-llm/lib/index.js`
+  (must be used for `providerRetryPolicy()` — hand-flattened shapes risk NaN
+  backoff; the installed plugin does exactly this fallback at lib/index.js:138-152).
+- Canonical error codes exported as `*_CODE` constants from
+  `dsh-llm/lib/index.js` (`QUOTA`, `ACCOUNT_QUOTA`, `EMPTY_RESPONSE`,
+  `INVALID_CREDENTIAL`, `CONTEXT_WINDOW_EXCEEDED`, `IMAGE_OFFLOAD_REQUIRED`).
+- `dsh-llm-retry/lib/index.js` retries only when
+  `policy.retryableCodes.includes(failure.code)` (line 160) — routing on
+  message text is useless; the daemon must emit machine-checkable `type`/`code`
+  fields, and the thin plugin must map them to these exact strings.
+- The DSH host bundle under test is `0.2.0-rc.2`; API drift across DSH updates
+  is a plan-stage risk (pin against this nix store path in tests).
+
 ## 10. Config and paths (approved: XDG)
 
 - `$XDG_CONFIG_HOME/zen-router/config.json` (default `~/.config/zen-router/config.json`):
