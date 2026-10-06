@@ -344,9 +344,9 @@ Until then the installed plugin v0.15.1 keeps running untouched.
 ## 14. Risks and mitigations
 
 - **Protocol drift** (upstream changes Zen behavior): all protocol knowledge in
-  one Go package; verified against the live-audited plugin behavior and a
-  background cross-check of upstream `anomalyco/opencode` sources (§4); models table
-  refreshable from `GET /models`.
+  one Go package; verified against the live-audited plugin behavior and an
+  independent cross-check of upstream `anomalyco/opencode` sources, completed
+  2026-10-06 (§4); models table refreshable from `GET /models`.
 - **Cloudflare rate-limits identity registration**: lazy spare registration with
   jitter; on registration failure fall back to direct and surface in TUI.
 - **sudo/ip dependencies**: already verified (`sudo -n` NOPASSWD ALL,
