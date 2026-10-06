@@ -1,0 +1,7 @@
+{
+  "pools": {
+    "opencode": {
+      "keys": ["key-a", "public", "key-b", "key-a", "", "key-c"]
+    }
+  }
+}

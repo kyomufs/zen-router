@@ -1,0 +1,10 @@
+{
+  "pools": {
+    "opencode": {
+      "keys": ["primary-1", "primary-2"]
+    },
+    "opencode-zen": {
+      "keys": ["secondary-1"]
+    }
+  }
+}

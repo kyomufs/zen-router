@@ -1,0 +1,7 @@
+{
+  "pools": {
+    "opencode-zen": {
+      "keys": ["zen-1", "public", "zen-2", "zen-1"]
+    }
+  }
+}
