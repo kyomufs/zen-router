@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -400,5 +401,246 @@ func TestExistingAccessorsCompileWork(t *testing.T) {
 	want := time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Errorf("NextReset = %v, want %v", got, want)
+	}
+}
+
+// TestOpenHandlesNullIdentitySlot: hand-edited JSON with a null identity slot
+// must load without panicking. Null slots are dropped from the pool in
+// memory (Active clamped to a real entry); the file itself is not rewritten.
+func TestOpenHandlesNullIdentitySlot(t *testing.T) {
+	t.Run("all-null pool", func(t *testing.T) {
+		raw := `{"version":2,"mode":"auto","current":"direct","updatedAt":1,` +
+			`"egress":{"direct":{},"warp":{}},"identities":[null],"active":0,"rotations":[]}`
+		path := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+
+		m, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open with identities:[null]: %v", err)
+		}
+
+		if act := m.ActiveIdentity(); act != nil {
+			t.Errorf("ActiveIdentity() = %+v, want nil (no usable entry)", act)
+		}
+		if w := m.GetWarp(); w != nil {
+			t.Errorf("GetWarp() = %+v, want nil", w)
+		}
+		if n := len(m.Identities()); n != 0 {
+			t.Errorf("len(Identities()) = %d, want 0 (null slot dropped)", n)
+		}
+		s := m.Snapshot()
+		if n := len(s.Identities); n != 0 {
+			t.Errorf("len(Snapshot().Identities) = %d, want 0", n)
+		}
+		if s.Active != 0 {
+			t.Errorf("Snapshot().Active = %d, want 0", s.Active)
+		}
+		if s.Warp != nil {
+			t.Errorf("Snapshot().Warp = %+v, want nil", s.Warp)
+		}
+
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("re-read fixture: %v", err)
+		}
+		if !bytes.Equal([]byte(raw), after) {
+			t.Error("Open rewrote the file; want disk untouched for a non-migrated v2 load")
+		}
+	})
+
+	t.Run("null slot before active entry", func(t *testing.T) {
+		raw := `{"version":2,"mode":"auto","current":"direct","updatedAt":1,` +
+			`"egress":{"direct":{},"warp":{}},` +
+			`"identities":[null,{"deviceId":"dev-b","token":"tb","privateKey":"pb","publicKey":"qb","registeredAt":9}],` +
+			`"active":1,"rotations":[]}`
+		path := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+
+		m, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open with null slot: %v", err)
+		}
+
+		// The null slot is dropped; Active is clamped onto the real entry so
+		// every copy stays index-aligned.
+		if act := m.ActiveIdentity(); act == nil || act.DeviceID != "dev-b" {
+			t.Errorf("ActiveIdentity() = %+v, want dev-b", act)
+		}
+		s := m.Snapshot()
+		if n := len(s.Identities); n != 1 {
+			t.Fatalf("len(Snapshot().Identities) = %d, want 1", n)
+		}
+		if s.Active < 0 || s.Active >= len(s.Identities) {
+			t.Errorf("Snapshot().Active = %d out of range for %d entries", s.Active, len(s.Identities))
+		}
+		if s.Identities[s.Active] == nil || s.Identities[s.Active].DeviceID != "dev-b" {
+			t.Errorf("Snapshot().Identities[%d] = %+v, want dev-b", s.Active, s.Identities[s.Active])
+		}
+		if ids := m.Identities(); len(ids) != 1 || ids[0].DeviceID != "dev-b" {
+			t.Errorf("Identities() = %+v, want [dev-b]", ids)
+		}
+
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("re-read fixture: %v", err)
+		}
+		if !bytes.Equal([]byte(raw), after) {
+			t.Error("Open rewrote the file; want disk untouched for a non-migrated v2 load")
+		}
+	})
+}
+
+// TestAddIdentityNilGuard: AddIdentity(nil) must not panic and must report
+// failure with -1 without touching the pool.
+func TestAddIdentityNilGuard(t *testing.T) {
+	m, _ := openTest(t)
+
+	if got := m.AddIdentity(nil); got != -1 {
+		t.Errorf("AddIdentity(nil) = %d, want -1", got)
+	}
+	if n := len(m.Identities()); n != 0 {
+		t.Errorf("len(Identities()) after AddIdentity(nil) = %d, want 0", n)
+	}
+	// The pool still works afterwards.
+	if idx := m.AddIdentity(&WarpIdentity{DeviceID: "ok", Token: "t", PrivateKey: "p", PublicKey: "q"}); idx != 0 {
+		t.Errorf("AddIdentity(valid) = %d, want 0", idx)
+	}
+}
+
+// TestSetActiveIdentityRejectsOutOfRange pins the error contract for negative
+// and too-large indices on empty and non-empty pools.
+func TestSetActiveIdentityRejectsOutOfRange(t *testing.T) {
+	m, _ := openTest(t)
+
+	// Empty pool.
+	for _, i := range []int{-1, 99} {
+		err := m.SetActiveIdentity(i)
+		if err == nil {
+			t.Errorf("SetActiveIdentity(%d) on empty pool = nil, want error", i)
+			continue
+		}
+		if !strings.Contains(err.Error(), "out of range") {
+			t.Errorf("SetActiveIdentity(%d) error = %q, want mention of \"out of range\"", i, err)
+		}
+	}
+
+	// Non-empty pool.
+	m.AddIdentity(&WarpIdentity{DeviceID: "a", Token: "ta", PrivateKey: "pa", PublicKey: "qa"})
+	m.AddIdentity(&WarpIdentity{DeviceID: "b", Token: "tb", PrivateKey: "pb", PublicKey: "qb"})
+	for _, i := range []int{-1, 99} {
+		err := m.SetActiveIdentity(i)
+		if err == nil {
+			t.Errorf("SetActiveIdentity(%d) = nil, want error", i)
+			continue
+		}
+		if !strings.Contains(err.Error(), "out of range") {
+			t.Errorf("SetActiveIdentity(%d) error = %q, want mention of \"out of range\"", i, err)
+		}
+	}
+	if act := m.ActiveIdentity(); act == nil || act.DeviceID != "a" {
+		t.Errorf("ActiveIdentity() after rejected swaps = %+v, want a (unchanged)", act)
+	}
+}
+
+// TestStateMigratesV1WithoutWarp: a v1 file with no registered identity still
+// upgrades to v2 with an empty pool, egress/rotations preserved, on disk too.
+func TestStateMigratesV1WithoutWarp(t *testing.T) {
+	v1 := `{
+  "version": 1,
+  "mode": "direct",
+  "current": "direct",
+  "updatedAt": 1700000000000,
+  "egress": {"direct": {"ok": 2, "daily429": 1}, "warp": {"ok": 1}},
+  "rotations": [{"at": 1700000000000, "from": "direct", "to": "warp", "reason": "r"}]
+}`
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(v1), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	m, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v1-no-warp fixture: %v", err)
+	}
+
+	s := m.Snapshot()
+	if s.Version != 2 {
+		t.Errorf("in-memory Version = %d, want 2", s.Version)
+	}
+	if len(s.Identities) != 0 {
+		t.Errorf("len(Identities) = %d, want 0", len(s.Identities))
+	}
+	if s.Keys == nil {
+		t.Error("Keys = nil, want non-nil map")
+	}
+	if s.Egress["direct"] == nil || s.Egress["direct"].OK != 2 || s.Egress["direct"].Daily429 != 1 {
+		t.Errorf("egress direct = %+v, want ok=2 daily429=1", s.Egress["direct"])
+	}
+	if len(s.Rotations) != 1 || s.Rotations[0].Reason != "r" {
+		t.Errorf("Rotations = %+v, want 1 entry", s.Rotations)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read migrated file: %v", err)
+	}
+	var onDisk State
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("unmarshal migrated file: %v", err)
+	}
+	if onDisk.Version != 2 {
+		t.Errorf("on-disk Version = %d, want 2 (migration persisted)", onDisk.Version)
+	}
+	if len(onDisk.Identities) != 0 {
+		t.Errorf("on-disk identities = %+v, want empty", onDisk.Identities)
+	}
+	if onDisk.Egress["direct"] == nil || onDisk.Egress["direct"].OK != 2 {
+		t.Errorf("on-disk egress not preserved: %+v", onDisk.Egress)
+	}
+	if len(onDisk.Rotations) != 1 {
+		t.Errorf("on-disk rotations = %d, want 1", len(onDisk.Rotations))
+	}
+}
+
+// TestOpenClampsOutOfRangeActive: a v2 file whose Active index is out of range
+// loads with Active clamped in memory; the file on disk stays untouched.
+func TestOpenClampsOutOfRangeActive(t *testing.T) {
+	v2 := `{"version":2,"mode":"auto","current":"direct","updatedAt":1700000000000,` +
+		`"egress":{"direct":{},"warp":{}},` +
+		`"identities":[` +
+		`{"deviceId":"dev-a","token":"ta","privateKey":"pa","publicKey":"qa"},` +
+		`{"deviceId":"dev-b","token":"tb","privateKey":"pb","publicKey":"qb"}],` +
+		`"active":99,"rotations":[]}`
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(v2), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	m, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open out-of-range-active fixture: %v", err)
+	}
+
+	if act := m.ActiveIdentity(); act == nil || act.DeviceID != "dev-a" {
+		t.Errorf("ActiveIdentity() = %+v, want dev-a (Active clamped to 0)", act)
+	}
+	if id := m.Identity(1); id == nil || id.DeviceID != "dev-b" {
+		t.Errorf("Identity(1) = %+v, want dev-b", id)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-read fixture: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("Open rewrote the file; want disk untouched for a non-migrated v2 load")
 	}
 }

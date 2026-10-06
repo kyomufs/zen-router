@@ -17,6 +17,9 @@ import (
 // router tracks which
 // egress (direct/warp) is spent, plus the WARP device identity used for
 // rotation. It reads the plugin's quota.json only as an advisory signal.
+// Since schema v2 it also tracks per-API-key counters (Keys) and a pool of
+// WARP identities with per-identity health (Identities/Active); v1 files are
+// migrated to v2 on load.
 type State struct {
 	Version   int    `json:"version"`
 	Mode      string `json:"mode"` // auto | direct | warp
@@ -129,6 +132,18 @@ func Open(path string) (*Manager, error) {
 	if err == nil {
 		var parsed State
 		if jsonErr := json.Unmarshal(data, &parsed); jsonErr == nil && parsed.Version != 0 {
+			// Drop null identity slots from hand-edited/corrupt JSON first, so
+			// Active always indexes a real entry. In-memory only: the file is
+			// rewritten on the next save (or now, when migrating).
+			if len(parsed.Identities) > 0 {
+				kept := parsed.Identities[:0]
+				for _, id := range parsed.Identities {
+					if id != nil {
+						kept = append(kept, id)
+					}
+				}
+				parsed.Identities = kept
+			}
 			migrated := false
 			if parsed.Version == 1 || (parsed.Warp != nil && len(parsed.Identities) == 0) {
 				if parsed.Warp != nil && len(parsed.Identities) == 0 {
@@ -180,15 +195,17 @@ func (m *Manager) saveLocked() {
 	_ = os.WriteFile(m.path, append(data, '\n'), 0o644)
 }
 
-// mirrorWarpLocked keeps the legacy Warp field equal to the active identity
-// (nil when the pool is empty) so pre-v2 readers still see the device.
+// mirrorWarpLocked keeps the legacy Warp field equal to the active identity.
+// A missing, out-of-range, or nil active entry means "no active identity":
+// Active is clamped in memory and Warp stays nil — the same nil-guard
+// behavior as Identity/activeIdentityLocked.
 func (m *Manager) mirrorWarpLocked() {
-	if len(m.s.Identities) == 0 {
-		m.s.Warp = nil
-		return
-	}
 	if m.s.Active < 0 || m.s.Active >= len(m.s.Identities) {
 		m.s.Active = 0
+	}
+	if len(m.s.Identities) == 0 || m.s.Identities[m.s.Active] == nil {
+		m.s.Warp = nil
+		return
 	}
 	w := *m.s.Identities[m.s.Active]
 	m.s.Warp = &w
@@ -216,13 +233,15 @@ func (m *Manager) Snapshot() State {
 		w := *m.s.Warp
 		cp.Warp = &w
 	}
-	cp.Identities = make([]*WarpIdentity, 0, len(m.s.Identities))
-	for _, id := range m.s.Identities {
+	// Preserve slots (including any nil) so indices stay aligned with Active
+	// in the copy.
+	cp.Identities = make([]*WarpIdentity, len(m.s.Identities))
+	for i, id := range m.s.Identities {
 		if id == nil {
 			continue
 		}
 		vv := *id
-		cp.Identities = append(cp.Identities, &vv)
+		cp.Identities[i] = &vv
 	}
 	cp.Rotations = append([]Rotation(nil), m.s.Rotations...)
 	return cp
@@ -346,9 +365,13 @@ func (m *Manager) ClearWarp() {
 	m.saveLocked()
 }
 
-// AddIdentity appends a WARP identity to the pool and returns its index.
-// The first identity becomes active automatically (Active defaults to 0).
+// AddIdentity appends a WARP identity to the pool and returns its index, or
+// -1 when id is nil (nothing is stored or saved). The first identity becomes
+// active automatically (Active defaults to 0).
 func (m *Manager) AddIdentity(id *WarpIdentity) int {
+	if id == nil {
+		return -1
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := *id
@@ -389,16 +412,18 @@ func (m *Manager) SetActiveIdentity(i int) error {
 	return nil
 }
 
-// Identities returns value copies of every pool entry.
+// Identities returns value copies of every pool entry, preserving indices so
+// out[i] corresponds to Identity(i) and SetActiveIdentity(i); a nil slot (not
+// reachable after Open's load-time filtering) appears as the zero value.
 func (m *Manager) Identities() []WarpIdentity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]WarpIdentity, 0, len(m.s.Identities))
-	for _, id := range m.s.Identities {
+	out := make([]WarpIdentity, len(m.s.Identities))
+	for i, id := range m.s.Identities {
 		if id == nil {
 			continue
 		}
-		out = append(out, *id)
+		out[i] = *id
 	}
 	return out
 }
