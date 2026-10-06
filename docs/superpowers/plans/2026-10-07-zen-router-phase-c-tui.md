@@ -113,6 +113,13 @@ gates), §13 phase C, §14 (registration-failure surfacing).
   a fake, live calls отмашка-gated.
 - **D4 — log tail:** daemon tees its logger to `config.Paths.LogFile`; the TUI tails
   the file (not journald). systemd keeps `StandardOutput` default (journald).
+- **D5 — dependencies install via `go get charm.land/bubbletea/v2@v2.0.10`
+  (+bubbles/lipgloss) + `go mod tidy`, never by hand-editing `go.mod`** (skill rule);
+  versions cross-checked against proxy.golang.org in the research pass.
+- **D6 — layout rules (skill `bubbletea`):** terminal-cell/ANSI-aware measurement —
+  no byte-length string slicing (clamp small terminals; measure borders per
+  `references/golden-rules.md`); effectful work (HTTP polls, file tails) stays OUT of
+  `View()` — only in `Update()` commands; validate wide + narrow window sizes.
 
 ## Tasks
 
