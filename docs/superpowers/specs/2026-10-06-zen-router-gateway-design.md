@@ -82,8 +82,9 @@ New packages: `internal/gateway` (OpenAI shim + Zen wire), `internal/tui`
 ## 4. External wire contract (daemon → opencode.ai)
 
 Ported from `dsh-opencode-zen` lib/index.js (live-audited 2026-10-02 against
-`sst/opencode` sources; a background cross-check against upstream `sst/opencode`
-was run for this spec — claims marked unverified stay TBD):
+`sst/opencode` sources; an independent cross-check against upstream
+`sst/opencode` is running in the background for this spec — claims marked
+unverified stay TBD and will be folded in when it reports):
 
 - **Endpoints**: `POST https://opencode.ai/zen/v1/chat/completions`,
   `POST .../responses`, `GET .../models`. Auth: `Authorization: Bearer <key>`
@@ -239,7 +240,8 @@ Until then the installed plugin v0.15.1 keeps running untouched.
 ## 14. Risks and mitigations
 
 - **Protocol drift** (upstream changes Zen behavior): all protocol knowledge in
-  one Go package; cross-checked against `sst/opencode` sources; models table
+  one Go package; verified against the live-audited plugin behavior and a
+  background cross-check of `sst/opencode` sources (§4); models table
   refreshable from `GET /models`.
 - **Cloudflare rate-limits identity registration**: lazy spare registration with
   jitter; on registration failure fall back to direct and surface in TUI.
