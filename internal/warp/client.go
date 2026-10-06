@@ -196,10 +196,10 @@ func (c *Client) GetWireGuardProfile(ctx context.Context) (*WireGuardProfile, er
 		return nil, err
 	}
 	return &WireGuardProfile{
-		AddressV4:  payload.Config.Interface.Addresses.V4,
-		AddressV6:  payload.Config.Interface.Addresses.V6,
-		ServerPub:  peer.PublicKey,
-		Endpoint:   endpoint,
+		AddressV4: payload.Config.Interface.Addresses.V4,
+		AddressV6: payload.Config.Interface.Addresses.V6,
+		ServerPub: peer.PublicKey,
+		Endpoint:  endpoint,
 	}, nil
 }
 
