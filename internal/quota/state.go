@@ -94,8 +94,9 @@ type Manager struct {
 
 // DefaultPath is where the router keeps its state: $ZEN_ROUTER_STATE when set,
 // otherwise the XDG default owned by internal/config (single source of truth;
-// config never imports quota, so there is no cycle).
-func DefaultPath() string {
+// config never imports quota, so there is no cycle). An error means no home
+// directory could be resolved for the XDG fallback.
+func DefaultPath() (string, error) {
 	return config.StateFile()
 }
 
@@ -117,7 +118,11 @@ func emptyState() *State {
 // file is written back once.
 func Open(path string) (*Manager, error) {
 	if path == "" {
-		path = DefaultPath()
+		p, err := DefaultPath()
+		if err != nil {
+			return nil, fmt.Errorf("resolve state path: %w", err)
+		}
+		path = p
 	}
 	m := &Manager{path: path, s: emptyState()}
 	data, err := os.ReadFile(path)

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ func clearEnv(t *testing.T) {
 		"ZEN_ROUTER_LISTEN",
 		"ZEN_ROUTER_UPSTREAM",
 		"ZEN_ROUTER_KEY_POOL_FILE",
+		"ZEN_ROUTER_FAMILY",
 		"ZEN_ROUTER_STATE",
 		"DSH_HOME",
 	} {
@@ -37,7 +39,10 @@ func TestDefaultPaths(t *testing.T) {
 		t.Setenv("XDG_CONFIG_HOME", configHome)
 		t.Setenv("XDG_STATE_HOME", stateHome)
 
-		got := config.DefaultPaths()
+		got, err := config.DefaultPaths()
+		if err != nil {
+			t.Fatalf("DefaultPaths() error: %v", err)
+		}
 		want := config.Paths{
 			ConfigDir: filepath.Join(configHome, "zen-router"),
 			StateDir:  filepath.Join(stateHome, "zen-router"),
@@ -54,7 +59,10 @@ func TestDefaultPaths(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
 
-		got := config.DefaultPaths()
+		got, err := config.DefaultPaths()
+		if err != nil {
+			t.Fatalf("DefaultPaths() error: %v", err)
+		}
 		want := config.Paths{
 			ConfigDir: filepath.Join(home, ".config", "zen-router"),
 			StateDir:  filepath.Join(home, ".local", "state", "zen-router"),
@@ -86,6 +94,7 @@ func TestConfigEnvOverridesFile(t *testing.T) {
 	writeConfig(t, `{
 		"listen": "127.0.0.1:9999",
 		"upstream": "https://file.example",
+		"family": "v4",
 		"keyPoolFile": "/from/file/pool.json",
 		"poolSize": 7,
 		"idleTimeout": "60s"
@@ -94,6 +103,7 @@ func TestConfigEnvOverridesFile(t *testing.T) {
 	t.Run("env overrides beat the file", func(t *testing.T) {
 		t.Setenv("ZEN_ROUTER_LISTEN", "127.0.0.1:1234")
 		t.Setenv("ZEN_ROUTER_KEY_POOL_FILE", "/from/env/pool.json")
+		t.Setenv("ZEN_ROUTER_FAMILY", "V6")
 
 		cfg, err := config.Load()
 		if err != nil {
@@ -104,6 +114,9 @@ func TestConfigEnvOverridesFile(t *testing.T) {
 		}
 		if cfg.KeyPoolFile != "/from/env/pool.json" {
 			t.Errorf("KeyPoolFile = %q, want ZEN_ROUTER_KEY_POOL_FILE value /from/env/pool.json", cfg.KeyPoolFile)
+		}
+		if cfg.Family != "v6" {
+			t.Errorf("Family = %q, want ZEN_ROUTER_FAMILY value normalized to v6", cfg.Family)
 		}
 		// Fields without env overrides still come from the file.
 		if cfg.Upstream != "https://file.example" {
@@ -127,6 +140,9 @@ func TestConfigEnvOverridesFile(t *testing.T) {
 		}
 		if cfg.KeyPoolFile != "/from/file/pool.json" {
 			t.Errorf("KeyPoolFile = %q, want file value /from/file/pool.json", cfg.KeyPoolFile)
+		}
+		if cfg.Family != "v4" {
+			t.Errorf("Family = %q, want file value v4", cfg.Family)
 		}
 	})
 }
@@ -192,6 +208,9 @@ func TestLoadDefaults(t *testing.T) {
 		if d.Upstream != "https://opencode.ai" {
 			t.Errorf("default Upstream = %q, want https://opencode.ai", d.Upstream)
 		}
+		if d.Family != "auto" {
+			t.Errorf("default Family = %q, want auto", d.Family)
+		}
 		if d.KeyPoolFile != "" {
 			t.Errorf("default KeyPoolFile = %q, want empty", d.KeyPoolFile)
 		}
@@ -230,27 +249,107 @@ func TestLoadMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestLoadInvalidDuration(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	writeConfig(t, `{"idleTimeout":"banana"}`)
+
+	cfg, err := config.Load()
+	if err == nil {
+		t.Fatal("Load() succeeded on invalid idleTimeout, want error")
+	}
+	if !strings.Contains(err.Error(), "idleTimeout") {
+		t.Errorf("error %q does not mention idleTimeout", err)
+	}
+	if cfg != nil {
+		t.Errorf("Load() returned config %+v alongside error, want nil", cfg)
+	}
+}
+
+// An undefined $HOME with no XDG overrides must surface an error instead of
+// silently falling back to relative paths inside the process cwd.
+func TestHomeResolutionError(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+
+	if cfg, err := config.Load(); err == nil {
+		t.Errorf("Load() = %+v, nil error; want error when $HOME is undefined and no XDG vars", cfg)
+	} else if !strings.Contains(err.Error(), "home") {
+		t.Errorf("Load() error %q does not mention home resolution", err)
+	}
+	if _, err := config.DefaultPaths(); err == nil {
+		t.Error("DefaultPaths() = nil error; want error when $HOME is undefined")
+	}
+	if _, err := config.StateFile(); err == nil {
+		t.Error("StateFile() = nil error; want error when $HOME is undefined")
+	}
+	if _, err := config.LegacyStatePath(); err == nil {
+		t.Error("LegacyStatePath() = nil error; want error when $HOME is undefined and DSH_HOME empty")
+	}
+	if _, err := quota.DefaultPath(); err == nil {
+		t.Error("quota.DefaultPath() = nil error; want error when $HOME is undefined")
+	}
+}
+
+func TestLoadInvalidFamily(t *testing.T) {
+	t.Run("file value", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		writeConfig(t, `{"family":"banana"}`)
+
+		cfg, err := config.Load()
+		if err == nil {
+			t.Fatal("Load() succeeded on invalid family, want error")
+		}
+		if !strings.Contains(err.Error(), "family") {
+			t.Errorf("error %q does not mention family", err)
+		}
+		if cfg != nil {
+			t.Errorf("Load() returned config %+v alongside error, want nil", cfg)
+		}
+	})
+
+	t.Run("env value", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("ZEN_ROUTER_FAMILY", "banana")
+
+		cfg, err := config.Load()
+		if err == nil {
+			t.Fatal("Load() succeeded on invalid ZEN_ROUTER_FAMILY, want error")
+		}
+		if !strings.Contains(err.Error(), "family") {
+			t.Errorf("error %q does not mention family", err)
+		}
+		if cfg != nil {
+			t.Errorf("Load() returned config %+v alongside error, want nil", cfg)
+		}
+	})
+}
+
 func TestStateFileEnvOverride(t *testing.T) {
 	clearEnv(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
 	xdgDefault := filepath.Join(home, ".local", "state", "zen-router", "state.json")
-	if got := config.StateFile(); got != xdgDefault {
-		t.Errorf("StateFile() = %q, want XDG default %q", got, xdgDefault)
+	if got, err := config.StateFile(); err != nil || got != xdgDefault {
+		t.Errorf("StateFile() = %q, %v; want XDG default %q, nil error", got, err, xdgDefault)
 	}
 	// quota.DefaultPath delegates to config.StateFile: no env set → XDG path.
-	if got := quota.DefaultPath(); got != xdgDefault {
-		t.Errorf("quota.DefaultPath() = %q, want XDG default %q", got, xdgDefault)
+	if got, err := quota.DefaultPath(); err != nil || got != xdgDefault {
+		t.Errorf("quota.DefaultPath() = %q, %v; want XDG default %q, nil error", got, err, xdgDefault)
 	}
 
 	custom := filepath.Join(t.TempDir(), "custom-state.json")
 	t.Setenv("ZEN_ROUTER_STATE", custom)
-	if got := config.StateFile(); got != custom {
-		t.Errorf("StateFile() = %q, want ZEN_ROUTER_STATE value %q", got, custom)
+	if got, err := config.StateFile(); err != nil || got != custom {
+		t.Errorf("StateFile() = %q, %v; want ZEN_ROUTER_STATE value %q, nil error", got, err, custom)
 	}
-	if got := quota.DefaultPath(); got != custom {
-		t.Errorf("quota.DefaultPath() = %q, want ZEN_ROUTER_STATE value %q", got, custom)
+	if got, err := quota.DefaultPath(); err != nil || got != custom {
+		t.Errorf("quota.DefaultPath() = %q, %v; want ZEN_ROUTER_STATE value %q, nil error", got, err, custom)
 	}
 }
 
@@ -260,15 +359,15 @@ func TestLegacyStatePath(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	wantFallback := filepath.Join(home, ".dsh", "state", "zen-router", "state.json")
-	if got := config.LegacyStatePath(); got != wantFallback {
-		t.Errorf("LegacyStatePath() = %q, want DSH_HOME default %q", got, wantFallback)
+	if got, err := config.LegacyStatePath(); err != nil || got != wantFallback {
+		t.Errorf("LegacyStatePath() = %q, %v; want DSH_HOME default %q, nil error", got, err, wantFallback)
 	}
 
 	dshHome := t.TempDir()
 	t.Setenv("DSH_HOME", dshHome)
 	want := filepath.Join(dshHome, "state", "zen-router", "state.json")
-	if got := config.LegacyStatePath(); got != want {
-		t.Errorf("LegacyStatePath() = %q, want DSH_HOME value %q", got, want)
+	if got, err := config.LegacyStatePath(); err != nil || got != want {
+		t.Errorf("LegacyStatePath() = %q, %v; want DSH_HOME value %q, nil error", got, err, want)
 	}
 }
 
@@ -306,7 +405,10 @@ func TestMigrateLegacyState(t *testing.T) {
 	t.Run("copies legacy state once, original untouched, second run no-op", func(t *testing.T) {
 		legacyFile := setup(t)
 		writeLegacy(t, legacyFile, legacyContent)
-		paths := config.DefaultPaths()
+		paths, err := config.DefaultPaths()
+		if err != nil {
+			t.Fatalf("DefaultPaths() error: %v", err)
+		}
 
 		migrated, err := config.MigrateLegacyState(paths)
 		if err != nil {
@@ -320,6 +422,17 @@ func TestMigrateLegacyState(t *testing.T) {
 		}
 		if got := readFile(t, legacyFile); got != legacyContent {
 			t.Errorf("legacy state modified by migration: %q, want %q", got, legacyContent)
+		}
+		// The destination dir must contain only state.json — no leftover
+		// temporary files from the write.
+		entries, err := os.ReadDir(filepath.Dir(paths.StateFile))
+		if err != nil {
+			t.Fatalf("read state dir: %v", err)
+		}
+		for _, e := range entries {
+			if e.Name() != "state.json" {
+				t.Errorf("unexpected file %q left in state dir after migration", e.Name())
+			}
 		}
 
 		migrated, err = config.MigrateLegacyState(paths)
@@ -336,7 +449,10 @@ func TestMigrateLegacyState(t *testing.T) {
 
 	t.Run("missing legacy file reports no migration", func(t *testing.T) {
 		legacyFile := setup(t)
-		paths := config.DefaultPaths()
+		paths, err := config.DefaultPaths()
+		if err != nil {
+			t.Fatalf("DefaultPaths() error: %v", err)
+		}
 
 		migrated, err := config.MigrateLegacyState(paths)
 		if err != nil {
@@ -356,7 +472,10 @@ func TestMigrateLegacyState(t *testing.T) {
 	t.Run("existing destination is never overwritten", func(t *testing.T) {
 		legacyFile := setup(t)
 		writeLegacy(t, legacyFile, legacyContent)
-		paths := config.DefaultPaths()
+		paths, err := config.DefaultPaths()
+		if err != nil {
+			t.Fatalf("DefaultPaths() error: %v", err)
+		}
 		const sentinel = `{"version":1,"current":"sentinel"}` + "\n"
 		if err := os.MkdirAll(filepath.Dir(paths.StateFile), 0o755); err != nil {
 			t.Fatalf("mkdir state dir: %v", err)
