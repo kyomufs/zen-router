@@ -18,13 +18,13 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ### From first whole-branch run (7)
 
-- [ ] **DM-1** T7 two missing translation tests: probe-absent path + `reasoningRequired→high`
+- [x] **DM-1** (closed 0c44866) T7 two missing translation tests: probe-absent path + `reasoningRequired→high`
       (behavior implemented responses.go:346-365, clamp side covered models_test.go:218+).
-- [ ] **DM-2** T7 ChatToResponses input-immutability test (body decoded fresh per request,
+- [x] **DM-2** (closed 0c44866) T7 ChatToResponses input-immutability test (body decoded fresh per request,
       handler.go:134 — pin by construction).
-- [ ] **DM-3** T7 `max_completion_tokens:null` edge test (null → model cap, never
+- [x] **DM-3** (closed 0c44866) T7 `max_completion_tokens:null` edge test (null → model cap, never
       over-budget; responses.go:379-398, doc :368-371).
-- [ ] **DM-4** T2 ClampEffort tie-break test (ruled to plan ledger:13, documented
+- [x] **DM-4** (closed 0c44866) T2 ClampEffort tie-break test (ruled to plan ledger:13, documented
       models.go:97, unreachable today).
 - [ ] **DM-5** T10 Active-remap: null-slot → remap `Active` (state.go:138-146 filters
       but does not remap; only hand-edited/corrupt JSON can trigger; clamped on read
@@ -38,15 +38,15 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 - [ ] **DM-8** buffer.go `merge` concatenates ALL choices (n>1 hypothetical — upstream is
       Zen/Anthropic-backed, no `n`): skip `c.Index > 0` or reject `n>1` in shaping + test.
-- [ ] **DM-9** handler.go:571 comment cites "§5/§9d metadata rule" — actual rule is §4:140.
+- [x] **DM-9** (closed c1acea6) handler.go:571 comment cites "§5/§9d metadata rule" — actual rule is §4:140.
       Comment-only fix.
-- [ ] **DM-10** errors.go:297 comment overstates plugin parity — plugin `Number()` ACCEPTS
+- [x] **DM-10** (closed c1acea6) errors.go:297 comment overstates plugin parity — plugin `Number()` ACCEPTS
       1.5, port rejects (spec-correct divergence); note it like errors_test.go:329 does.
-- [ ] **DM-11** No test pins `buf.reset()` after a partially-buffered failed attempt +
+- [x] **DM-11** (closed 0c44866) No test pins `buf.reset()` after a partially-buffered failed attempt +
       re-issue (unreachable with live rotator: post-buffer failures are KindTransport →
       NextAttempt false). Defense-in-depth: fake-Rotator test — attempt 1 emits a frame
       then dies, attempt 2 succeeds, assert final JSON has only attempt-2 content.
-- [ ] **DM-12** Zero-frame flush untested: 2xx upstream stream with only [DONE] →
+- [x] **DM-12** (closed 0c44866) Zero-frame flush untested: 2xx upstream stream with only [DONE] →
       200 + `content:""` + finish `"stop"` (valid semantics, pin it).
 - [ ] **DM-13** Upstream `"metadata":null` passes `json.Valid` → client gets
       `metadata:null` instead of `{}` (handler.go:586-591 + probeEnvelope:505-507).
@@ -54,12 +54,12 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ### Whole-branch-2 nits (batch with DM-1/DM-3)
 
-- [ ] **N-1** `TestResponsesAutoRoute` subtest-1 is no longer a force-proof (client already
+- [x] **N-1** (closed c1acea6) `TestResponsesAutoRoute` subtest-1 is no longer a force-proof (client already
       sends `stream:true`); note in test comment — force pinned by
       TestNonStreamingResponsesLane instead.
 - [ ] **N-2** `review-package.sh`: empty `=== PLAN SLICE ===` header when a plan arg is
       absent — emit the header only when content follows.
-- [ ] **N-3** No responses-lane test with `stream` key *omitted* (redundant — same
+- [x] **N-3** (closed 0c44866) No responses-lane test with `stream` key *omitted* (redundant — same
       `body["stream"].(bool)` path as `false`; add for symmetry if touching the file anyway).
 
 ---

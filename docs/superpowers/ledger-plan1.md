@@ -98,3 +98,8 @@ Reviewer 2eeaea21, package /tmp/zen-review-whole-branch-2.txt (467KB, base 95897
 - 3 new nits (non-blocking): force-pin attribution note, empty PLAN SLICE header in package generator, no omitted-stream responses-lane test (redundant coverage).
 - Deferred minors now total 13 (7 from first run + 6 from T14-re) → docs/superpowers/checklists/phase-e.md (DM-1..DM-13 + N-1..N-3, committed 893ea80).
 PLAN 1 CLOSED: all 14 ledger entries + APPROVE-PLAN1. Ready for user review of Plan 2 (docs/superpowers/plans/2026-10-07-zen-router-phase-c-tui.md) and Plan 3 (2026-10-07-dsh-opencode-zen-thin.md).
+
+## Phase E minors batch (2026-10-07 02:54 MSK) — 10/10 closed, test/comment-only
+Agent 4553f24e: commits 0c44866 (tests: DM-1 translation edges, DM-2 immutability, DM-3 null-cap, DM-4 clamp tie-break, DM-11 oneShotRot buf.reset pin, DM-12 zero-frame flush, N-3 omitted-stream responses variant) + c1acea6 (comments: DM-9 §4:140 citation, DM-10 Retry-After parity divergence note, N-1 force-proof pointer).
+RED via mutation experiments (temp mutate → real FAIL → restore, worktree clean). Gates green, tree clean.
+Remaining in checklist: DM-5 (Active-remap), DM-6/DM-7 (bare-429, daily-regex corpus decisions), DM-8 (buffer merge n>1), DM-13 (metadata:null), N-2 (package generator) + all отмашка-gated live items + README.
