@@ -180,7 +180,8 @@ Spec §6 mandates exactly one re-issue at step 1 (key rotation) but does not say
   - `TestResponsesAutoRoute` — model `muse-spark-1.3-contributor-free` → upstream receives `POST /zen/v1/responses` with translated body; chat frames out.
   - `TestUpstreamDownSurfaces502` — dial error → client gets `KindTransport`-class JSON error, not a hang.
 - [ ] Run, fail.
-- [ ] Implement `handler.go`: route `/v1/chat/completions` (read + buffer body ≤ 4 MiB, `ResolveModel`, `ClampEffort`, `EnsureFreeLaneShape`, build upstream URL by lane, attempt loop `for att := rot.Attempt(); …` with `rot.NextAttempt` per D1, body re-send from buffer), `GET /v1/models`; `stream.go`: watchdog-wrapped response reader, flush-per-frame, first-byte flag feeding the no-reissue guard, error mapping before first byte → OpenAI error envelope JSON.
+- [ ] Carry-overs from prior reviews (binding): add `KindTransport` to `zen` kind enum (const + `String` + `IsRetryable=true` — referenced by `TestUpstreamDownSurfaces502` but absent from Task 5's enum); `zen.BuildHeaders` must receive `IncludeSessionAffinity: true` (zero value silently sends a 6-header union — call-site test asserting all 8 headers); add subtest for zero-tools + pre-existing `tool_choice` overwritten to `"none"`.
+- [ ] Implement `handler.go`: route `/v1/chat/completions` (read + buffer body ≤ 4 MiB, `ResolveModel`, `ClampEffort`, `EnsureFreeLaneShape`, build upstream URL by lane, attempt loop `for att := rot.Attempt(); …` with `rot.NextAttempt` per D1, body re-send from buffer), `GET /v1/models`; `stream.go`: watchdog-wrapped response reader, flush-per-frame, first-byte flag feeding the no-reissue guard, error mapping before first byte → OpenAI error envelope JSON. Watchdog timeout handoff: on `ErrWatchdogTimeout` cancel ctx + close upstream body (pump leak caveat from Task 6).
 - [ ] Green; commit `Add OpenAI gateway surface with staged re-issue`.
 
 ### Task 13: wire into `cmd/zen-router`
@@ -189,6 +190,7 @@ Spec §6 mandates exactly one re-issue at step 1 (key rotation) but does not say
 
 - [ ] Add failing test? `main` stays thin — verify by build + existing suites; add a `TestGatewayMounts` in `internal/gateway` that exercises the same mux composition helper (`gateway.Mux(rotator, cfg)`) used by `main.go`, so mount wiring is covered.
 - [ ] Implement: `cmdUp` builds config (`config.Load` + migration), pool, gateway handler via `gateway.Mux`; listener serves: `/_zenctl/*` (unchanged), `/v1/*` → gateway, `/zen/v1/*` → legacy reverse proxy (kept). `--listen` flag unchanged.
+- [ ] Unify listen address: make `internal/cli/client.go` delegate to `config.Load` (kill the duplicated `DefaultListen = "127.0.0.1:8787"` + `ZEN_ROUTER_LISTEN` parsing — single source of truth; deferred from Task 1 review).
 - [ ] `go build ./... && go vet ./... && go test -short ./...` all green; `./bin/zen-router help` prints updated usage (add a line for the OpenAI surface).
 - [ ] Commit `Mount OpenAI gateway on the daemon listener`.
 
