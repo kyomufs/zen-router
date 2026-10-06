@@ -194,6 +194,24 @@ Uninstall via `zen-router install-systemd --remove`.
   `a416790` lineage's protocol knowledge (or reworks `c2471d2`), and the
   profile pin moves to the new commit only after the user's отмашка.
 
+## 9c. Current runtime state (verified 2026-10-06)
+
+- **Port conflict resolved**: both `cmd/zen-router/main.go` and
+  `internal/cli/client.go` default to `127.0.0.1:8787` — no 4787 remains.
+- **Daemon already runs**: `zen-router up` as pid 1459, binary at
+  `~/.local/bin/zen-router` (built 01:19), systemd user unit
+  `~/.config/systemd/user/zen-router.service` (hand-written 01:23,
+  `Restart=on-failure`, `WantedBy=default.target`) is enabled and active;
+  `Linger=yes`, user systemd is running. There is no `install-systemd`
+  subcommand yet — phase C adds it to manage this unit declaratively.
+- **Running daemon is transport-only**: `GET /v1/models` → 404 (falls through
+  to upstream), `POST /v1/chat/completions` → 404. The OpenAI shim (§3, §5)
+  does not exist yet; `internal/proxy` only keeps the caller's `/zen/v1/...`
+  path (the HEAD-plugin variant from §9b). Phase A replaces this with the
+  OpenAI surface, keeping `/_zenctl/*` on the same listener.
+- Live state as of check: `mode=direct`, warp `spentUntil` elapsed; the
+  `zenwarp` interface is currently down (direct mode).
+
 ## 10. Config and paths (approved: XDG)
 
 - `$XDG_CONFIG_HOME/zen-router/config.json` (default `~/.config/zen-router/config.json`):
