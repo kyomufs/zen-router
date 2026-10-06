@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Kind classifies one upstream (opencode.ai) failure for the rotation
@@ -166,7 +167,8 @@ func (e *UpstreamError) IsRetryable() bool {
 // construction: a 401 with error.type ModelError classifies in step 2 as
 // KindModel, never KindAuth.
 //
-// RetryAfter: a present header always wins (decimal seconds or RFC1123
+// RetryAfter: a present header always wins (whole seconds — integer
+// digits only, a decimal like 1.5 does not parse — or an RFC1123
 // HTTP-date, both clamped to a minimum of 1s like the plugin's
 // parseRetryAfter). When the header is absent or unparsable: KindDailyLimit
 // synthesizes seconds to the next UTC midnight (spec §4 line 161), a
@@ -293,7 +295,8 @@ func decodeEnvelope(b []byte) (typ, msg string, ok bool) {
 }
 
 // parseRetryAfter mirrors the plugin's parseRetryAfter (lib/index.js:768):
-// decimal seconds first, RFC1123 HTTP-date otherwise; both clamp to a
+// whole (integer) seconds first — isDigits rejects a decimal like 1.5 —
+// RFC1123 HTTP-date otherwise; both clamp to a
 // minimum of 1s so RetryAfter == 0 unambiguously means "absent". ok=false
 // means the header is absent or unparsable — the caller then applies the
 // per-kind defaults.
@@ -344,7 +347,10 @@ func secondsToUTCMidnight(now time.Time) time.Duration {
 }
 
 // snippet bounds a body for Message: the plugin slices failures to 300
-// chars (lib/index.js httpFailure).
+// chars (lib/index.js httpFailure). The budget is BYTES, but the cut backs
+// off to a rune boundary so a multi-byte body (Cyrillic, emoji) straddling
+// byte 300 can never emit invalid UTF-8 — at most one leading partial rune
+// is dropped.
 const maxSnippet = 300
 
 func snippet(body []byte) string {
@@ -352,5 +358,9 @@ func snippet(body []byte) string {
 	if len(s) <= maxSnippet {
 		return s
 	}
-	return strings.TrimSpace(s[:maxSnippet])
+	cut := maxSnippet
+	for cut > 0 && cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(s[:cut])
 }

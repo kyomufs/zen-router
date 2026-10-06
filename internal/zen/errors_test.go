@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Fixtures follow spec §4 "Error envelopes" (gateway design doc lines
@@ -326,7 +327,9 @@ func TestClassifyMalformed(t *testing.T) {
 
 func TestClassifyRetryAfterHTTPDate(t *testing.T) {
 	// The plugin accepts both decimal seconds and an HTTP-date
-	// (index.js parseRetryAfter: Number() then Date.parse).
+	// (index.js parseRetryAfter: Number() then Date.parse); our port
+	// parses whole (integer) seconds or the HTTP-date — this test pins
+	// the date path.
 	header := errNow.Add(90 * time.Second).Format(time.RFC1123)
 	got := classify(errNow, 429, errEnvelope("RateLimitError", "slow down"), header)
 	if got == nil {
@@ -380,5 +383,37 @@ func TestUpstreamErrorString(t *testing.T) {
 	var nilErr *UpstreamError
 	if msg := nilErr.Error(); !strings.Contains(msg, "nil") {
 		t.Errorf("nil.Error() = %q, want a safe <nil> rendering", msg)
+	}
+}
+
+// TestSnippetKeepsRuneBoundary: the Message snippet bounds a body at 300
+// BYTES (lib/index.js httpFailure parity), but a naive byte slice can cut a
+// multi-byte rune in half — a Cyrillic body straddling byte 300 would emit
+// invalid UTF-8. The truncation must back off to a rune boundary while
+// staying within the byte budget.
+func TestSnippetKeepsRuneBoundary(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString(strings.Repeat("a", 299)) // byte 299 starts a 2-byte п
+	sb.WriteString(strings.Repeat("привет мир ", 50))
+	body := []byte(sb.String())
+	if len(body) <= maxSnippet {
+		t.Fatalf("fixture length = %d, want > maxSnippet=%d", len(body), maxSnippet)
+	}
+
+	got := snippet(body)
+	if !utf8.ValidString(got) {
+		t.Errorf("snippet split a multi-byte rune: invalid UTF-8 at the cut (% x)",
+			got[len(got)-3:])
+	}
+	if len(got) > maxSnippet {
+		t.Errorf("snippet length = %d, want <= %d (byte budget must hold)", len(got), maxSnippet)
+	}
+	if trimmed := strings.TrimSpace(string(body)); !strings.HasPrefix(trimmed, got) {
+		t.Errorf("snippet is not a prefix of the body: cut altered content")
+	}
+	// The boundary must have backed off to a complete rune, not merely
+	// happened to be valid: the byte right after the cut starts a rune.
+	if len(got) < maxSnippet-1 {
+		t.Errorf("snippet length = %d, expected maxSnippet minus at most one incomplete rune", len(got))
 	}
 }

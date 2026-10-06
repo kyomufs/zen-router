@@ -652,7 +652,7 @@ func TestBudgetExhaustedSurfaces429(t *testing.T) {
 	}
 	n, err := strconv.Atoi(gotRetry)
 	if err != nil {
-		t.Fatalf("Retry-After = %q, want decimal seconds: %v", gotRetry, err)
+		t.Fatalf("Retry-After = %q, want whole seconds: %v", gotRetry, err)
 	}
 	if n < wantRetry-30 || n > wantRetry+5 {
 		t.Errorf("Retry-After = %d, want ≈ %d (seconds to next UTC midnight)", n, wantRetry)
