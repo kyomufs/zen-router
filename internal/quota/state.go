@@ -7,10 +7,14 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"zen-router/internal/config"
 )
 
-// State file layout (~/.dsh/state/zen-router/state.json). This is deliberately
-// separate from the plugin's per-family quota.json: the router tracks which
+// State file layout ($XDG_STATE_HOME/zen-router/state.json; the legacy
+// ~/.dsh/state location is migrated once by config.MigrateLegacyState).
+// This is deliberately separate from the plugin's per-family quota.json: the
+// router tracks which
 // egress (direct/warp) is spent, plus the WARP device identity used for
 // rotation. It reads the plugin's quota.json only as an advisory signal.
 type State struct {
@@ -39,16 +43,16 @@ type EgressStats struct {
 
 // WarpIdentity is the registered WARP device.
 type WarpIdentity struct {
-	DeviceID  string `json:"deviceId"`
-	Token     string `json:"token"`
-	License   string `json:"license,omitempty"`
-	PrivateKey string `json:"privateKey"`
-	PublicKey  string `json:"publicKey"`
-	AddressV4 string `json:"addressV4,omitempty"`
-	AddressV6 string `json:"addressV6,omitempty"`
-	Endpoint  string `json:"endpoint,omitempty"`
-	ServerPub string `json:"serverPub,omitempty"`
-	RegisteredAt int64 `json:"registeredAt"`
+	DeviceID     string `json:"deviceId"`
+	Token        string `json:"token"`
+	License      string `json:"license,omitempty"`
+	PrivateKey   string `json:"privateKey"`
+	PublicKey    string `json:"publicKey"`
+	AddressV4    string `json:"addressV4,omitempty"`
+	AddressV6    string `json:"addressV6,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	ServerPub    string `json:"serverPub,omitempty"`
+	RegisteredAt int64  `json:"registeredAt"`
 }
 
 // Rotation is one recorded IP-rotation event.
@@ -66,18 +70,11 @@ type Manager struct {
 	s    *State
 }
 
-// DefaultPath is where the router keeps its state.
+// DefaultPath is where the router keeps its state: $ZEN_ROUTER_STATE when set,
+// otherwise the XDG default owned by internal/config (single source of truth;
+// config never imports quota, so there is no cycle).
 func DefaultPath() string {
-	if v := os.Getenv("ZEN_ROUTER_STATE"); v != "" {
-		return v
-	}
-	home := os.Getenv("DSH_HOME")
-	if home == "" {
-		if h, err := os.UserHomeDir(); err == nil {
-			home = filepath.Join(h, ".dsh")
-		}
-	}
-	return filepath.Join(home, "state", "zen-router", "state.json")
+	return config.StateFile()
 }
 
 func emptyState() *State {
