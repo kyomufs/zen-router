@@ -846,6 +846,11 @@ func TestResponsesAutoRoute(t *testing.T) {
 		// handler must still force stream:true upstream (and clamp "max" →
 		// "xhigh" before ChatToResponses) — the client flag only chooses
 		// the LOCAL rendering (buffered JSON when false/omitted).
+		// Whole-branch-2 nit (N-1): this is no longer the force-proof —
+		// the client body below already sends "stream":true, so the
+		// upstream value would be true either way. The force itself is
+		// pinned by TestNonStreamingResponsesLane (client stream:false →
+		// upstream still true).
 		clientBody := `{"model":"` + responsesModel + `","stream":true,` +
 			`"messages":[{"role":"user","content":"hello"}],"reasoning_effort":"max"}`
 		rec := httptest.NewRecorder()

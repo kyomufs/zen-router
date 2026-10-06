@@ -568,7 +568,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 //
 // with "metadata" as a TOP-LEVEL SIBLING of "error" and only on 429s
 // (round-tripped from the upstream failure when present, {} otherwise;
-// spec §5/§9d metadata rule). Note this is NOT the upstream Zen envelope
+// the metadata-only-on-429 rule is spec §4:140). Note this is NOT the
+// upstream Zen envelope
 // {"type":"error","error":{...}} the daemon parses in internal/zen — the
 // wrapper "type" key never reaches a client.
 //

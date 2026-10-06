@@ -294,12 +294,16 @@ func decodeEnvelope(b []byte) (typ, msg string, ok bool) {
 	return "", "", false
 }
 
-// parseRetryAfter mirrors the plugin's parseRetryAfter (lib/index.js:768):
-// whole (integer) seconds first — isDigits rejects a decimal like 1.5 —
-// RFC1123 HTTP-date otherwise; both clamp to a
-// minimum of 1s so RetryAfter == 0 unambiguously means "absent". ok=false
-// means the header is absent or unparsable — the caller then applies the
-// per-kind defaults.
+// parseRetryAfter parses the two Retry-After shapes the plugin's
+// parseRetryAfter (lib/index.js:768) handles: whole (integer) seconds
+// first — isDigits rejects a decimal like 1.5 — then RFC1123 HTTP-date;
+// both clamp to a minimum of 1s so RetryAfter == 0 unambiguously means
+// "absent". Divergence from the plugin, noted the same way as
+// errors_test.go TestClassifyRetryAfterHTTPDate: the plugin's Number()
+// ACCEPTS a decimal such as 1.5 while this port rejects it — HTTP
+// delay-seconds is integer-only, so a decimal header is treated here as
+// unparsable. ok=false means the header is absent or unparsable — the
+// caller then applies the per-kind defaults.
 func parseRetryAfter(header string, now time.Time) (time.Duration, bool) {
 	h := strings.TrimSpace(header)
 	if h == "" || !isDigits(h) {
