@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"zen-router/internal/config"
+	"zen-router/internal/proxy"
+	"zen-router/internal/router"
 )
 
 // chatSSERespond is the shared upstream script: a reasoning delta, two
@@ -324,67 +326,198 @@ func TestNonStreamingUpstreamDiesMidBuffer(t *testing.T) {
 // TestNonStreamingResponsesLane: the Responses lane honors the client flag
 // too — upstream still streams (translated + stamped), the client gets one
 // JSON completion carrying translated reasoning, content, finish and usage.
+// Both loopable stream-key shapes are pinned (N-3): "stream":false and the
+// omitted flag, which takes the same body["stream"].(bool) → false path.
 func TestNonStreamingResponsesLane(t *testing.T) {
 	const responsesModel = "muse-spark-1.3-contributor-free"
 
-	rot := newTestRotator(t)
-	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+	for _, tc := range []struct {
+		name      string
+		streamKey string
+	}{
+		{"stream false returns one JSON completion", `"stream":false,`},
+		{"omitted stream defaults to non-streaming", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rot := newTestRotator(t)
+			up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+				writeSSE(wrap(w),
+					`data: {"type":"response.reasoning_text.delta","delta":"think","output_index":0}`+"\n\n",
+					`data: {"type":"response.output_text.delta","delta":"Hello","output_index":0}`+"\n\n",
+					`data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2}}}`+"\n\n",
+				)
+			})
+			h := New(rot, config.Default())
+			h.Upstream = up.srv.URL
+
+			clientBody := `{"model":"` + responsesModel + `",` + tc.streamKey +
+				`"messages":[{"role":"user","content":"hello"}]}`
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newChatRequest(clientBody))
+			env := requireJSONCompletion(t, rec)
+
+			reqs := up.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("upstream requests = %d, want 1", len(reqs))
+			}
+			if p := reqs[0].Path; p != "/zen/v1/responses" {
+				t.Errorf("upstream path = %s, want /zen/v1/responses", p)
+			}
+			ub := decodeJSONMap(t, reqs[0].Body)
+			if s, _ := ub["stream"].(bool); !s {
+				t.Errorf("upstream stream = %v, want true (responses lane streams upstream regardless)",
+					ub["stream"])
+			}
+
+			if o, _ := env["object"].(string); o != "chat.completion" {
+				t.Errorf("object = %v, want chat.completion", env["object"])
+			}
+			if mdl, _ := env["model"].(string); mdl != responsesModel {
+				t.Errorf("model = %v, want %s (stamped through translation)", env["model"], responsesModel)
+			}
+			if id, _ := env["id"].(string); !strings.HasPrefix(id, "chatcmpl") {
+				t.Errorf("id = %v, want chatcmpl* prefix (stamped)", env["id"])
+			}
+
+			msg, finish := requireChoice(t, env)
+			if c, _ := msg["content"].(string); c != "Hello" {
+				t.Errorf("message.content = %q, want Hello", c)
+			}
+			if rc, _ := msg["reasoning_content"].(string); rc != "think" {
+				t.Errorf("message.reasoning_content = %q, want think", rc)
+			}
+			if finish != "stop" {
+				t.Errorf("finish_reason = %q, want stop", finish)
+			}
+			usage, _ := env["usage"].(map[string]any)
+			if usage == nil {
+				t.Fatalf("usage missing: %s", truncate(mustMarshalForLog(t, env)))
+			}
+			if pt, _ := usage["prompt_tokens"].(float64); int(pt) != 5 {
+				t.Errorf("usage.prompt_tokens = %v, want 5", usage["prompt_tokens"])
+			}
+			if tt, _ := usage["total_tokens"].(float64); int(tt) != 7 {
+				t.Errorf("usage.total_tokens = %v, want 7", usage["total_tokens"])
+			}
+		})
+	}
+}
+
+// oneShotRot is the DM-11 seam: Attempt offers a plain direct attempt and
+// NextAttempt grants exactly ONE re-issue, then exhausts. The live router
+// can never produce this shape — a post-buffer failure is KindTransport and
+// the router declines it (ledger: "KindTransport→false") — so the buffer's
+// reset() guarantee is pinned here by construction.
+type oneShotRot struct {
+	offered bool
+}
+
+func (r *oneShotRot) Attempt() router.Attempt {
+	return router.Attempt{Key: "k1", Egress: proxy.EgressDirect, Transport: http.DefaultTransport, Step: 0}
+}
+
+func (r *oneShotRot) NextAttempt(_ router.Report) (router.Attempt, bool) {
+	if r.offered {
+		return router.Attempt{}, false
+	}
+	r.offered = true
+	return router.Attempt{
+		Key:       "k2",
+		Egress:    proxy.EgressDirect,
+		Transport: http.DefaultTransport,
+		Step:      1,
+	}, true
+}
+
+// TestBufferResetAfterFailedAttempt (DM-11): defense-in-depth for
+// completionBuffer.reset(). Attempt 1 emits one complete content frame and
+// then dies mid-stream; the buffered client wrote nothing, so the handler
+// re-issues (oneShotRot grants it — the live rotator would not). The ONE
+// flushed chat.completion must carry ONLY attempt-2 content: a partially
+// buffered failed attempt never leaks into the re-issued success.
+func TestBufferResetAfterFailedAttempt(t *testing.T) {
+	rot := &oneShotRot{}
+	up := newFakeUpstream(t, func(call int, w http.ResponseWriter, _ *http.Request) {
+		if call == 1 {
+			writeSSE(wrap(w),
+				`data: {"id":"c","choices":[{"index":0,"delta":{"content":"partial-first"}}]}`+"\n\n",
+			)
+			panic(http.ErrAbortHandler) // attempt 1 dies after buffering a frame
+		}
 		writeSSE(wrap(w),
-			`data: {"type":"response.reasoning_text.delta","delta":"think","output_index":0}`+"\n\n",
-			`data: {"type":"response.output_text.delta","delta":"Hello","output_index":0}`+"\n\n",
-			`data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2}}}`+"\n\n",
+			`data: {"id":"c","choices":[{"index":0,"delta":{"content":"second"}}]}`+"\n\n",
+			`data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n",
+			"data: [DONE]"+"\n\n",
 		)
 	})
 	h := New(rot, config.Default())
 	h.Upstream = up.srv.URL
 
-	clientBody := `{"model":"` + responsesModel + `","stream":false,` +
-		`"messages":[{"role":"user","content":"hello"}]}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, newChatRequest(clientBody))
+	h.ServeHTTP(rec, newChatRequest(nonStreamBody(`"stream":false,`)))
+
+	env := requireJSONCompletion(t, rec)
+	if n := len(up.requests()); n != 2 {
+		t.Fatalf("upstream requests = %d, want 2 (one re-issue granted)", n)
+	}
+	msg, finish := requireChoice(t, env)
+	if c, _ := msg["content"].(string); c != "second" {
+		t.Errorf("message.content = %q, want %q (attempt-1 frames must be reset)", c, "second")
+	}
+	if body := rec.Body.String(); strings.Contains(body, "partial-first") {
+		t.Errorf("attempt-1 content leaked into the flushed body: %s", truncate(rec.Body.Bytes()))
+	}
+	if finish != "stop" {
+		t.Errorf("finish_reason = %q, want stop (from the attempt-2 finish frame)", finish)
+	}
+}
+
+// TestNonStreamingZeroFrameFlush (DM-12): a clean 2xx upstream stream that
+// carries ONLY the terminator — no content, no finish, no usage frame —
+// still flushes ONE valid chat.completion: 200, application/json, empty
+// content, finish_reason "stop", the zero usage object, the request model
+// and a chatcmpl* id (documented buffer.go flush fallbacks).
+func TestNonStreamingZeroFrameFlush(t *testing.T) {
+	rot := newTestRotator(t)
+	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		writeSSE(wrap(w), "data: [DONE]"+"\n\n")
+	})
+	h := New(rot, config.Default())
+	h.Upstream = up.srv.URL
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newChatRequest(nonStreamBody(`"stream":false,`)))
 	env := requireJSONCompletion(t, rec)
 
-	reqs := up.requests()
-	if len(reqs) != 1 {
-		t.Fatalf("upstream requests = %d, want 1", len(reqs))
+	if n := len(up.requests()); n != 1 {
+		t.Errorf("upstream requests = %d, want 1", n)
 	}
-	if p := reqs[0].Path; p != "/zen/v1/responses" {
-		t.Errorf("upstream path = %s, want /zen/v1/responses", p)
-	}
-	ub := decodeJSONMap(t, reqs[0].Body)
-	if s, _ := ub["stream"].(bool); !s {
-		t.Errorf("upstream stream = %v, want true (responses lane streams upstream regardless)",
-			ub["stream"])
-	}
-
 	if o, _ := env["object"].(string); o != "chat.completion" {
 		t.Errorf("object = %v, want chat.completion", env["object"])
 	}
-	if mdl, _ := env["model"].(string); mdl != responsesModel {
-		t.Errorf("model = %v, want %s (stamped through translation)", env["model"], responsesModel)
-	}
 	if id, _ := env["id"].(string); !strings.HasPrefix(id, "chatcmpl") {
-		t.Errorf("id = %v, want chatcmpl* prefix (stamped)", env["id"])
+		t.Errorf("id = %v, want chatcmpl* prefix (random fallback stamp)", env["id"])
+	}
+	if mdl, _ := env["model"].(string); mdl != "mimo-v2.6-flash-free" {
+		t.Errorf("model = %v, want the request model (no frame stamped it)", env["model"])
+	}
+	if cr, _ := env["created"].(float64); cr <= 0 {
+		t.Errorf("created = %v, want > 0 fallback stamp", env["created"])
 	}
 
 	msg, finish := requireChoice(t, env)
-	if c, _ := msg["content"].(string); c != "Hello" {
-		t.Errorf("message.content = %q, want Hello", c)
-	}
-	if rc, _ := msg["reasoning_content"].(string); rc != "think" {
-		t.Errorf("message.reasoning_content = %q, want think", rc)
+	if c, _ := msg["content"].(string); c != "" {
+		t.Errorf("message.content = %q, want empty (stream carried no content)", c)
 	}
 	if finish != "stop" {
-		t.Errorf("finish_reason = %q, want stop", finish)
+		t.Errorf("finish_reason = %q, want stop (flush fallback)", finish)
 	}
 	usage, _ := env["usage"].(map[string]any)
 	if usage == nil {
-		t.Fatalf("usage missing: %s", truncate(mustMarshalForLog(t, env)))
+		t.Fatalf("usage missing (must default to the zero object): %s",
+			truncate(mustMarshalForLog(t, env)))
 	}
-	if pt, _ := usage["prompt_tokens"].(float64); int(pt) != 5 {
-		t.Errorf("usage.prompt_tokens = %v, want 5", usage["prompt_tokens"])
-	}
-	if tt, _ := usage["total_tokens"].(float64); int(tt) != 7 {
-		t.Errorf("usage.total_tokens = %v, want 7", usage["total_tokens"])
+	if tt, _ := usage["total_tokens"].(float64); int(tt) != 0 {
+		t.Errorf("usage.total_tokens = %v, want 0 default", usage["total_tokens"])
 	}
 }

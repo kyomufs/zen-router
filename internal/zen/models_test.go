@@ -256,3 +256,41 @@ func TestClampEffortReasoningRequired(t *testing.T) {
 		})
 	}
 }
+
+// TestClampEffortTieBreak pins the documented tie rule (models.go:97-99):
+// when the clamped request sits equidistant from two ladder entries, the
+// EARLIER (lower) ladder entry wins. Ruled over the plugin, which breaks
+// ties UPWARD — ledger-plan1.md:13 ("minimal→off over plugin upward").
+// The tie is unreachable in production traffic today (it needs an
+// off-ladder word exactly halfway between two entries); this test exists
+// so the ruling cannot regress silently. The clamp VALUES also appear as
+// rows in TestClampEffort — this test names the rule itself.
+func TestClampEffortTieBreak(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		input string
+		want  string
+	}{
+		// mimo ladder [off low medium high]: "minimal" (global index 1)
+		// is 1 step from both "off" and "low" → tie → earlier entry
+		// "off" (the plugin would answer "low").
+		{"mimo minimal ties off vs low", "mimo-v2.6-flash-free", "minimal", "off"},
+		// Default ladder [off low high max]: "medium" (global index 3)
+		// is 1 step from both "low" and "high" → tie → earlier entry
+		// "low" (the plugin would answer "high").
+		{"default ladder medium ties low vs high", "big-pickle", "medium", "low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := ResolveModel(tc.model)
+			if err != nil {
+				t.Fatalf("ResolveModel(%q): %v", tc.model, err)
+			}
+			if got := ClampEffort(m, tc.input); got != tc.want {
+				t.Errorf("ClampEffort(%q, %q) = %q, want %q (tie → earlier ladder entry)",
+					tc.model, tc.input, got, tc.want)
+			}
+		})
+	}
+}

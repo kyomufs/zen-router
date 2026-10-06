@@ -1,6 +1,8 @@
 package zen
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -342,6 +344,16 @@ func TestChatToResponsesEffort(t *testing.T) {
 		{"max clamps to xhigh", "muse-spark-1.3-contributor-free", "max", "xhigh"},
 		{"minimal passes ladder", "muse-spark-1.3-contributor-free", "minimal", "minimal"},
 		{"absent omitted", "muse-spark-1.3-contributor-free", nil, nil},
+		// DM-1: the absent path through the TRANSLATION (responsesEffort
+		// case ""), where the clamp side is covered in models_test.go:
+		// reasoningRequired defaults to "high" (index.js:1258), while a
+		// model the ResolveModel probe cannot resolve (zero Model —
+		// responses.go findModel → undefined) keeps the key ABSENT.
+		{"absent on reasoningRequired defaults high", "space-bunny-free", nil, "high"},
+		{"absent on unknown model stays absent", "some-other-model", nil, nil},
+		// An explicitly empty value type-asserts to "" and takes the same
+		// case "" path as an absent key.
+		{"empty effort treated as absent", "muse-spark-1.3-contributor-free", "", nil},
 		// Unknown model: plugin findModel → undefined → DEFAULT_EFFORT_IDS
 		// ladder [off low high max], so "max" passes unchanged.
 		{"unknown model keeps word", "some-other-model", "max", "max"},
@@ -376,6 +388,66 @@ func TestChatToResponsesEffort(t *testing.T) {
 				t.Errorf("reasoning.effort = %v, want %v", obj["effort"], tc.want)
 			}
 		})
+	}
+}
+
+// TestChatToResponsesInputUnchanged pins the documented contract at
+// responses.go:62 — "the input is never mutated: a fresh map is returned".
+// The handler decodes a fresh body per request (json.Unmarshal into a new
+// map), so the request-level immutability holds by construction; what needs
+// a test is the call itself: after ChatToResponses returns, the input map
+// must still marshal to the same JSON as before, and a second call over the
+// same input must return an equal output (no destructive reads, no
+// order-dependent state).
+func TestChatToResponsesInputUnchanged(t *testing.T) {
+	chat := map[string]any{
+		"model": "muse-spark-1.3-contributor-free",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "Hi"},
+			map[string]any{"role": "assistant", "content": "Hello"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{"id": "call_1", "type": "function", "function": map[string]any{
+					"name": "get_weather", "arguments": `{"city":"MSK"}`,
+				}},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{
+				"name":        "get_weather",
+				"description": "look up weather",
+				"parameters":  map[string]any{"type": "object"},
+			}},
+		},
+		"tool_choice":      "auto",
+		"temperature":      0.2,
+		"max_tokens":       float64(64),
+		"reasoning_effort": "high",
+		"stream":           false,
+	}
+
+	before, err := json.Marshal(chat)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	first, err := ChatToResponses(chat)
+	if err != nil {
+		t.Fatalf("ChatToResponses: %v", err)
+	}
+	after, err := json.Marshal(chat)
+	if err != nil {
+		t.Fatalf("re-marshal input: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("input mutated:\nbefore = %s\nafter  = %s", before, after)
+	}
+
+	second, err := ChatToResponses(chat)
+	if err != nil {
+		t.Fatalf("second ChatToResponses: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("repeat call not deterministic:\nfirst  = %#v\nsecond = %#v", first, second)
 	}
 }
 
@@ -528,6 +600,16 @@ func TestChatToResponsesMaxTokens(t *testing.T) {
 		{
 			"string uses model cap",
 			map[string]any{"max_tokens": "lots"},
+			131072,
+		},
+		{
+			// DM-3: JSON `null` decodes to a nil map value with the key
+			// PRESENT (ok=true), so the max_tokens fallback is never
+			// consulted: null is not a positive safe integer and the
+			// budget (model cap) is returned — never over-budget, and
+			// not the max_tokens value sitting next to it.
+			"null max_completion_tokens uses model cap, not max_tokens",
+			map[string]any{"max_completion_tokens": nil, "max_tokens": float64(100)},
 			131072,
 		},
 		{
