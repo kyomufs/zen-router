@@ -88,3 +88,13 @@ Fix commits: 6d50b7e (F1 OpenAI envelope, code mirrors type, metadata sibling on
 Re-review 746f8f69: APPROVE, gates green (gofmt/build/vet/short/count=3). Streaming regression NONE (sink selection single-point, DSH plugin sends stream:true → SSE untouched). Envelope single-funnel 12 writes; cross-checked vs plugin gatewayError parser (reads error.type — Plan 3 compatible).
 New deferred-minors (6, non-blocking): (1) buffer.go merge concatenates all choices (n>1 hypothetical — upstream has no n); (2) handler.go:571 comment cites §5 metadata rule, actually §4:140; (3) errors.go:297 comment overstates plugin parity (plugin Number() accepts 1.5, port rejects — spec-correct); (4) no test pinning buf.reset after partial-buffered failed attempt (unreachable: post-buffer failures are KindTransport → no re-issue); (5) zero-frame flush untested (200 + content:"" valid); (6) upstream metadata:null passes to client as null instead of {}.
 Next: whole-branch re-run (package /tmp/zen-review-whole-branch-2.txt, base 9589783 head e6da9f0, 50 commits, 467KB).
+
+## Whole-branch RE-RUN verdict (2026-10-07 02:32 MSK): APPROVE-PLAN1
+Reviewer 2eeaea21, package /tmp/zen-review-whole-branch-2.txt (467KB, base 9589783 head e6da9f0, 50 commits).
+- All 4 T14 findings verified fixed (envelope requireOpenAIError pins; buffered path sink selection single-point, buf.reset per attempt, D1 3-attempt proof pre-flush; integer-seconds wording; snippet rune boundary).
+- Zero regressions: stage.go/go.mod/go.sum untouched by T14; streaming path byte-equivalent for stream:true; force-stream pin strengthened by TestNonStreamingResponsesLane.
+- Traces A (429 both counters → stages → envelope+metadata+Retry-After), B (transport → false → 502 no metadata), C (non-streaming both lanes → one JSON, no SSE) all green in code+pins.
+- Gates 5/5 green at HEAD cf4f92d; package byte-identical to repo diff; scope clean (C/D/E absent); hermeticity intact.
+- 3 new nits (non-blocking): force-pin attribution note, empty PLAN SLICE header in package generator, no omitted-stream responses-lane test (redundant coverage).
+- Deferred minors now total 13 (7 from first run + 6 from T14-re) → Phase E checklist.
+PLAN 1 CLOSED: all 14 ledger entries + APPROVE-PLAN1. Ready for user review of Plan 2 (docs/superpowers/plans/2026-10-07-zen-router-phase-c-tui.md) and Plan 3 (2026-10-07-dsh-opencode-zen-thin.md).
