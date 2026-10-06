@@ -188,6 +188,39 @@ func truncate(b []byte) string {
 	return string(b)
 }
 
+// requireOpenAIError asserts the CLIENT-facing error envelope is the
+// OpenAI shape of spec §5:184-187 — {"error":{"message","type","code"}} —
+// with NO top-level "type" wrapper (that wrapper is the UPSTREAM Zen
+// envelope the daemon parses, never the one it emits). code mirrors type:
+// one stable machine-readable class string per error, so Plan 3 mapping by
+// error.type keeps working and code is checkable verbatim. Returns the
+// decoded envelope so callers can assert 429-only metadata.
+func requireOpenAIError(t *testing.T, rec *httptest.ResponseRecorder, wantType string) map[string]any {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	env := decodeJSONMap(t, rec.Body.Bytes())
+	if _, ok := env["type"]; ok {
+		t.Errorf("top-level type wrapper present — client envelope must be OpenAI shape {\"error\":{...}}: %s",
+			truncate(rec.Body.Bytes()))
+	}
+	inner, _ := env["error"].(map[string]any)
+	if inner == nil {
+		t.Fatalf("envelope has no error object: %s", truncate(rec.Body.Bytes()))
+	}
+	if typ, _ := inner["type"].(string); typ != wantType {
+		t.Errorf("error.type = %v, want %s", inner["type"], wantType)
+	}
+	if code, _ := inner["code"].(string); code != wantType {
+		t.Errorf("error.code = %v, want %s (code mirrors type: one stable class string)", inner["code"], wantType)
+	}
+	if msg, _ := inner["message"].(string); msg == "" {
+		t.Error("error.message is empty")
+	}
+	return env
+}
+
 // toolNames extracts display names from a tools array in either wire shape:
 // OpenAI chat ({"function":{"name":…}}) or Responses flat ({"name":…}).
 func toolNames(t *testing.T, toolsRaw any) []string {
@@ -602,20 +635,7 @@ func TestBudgetExhaustedSurfaces429(t *testing.T) {
 		t.Errorf("upstream requests = %d, want exactly 3 (no infinite loop)", n)
 	}
 
-	env := decodeJSONMap(t, rec.Body.Bytes())
-	if typ, _ := env["type"].(string); typ != "error" {
-		t.Errorf("envelope type = %v, want error", env["type"])
-	}
-	inner, _ := env["error"].(map[string]any)
-	if inner == nil {
-		t.Fatalf("envelope has no error object: %s", truncate(rec.Body.Bytes()))
-	}
-	if typ, _ := inner["type"].(string); typ != "FreeUsageLimitError" {
-		t.Errorf("error.type = %v, want FreeUsageLimitError", inner["type"])
-	}
-	if msg, _ := inner["message"].(string); msg == "" {
-		t.Error("error.message is empty")
-	}
+	env := requireOpenAIError(t, rec, "FreeUsageLimitError")
 	md, _ := env["metadata"].(map[string]any)
 	if md == nil {
 		t.Fatalf("429 envelope metadata is not an object: %s", truncate(rec.Body.Bytes()))
@@ -929,14 +949,7 @@ func TestResponsesAutoRoute(t *testing.T) {
 		if n := len(up.requests()); n != 0 {
 			t.Errorf("upstream requests = %d, want 0 (rejected pre-upstream)", n)
 		}
-		env := decodeJSONMap(t, rec.Body.Bytes())
-		inner, _ := env["error"].(map[string]any)
-		if inner == nil {
-			t.Fatalf("no error object: %s", truncate(rec.Body.Bytes()))
-		}
-		if typ, _ := inner["type"].(string); typ != "InvalidRequestError" {
-			t.Errorf("error.type = %v, want InvalidRequestError", inner["type"])
-		}
+		requireOpenAIError(t, rec, "InvalidRequestError")
 	})
 }
 
@@ -964,20 +977,7 @@ func TestUpstreamDownSurfaces502(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
-	env := decodeJSONMap(t, rec.Body.Bytes())
-	if typ, _ := env["type"].(string); typ != "error" {
-		t.Errorf("envelope type = %v, want error", env["type"])
-	}
-	inner, _ := env["error"].(map[string]any)
-	if inner == nil {
-		t.Fatalf("no error object: %s", truncate(rec.Body.Bytes()))
-	}
-	if typ, _ := inner["type"].(string); typ != "TransportError" {
-		t.Errorf("error.type = %v, want TransportError (KindTransport class)", inner["type"])
-	}
-	if msg, _ := inner["message"].(string); msg == "" {
-		t.Error("error.message is empty")
-	}
+	env := requireOpenAIError(t, rec, "TransportError")
 	if _, ok := env["metadata"]; ok {
 		t.Errorf("metadata must appear only on 429 envelopes: %s", truncate(rec.Body.Bytes()))
 	}
@@ -1025,14 +1025,7 @@ func TestFirstEventBudgetCoversHeaders(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
-	env := decodeJSONMap(t, rec.Body.Bytes())
-	inner, _ := env["error"].(map[string]any)
-	if inner == nil {
-		t.Fatalf("no error object: %s", truncate(rec.Body.Bytes()))
-	}
-	if typ, _ := inner["type"].(string); typ != "TransportError" {
-		t.Errorf("error.type = %v, want TransportError (KindTransport class)", inner["type"])
-	}
+	requireOpenAIError(t, rec, "TransportError")
 	if n := len(up.requests()); n != 1 {
 		t.Errorf("upstream attempts = %d, want 1 (stalled-headers attempt is not re-issued)", n)
 	}

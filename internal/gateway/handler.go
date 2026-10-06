@@ -525,17 +525,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeError emits the spec §4 gateway envelope:
+// writeError emits the CLIENT-facing envelope of spec §5:184-187 — the
+// OpenAI error shape:
 //
-//	{"type":"error","error":{"type":…,"message":…},"metadata":…}
+//	{"error":{"message":…,"type":…,"code":…}}
 //
-// metadata appears ONLY on 429s (round-tripped from the upstream failure
-// when present, {} otherwise). Callers set Retry-After for 429s before
-// invoking this.
+// with "metadata" as a TOP-LEVEL SIBLING of "error" and only on 429s
+// (round-tripped from the upstream failure when present, {} otherwise;
+// spec §5/§9d metadata rule). Note this is NOT the upstream Zen envelope
+// {"type":"error","error":{...}} the daemon parses in internal/zen — the
+// wrapper "type" key never reaches a client.
+//
+// error.type keeps the raw classification path (errorClass), identical to
+// the previous envelope, so Plan 3 mapping by error.type stays compatible.
+// error.code MIRRORS type: the daemon exposes exactly one stable
+// machine-readable class string per error, and duplicating it in "code"
+// satisfies spec §5:192-193 (machine-readable code) without inventing a
+// second code vocabulary the DSH plugin would have to keep in sync.
+// Callers set Retry-After for 429s before invoking this.
 func writeError(w http.ResponseWriter, status int, typ, msg string, metadata json.RawMessage) {
 	env := map[string]any{
-		"type":  "error",
-		"error": map[string]any{"type": typ, "message": msg},
+		"error": map[string]any{"message": msg, "type": typ, "code": typ},
 	}
 	if status == http.StatusTooManyRequests {
 		if len(metadata) > 0 && json.Valid(metadata) {
