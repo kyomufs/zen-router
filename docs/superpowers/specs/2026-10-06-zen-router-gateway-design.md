@@ -179,6 +179,20 @@ Uninstall via `zen-router install-systemd --remove`.
   pool, disguise/session code, Responses routing, watchdogs, in-process retry.
   All of it moves to the daemon. The panel's replacement is the TUI.
 
+## 9b. Plugin source repo state (discovered 2026-10-06)
+
+- Source repo cloned to `/home/kyomufs/Projects/dsh-opencode-zen` (GitHub
+  `kyomufs/dsh-opencode-zen`); the profile pins
+  `github:kyomufs/dsh-opencode-zen#a416790` in `profiles/web/package.json`.
+- Repo HEAD `c2471d2` ("drop the status panel and client seat; route traffic
+  through the zen-router proxy") is an intermediate iteration of THIS project
+  that is NOT installed: it removed `lib/status.js` + `lib/client.js` and
+  defaulted `OPENCODE_BASE` to `127.0.0.1:8787/zen/v1` (the transport-proxy
+  variant, superseded by the OpenAI-shim decision in §3).
+- Plan implication: phase D builds the thin adapter from the pinned
+  `a416790` lineage's protocol knowledge (or reworks `c2471d2`), and the
+  profile pin moves to the new commit only after the user's отмашка.
+
 ## 10. Config and paths (approved: XDG)
 
 - `$XDG_CONFIG_HOME/zen-router/config.json` (default `~/.config/zen-router/config.json`):
