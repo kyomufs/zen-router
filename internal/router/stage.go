@@ -230,12 +230,20 @@ func (r *Router) otherKey(current string) (string, bool) {
 func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
 	r.mu.Lock()
 	inside := time.Since(r.lastRotate) < r.rotationCooldown
-	already := r.cooldownSwapped
+	if inside {
+		if r.cooldownSwapped {
+			// The window's switch was already claimed/persisted — plain
+			// false, no tunnel churn.
+			r.mu.Unlock()
+			return Attempt{}, false
+		}
+		// Claim the window's single switch ATOMICALLY with the inside read:
+		// concurrent in-window reports must not both proceed into
+		// switchIdentity (both would reconfigure the tunnel).
+		r.cooldownSwapped = true
+	}
 	from := r.egress
 	r.mu.Unlock()
-	if inside && already {
-		return Attempt{}, false
-	}
 
 	idx := r.freshIdentityIndex(now)
 	if idx < 0 {
@@ -260,10 +268,7 @@ func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
 		r.store.RecordRotation(string(from), string(proxy.EgressWarp), "fresh warp identity")
 	}
 	if inside {
-		r.mu.Lock()
-		r.cooldownSwapped = true
-		r.mu.Unlock()
-		return Attempt{}, false
+		return Attempt{}, false // latch already claimed above
 	}
 	r.mu.Lock()
 	r.lastRotate = time.Now()

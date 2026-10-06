@@ -193,6 +193,21 @@ func (r *Router) OnResult(res proxy.Result) {
 	}
 }
 
+// finishRotation is the shared body of the rotate()/RotateNow deferred
+// critical sections: it releases the rotation guard, stamps a new cooldown
+// window and CLEARS the in-window switch latch — every lastRotate stamp from
+// the rotation paths goes through here, so a stale latch can never suppress
+// the first identity switch of the next window. It never switches identities
+// itself (also the test seam for these defers: tests must not run
+// applyRotation, which registers a device against Cloudflare).
+func (r *Router) finishRotation() {
+	r.mu.Lock()
+	r.rotating = false
+	r.lastRotate = time.Now()
+	r.cooldownSwapped = false
+	r.mu.Unlock()
+}
+
 // rotate switches egress in response to a spent bucket. Direct -> warp the
 // first time; warp -> fresh WARP identity (new IP) on subsequent hits.
 func (r *Router) rotate(reason string) {
@@ -210,12 +225,7 @@ func (r *Router) rotate(reason string) {
 	from := r.egress
 	r.mu.Unlock()
 
-	defer func() {
-		r.mu.Lock()
-		r.rotating = false
-		r.lastRotate = time.Now()
-		r.mu.Unlock()
-	}()
+	defer r.finishRotation()
 
 	to, err := r.applyRotation(from, reason)
 	if err != nil {
@@ -238,12 +248,7 @@ func (r *Router) RotateNow(reason string) (proxy.Egress, error) {
 	from := r.egress
 	r.mu.Unlock()
 
-	defer func() {
-		r.mu.Lock()
-		r.rotating = false
-		r.lastRotate = time.Now()
-		r.mu.Unlock()
-	}()
+	defer r.finishRotation()
 
 	to, err := r.applyRotation(from, reason)
 	if err != nil {

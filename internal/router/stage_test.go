@@ -97,9 +97,13 @@ func (tr *testRouter) setWarpEgress(t *testing.T) {
 
 func addIdentity(t *testing.T, st *quota.Manager, device string, spentUntil time.Time) {
 	t.Helper()
+	var spent int64 // 0 = not spent (quota semantics); only stamp real times
+	if !spentUntil.IsZero() {
+		spent = spentUntil.UnixMilli()
+	}
 	st.AddIdentity(&quota.WarpIdentity{
 		DeviceID:   device,
-		SpentUntil: spentUntil.UnixMilli(),
+		SpentUntil: spent,
 	})
 }
 
@@ -301,6 +305,56 @@ func TestNextAttemptIdentityStep(t *testing.T) {
 		}
 		if snap := tr.store.Snapshot(); len(snap.Rotations) != 1 {
 			t.Errorf("Rotations after second report = %d, want 1 (no ping-pong)", len(snap.Rotations))
+		}
+	})
+
+	t.Run("rotation stamp clears the latch for the next window", func(t *testing.T) {
+		// Regression (re-review F1): rotate()/RotateNow stamp lastRotate from
+		// their deferred critical sections WITHOUT an identity switch; that
+		// stamp must clear cooldownSwapped so a stale latch cannot suppress
+		// the FIRST switch of the next window.
+		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
+		addIdentity(t, tr.store, "id0", time.Time{}) // active
+		addIdentity(t, tr.store, "id1", time.Time{})
+
+		// Switch #1 inside a cooldown window (claimed latch, no re-issue).
+		tr.mu.Lock()
+		tr.lastRotate = time.Now()
+		tr.mu.Unlock()
+		rep := Report{
+			Kind:       zen.KindDailyLimit,
+			Egress:     proxy.EgressDirect,
+			Key:        "k2",
+			Step:       1,
+			RetryAfter: time.Hour,
+		}
+		if _, ok := tr.NextAttempt(rep); ok {
+			t.Fatal("in-window report: expected false (no re-issue)")
+		}
+		if tr.sw.calls != 1 {
+			t.Fatalf("identity switch calls = %d, want 1", tr.sw.calls)
+		}
+
+		// Window expires; rotate()/RotateNow re-stamp lastRotate via their
+		// deferred critical section — no identity switch involved.
+		tr.mu.Lock()
+		tr.lastRotate = time.Now().Add(-time.Minute)
+		tr.mu.Unlock()
+		tr.finishRotation() // seam: the rotate()/RotateNow defer body
+		if tr.sw.calls != 1 {
+			t.Fatalf("rotation stamp must not switch, calls = %d", tr.sw.calls)
+		}
+
+		// The new window's first report must still get its switch: the stale
+		// latch must have been cleared by the stamp.
+		if _, ok := tr.NextAttempt(rep); ok {
+			t.Error("first report of new window = true, want false (no re-issue)")
+		}
+		if tr.sw.calls != 2 {
+			t.Errorf("identity switch calls = %d, want 2 (latch cleared by rotation stamp)", tr.sw.calls)
+		}
+		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id0" {
+			t.Errorf("active identity = %v, want id0 after the new window's switch", id)
 		}
 	})
 
@@ -546,6 +600,12 @@ func TestAccountLimitNoRotation(t *testing.T) {
 			}
 			if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id0" {
 				t.Errorf("active identity = %v, want id0 untouched", id)
+			}
+			// Pin the !accountScoped guard: a workspace-scoped report must
+			// NOT burn the active identity's IP window.
+			if id := tr.store.ActiveIdentity(); id != nil && (id.SpentUntil != 0 || id.Last429At != 0) {
+				t.Errorf("active identity stamped by account-scoped report: SpentUntil=%d Last429At=%d, want 0/0",
+					id.SpentUntil, id.Last429At)
 			}
 			if snap := tr.store.Snapshot(); len(snap.Rotations) != 0 {
 				t.Errorf("Rotations = %d, want 0", len(snap.Rotations))
