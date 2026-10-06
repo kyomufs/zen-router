@@ -18,6 +18,9 @@ import (
 	"time"
 
 	"zen-router/internal/cli"
+	"zen-router/internal/config"
+	"zen-router/internal/gateway"
+	"zen-router/internal/keys"
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
@@ -62,7 +65,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `zen-router — local reverse proxy for OpenCode Zen with WARP IP rotation
+	fmt.Fprintf(os.Stderr, `zen-router — local reverse proxy for OpenCode Zen with WARP IP rotation
 
 Usage:
   zen-router up      [--listen ADDR]     start the proxy daemon (foreground)
@@ -71,22 +74,26 @@ Usage:
   zen-router use     <direct|warp>       force the active egress path
   zen-router stop    [--listen ADDR]     gracefully stop the daemon
 
+OpenAI surface (on the same listener):
+  GET /v1/models, POST /v1/chat/completions — OpenAI-compatible endpoints
+
 Environment:
-  ZEN_ROUTER_LISTEN   default listen address (127.0.0.1:8787)
+  ZEN_ROUTER_LISTEN   default listen address (%s)
   ZEN_ROUTER_STATE    state file path
-`)
+`, config.Default().Listen)
 }
 
 func parseListen(args []string) (string, error) {
 	fs := flag.NewFlagSet("zen-router", flag.ContinueOnError)
-	listen := fs.String("listen", "", "listen address (default 127.0.0.1:8787)")
+	listen := fs.String("listen", "", "listen address (default "+config.Default().Listen+")")
 	if err := fs.Parse(args); err != nil {
 		return "", err
 	}
-	return cli.Listen(*listen), nil
+	return cli.Listen(*listen)
 }
 
-// cmdUp starts the daemon: router + proxy + control API, in the foreground.
+// cmdUp starts the daemon: control API + OpenAI gateway + legacy reverse
+// proxy on one listener, in the foreground.
 func cmdUp(args []string) error {
 	listen, err := parseListen(args)
 	if err != nil {
@@ -94,11 +101,37 @@ func cmdUp(args []string) error {
 	}
 	logger := log.New(os.Stderr, "zen-router ", log.LstdFlags|log.Lmsgprefix)
 
+	// Full config: the gateway needs the upstream base URL and watchdog
+	// budgets; the rotator needs the key pool, identity-pool sizing,
+	// cooldown and address family. parseListen already resolved Listen
+	// through the same loader — config.json is a tiny read-only file, so
+	// reading it again here beats duplicating flag-parsing logic.
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	// One-shot legacy-state migration, BEFORE the state file is opened.
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	if _, err := config.MigrateLegacyState(paths); err != nil {
+		return fmt.Errorf("migrate legacy state: %w", err)
+	}
+
 	store, err := quota.Open("")
 	if err != nil {
 		return err
 	}
-	r, err := router.New(router.Options{Store: store, Logger: logger})
+	r, err := router.New(router.Options{
+		Store:            store,
+		Logger:           logger,
+		Pool:             keys.New(cfg.KeyPoolFile),
+		RotationCooldown: cfg.RotationCooldown,
+		Family:           cfg.Family,
+		PoolSize:         cfg.PoolSize,
+		PoolSpare:        cfg.PoolSpare,
+	})
 	if err != nil {
 		return err
 	}
@@ -128,7 +161,17 @@ func cmdUp(args []string) error {
 	defer stop()
 
 	ctrl := &cli.Control{Router: r, Shutdown: stop}
-	handler := ctrl.Handler(srv.Handler())
+	// Three surfaces, ONE listener (plan Task 13): control stays outermost
+	// and unchanged (it intercepts /_zenctl/* by prefix), the OpenAI
+	// gateway takes /v1/*, and everything else — including the legacy
+	// /zen/v1/* the plugin targets — falls through to the reverse proxy.
+	// The gateway must never see /zen/* (it would 404-envelope the
+	// plugin's traffic) and /v1/* must never reach the path-preserving
+	// proxy (the OpenAI path would leak straight to the upstream).
+	root := http.NewServeMux()
+	root.Handle("/v1/", gateway.Mux(r, cfg))
+	root.Handle("/", srv.Handler())
+	handler := ctrl.Handler(root)
 
 	httpSrv := &http.Server{
 		Addr:              listen,
@@ -147,7 +190,7 @@ func cmdUp(args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listen, err)
 	}
-	logger.Printf("zen-router up on http://%s (proxy + %scontrol), egress=%s mode=%s",
+	logger.Printf("zen-router up on http://%s (OpenAI /v1 gateway + %scontrol + legacy proxy), egress=%s mode=%s",
 		listen, cli.ControlPrefix, r.Current(), store.Mode())
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err

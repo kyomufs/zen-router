@@ -451,6 +451,49 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// --- TestGatewayMounts -----------------------------------------------------
+
+// TestGatewayMounts pins the mount contract cmdUp relies on (plan Task 13):
+// the daemon listener stacks THREE prefixes — /_zenctl/* (cli.Control),
+// /v1/* (gateway.Mux) and everything else, including the legacy /zen/v1/*
+// (reverse proxy) — so gateway.Mux must serve the OpenAI surface under
+// /v1/* and MISS the other two prefixes; swallowing either would
+// 404-envelope the plugin's legacy traffic or shadow the control API.
+func TestGatewayMounts(t *testing.T) {
+	rot := newTestRotator(t)
+	m := Mux(rot, config.Default())
+
+	// Served: the OpenAI surface answers with the list envelope.
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/v1/models status = %d, want 200", rec.Code)
+	}
+	var list struct {
+		Object string            `json:"object"`
+		Data   []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode model list: %v", err)
+	}
+	if list.Object != "list" {
+		t.Errorf("object = %q, want list", list.Object)
+	}
+	if len(list.Data) == 0 {
+		t.Error("data is empty, want the daemon's model table")
+	}
+
+	// Not served: both prefixes are mounted OUTSIDE this mux in cmdUp, so a
+	// request reaching this mux for either must 404, not be answered.
+	for _, path := range []string{"/_zenctl/status", "/zen/v1/models"} {
+		rec := httptest.NewRecorder()
+		m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("Mux %s status = %d, want 404 (mounted outside this mux)", path, rec.Code)
+		}
+	}
+}
+
 // --- TestDailyLimitRotationSequence ----------------------------------------
 
 // TestDailyLimitRotationSequence: the upstream 429s the first two attempts

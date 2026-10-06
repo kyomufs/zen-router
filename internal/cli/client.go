@@ -6,23 +6,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"zen-router/internal/config"
 )
 
-// DefaultListen is where the daemon binds the proxy + control API.
-const DefaultListen = "127.0.0.1:8787"
-
-// Listen resolves the daemon address from flag, env, or the default.
-func Listen(flagVal string) string {
+// Listen resolves the daemon address from the flag, or — when the flag is
+// empty — from config.Load (config.json + ZEN_ROUTER_LISTEN env + built-in
+// default, in that precedence). The config package is the single source of
+// truth for listen addresses: the duplicated DefaultListen constant and
+// ZEN_ROUTER_LISTEN parsing that lived here until Task 13 are gone.
+func Listen(flagVal string) (string, error) {
 	if flagVal != "" {
-		return flagVal
+		return flagVal, nil
 	}
-	if v := os.Getenv("ZEN_ROUTER_LISTEN"); v != "" {
-		return v
+	cfg, err := config.Load()
+	if err != nil {
+		return "", err
 	}
-	return DefaultListen
+	return cfg.Listen, nil
 }
 
 // controlBase builds the control API base URL for a listen address.
