@@ -250,16 +250,47 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			// First-event budget, phase 1 (connect + response headers): one
+			// timer armed AROUND Do and stopped the instant Do returns — the
+			// port arms FIRST_EVENT before fetch (one AbortController owns
+			// connect + headers + body), so a stalled-headers upstream must
+			// not pin this goroutine. Budget <= 0 disables the phase (same
+			// convention as zen.NewWatchdog). Full policy: streamFailure doc.
+			var headerTimer *time.Timer
+			if firstEvent > 0 {
+				headerTimer = time.AfterFunc(firstEvent, cancel)
+			}
 			resp, err := (&http.Client{Transport: att.Transport}).Do(req)
+			// Stop() reports false iff the timer already expired (or its
+			// callback is running): the budget was blown. Re-issue cancel —
+			// it is idempotent — to close the window where Stop lost the
+			// race against the timer proc.
+			headersTimedOut := headerTimer != nil && !headerTimer.Stop()
+			if headersTimedOut {
+				cancel()
+			}
 			if err != nil {
 				if ctx.Err() != nil {
 					return true, nil, "", nil // client went away: nothing to write
+				}
+				if headersTimedOut {
+					return false, firstEventTimeoutError(firstEvent), "", nil
 				}
 				return false, &zen.UpstreamError{
 					Kind:    zen.KindTransport,
 					Status:  http.StatusBadGateway,
 					Message: "zen: upstream transport: " + err.Error(),
 				}, "", nil
+			}
+			if headersTimedOut {
+				// Timer expired in the very instant Do returned a response:
+				// the attempt context is dead, so the body could never be
+				// relayed reliably. Drop the response — no byte reached the
+				// client (the status line commits on the first frame), so
+				// the loop can still surface an envelope under its normal
+				// rules. Benign cancel of a completed attempt, by design.
+				_ = resp.Body.Close()
+				return false, firstEventTimeoutError(firstEvent), "", nil
 			}
 
 			if resp.StatusCode >= http.StatusBadRequest {
@@ -356,11 +387,43 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 // practical gain (an upstream that sends bytes but no data line for
 // FirstEventTimeout, 30s by default, is already pathological, and we are
 // the stricter side of that race).
+//
+// First-event budget policy (two phases, one budget value): the plugin
+// (lib/index.js:1382 armFirst() immediately before fetch; index.js:837-840
+// "One AbortController owns connect + headers + body for the whole
+// attempt") arms FIRST_EVENT before the attempt starts, so
+// FirstEventTimeout must bound the CONNECT + RESPONSE-HEADERS phase, not
+// only the body. The attempt closure enforces phase 1 with
+// time.AfterFunc(firstEvent, attemptCancel) armed around http.Client.Do
+// and stopped the moment Do returns (a timer that expires in the same
+// instant Do succeeds is treated as a timeout: the cancelled response is
+// closed and reported — no byte reached the client, so no relay state is
+// corrupted, and cancel/Stop never double-fire a healthy attempt).
+// Phase 2 — the body up to its first byte — re-arms the full firstEvent
+// budget through zen.NewWatchdog after Do returns, then hands over to the
+// idle budget. Deliberate divergence from the plugin's single shared
+// deadline: each phase gets the full budget, so this layer is never LESS
+// strict than the port (worst case headers + first byte = 2×
+// FirstEventTimeout); sharing one deadline would need a second timer
+// racing the watchdog for no gain in strictness.
 func streamFailure(err error) *zen.UpstreamError {
 	return &zen.UpstreamError{
 		Kind:    zen.KindTransport,
 		Status:  http.StatusBadGateway,
 		Message: "zen: stream relay: " + err.Error(),
+	}
+}
+
+// firstEventTimeoutError classifies an attempt cut off by phase 1 of the
+// first-event budget (connect + response headers); see the streamFailure
+// doc for the full policy. KindTransport keeps it inside the normal
+// bounded re-issue rules (report to the rotator first, then decide).
+func firstEventTimeoutError(firstEvent time.Duration) *zen.UpstreamError {
+	return &zen.UpstreamError{
+		Kind:   zen.KindTransport,
+		Status: http.StatusBadGateway,
+		Message: "zen: first event timeout: no response headers within " +
+			firstEvent.String() + " (connect + response-headers phase)",
 	}
 }
 

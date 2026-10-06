@@ -66,8 +66,8 @@ func (l *labelRT) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // newTestRotator builds the real staged router: 2-key pool, quota state in
 // t.TempDir(), no-op identity switch (marker transport) and no-op spare
-// registrar. One unspent identity is seeded so the stage-2 switch has
-// somewhere to go.
+// registrar. TWO unspent identities are seeded so the stage-2 switch has a
+// genuine choice of identities to move between (hot spare ≠ active).
 func newTestRotator(t *testing.T) *router.Router {
 	t.Helper()
 	// Neutralize environment key overrides: the pool file is the only source.
@@ -90,6 +90,7 @@ func newTestRotator(t *testing.T) *router.Router {
 		t.Fatalf("router.New: %v", err)
 	}
 	st.AddIdentity(&quota.WarpIdentity{DeviceID: "dev1"})
+	st.AddIdentity(&quota.WarpIdentity{DeviceID: "dev2"})
 	return rot
 }
 
@@ -512,6 +513,16 @@ func TestDailyLimitRotationSequence(t *testing.T) {
 		t.Errorf("key k2 = %+v, want Daily429=1", ks)
 	}
 
+	// The stage-2 switch had TWO seeded identities to choose between, and
+	// the activation was persisted as a direct→warp rotation.
+	if ids := rot.Store().Identities(); len(ids) != 2 {
+		t.Errorf("seeded identities = %d, want 2", len(ids))
+	}
+	if rots := snap.Rotations; len(rots) == 0 ||
+		rots[0].From != string(proxy.EgressDirect) || rots[0].To != string(proxy.EgressWarp) {
+		t.Errorf("rotations = %+v, want a direct→warp identity switch recorded", snap.Rotations)
+	}
+
 	// The client still got a normal stream.
 	body := rec.Body.String()
 	if !strings.Contains(body, `"content":"ok"`) || strings.Count(body, "data: [DONE]") != 1 {
@@ -562,8 +573,14 @@ func TestBudgetExhaustedSurfaces429(t *testing.T) {
 	if msg, _ := inner["message"].(string); msg == "" {
 		t.Error("error.message is empty")
 	}
-	if _, ok := env["metadata"]; !ok {
-		t.Errorf("429 envelope missing metadata: %s", truncate(rec.Body.Bytes()))
+	md, _ := env["metadata"].(map[string]any)
+	if md == nil {
+		t.Fatalf("429 envelope metadata is not an object: %s", truncate(rec.Body.Bytes()))
+	}
+	// Value round-trip, not mere presence: the upstream 429 body carries
+	// metadata.limitName and it must survive probeEnvelope → writeError.
+	if ln, _ := md["limitName"].(string); ln != "free" {
+		t.Errorf("metadata.limitName = %v, want free (round-tripped from the upstream 429)", md["limitName"])
 	}
 
 	gotRetry := rec.Header().Get("Retry-After")
@@ -598,6 +615,53 @@ func (r *recordingRot) NextAttempt(rep router.Report) (router.Attempt, bool) {
 		Transport: http.DefaultTransport,
 		Step:      rep.Step + 1,
 	}, true
+}
+
+// countingRot wraps a Rotator and counts every upstream RoundTrip: the
+// executed-attempt counter, observable even for a refused dial — a dead
+// server never receives an HTTP request, so the upstream request recorder
+// alone could not prove "never re-issue".
+type countingRot struct {
+	inner Rotator
+	mu    sync.Mutex
+	dials int
+}
+
+func (c *countingRot) Attempt() router.Attempt {
+	return c.wrap(c.inner.Attempt())
+}
+
+func (c *countingRot) NextAttempt(rep router.Report) (router.Attempt, bool) {
+	att, ok := c.inner.NextAttempt(rep)
+	if ok {
+		att = c.wrap(att)
+	}
+	return att, ok
+}
+
+func (c *countingRot) wrap(att router.Attempt) router.Attempt {
+	att.Transport = &countingRT{base: att.Transport, rot: c}
+	return att
+}
+
+func (c *countingRot) attempts() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dials
+}
+
+// countingRT counts RoundTrip calls — one per executed upstream attempt,
+// whether the dial succeeds or is refused.
+type countingRT struct {
+	base http.RoundTripper
+	rot  *countingRot
+}
+
+func (rt *countingRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.rot.mu.Lock()
+	rt.rot.dials++
+	rt.rot.mu.Unlock()
+	return rt.base.RoundTrip(r)
 }
 
 // --- TestNoReissueAfterFirstByte -------------------------------------------
@@ -838,8 +902,10 @@ func TestResponsesAutoRoute(t *testing.T) {
 // TestUpstreamDownSurfaces502: a dial error classifies as KindTransport —
 // retryable, but NextAttempt has no stage for it, so the client gets one
 // KindTransport-class JSON envelope with status 502 instead of a hang.
+// attempts==1 (counted at the transport) asserts transport failures are
+// never re-issued beyond the loop's rules.
 func TestUpstreamDownSurfaces502(t *testing.T) {
-	rot := newTestRotator(t)
+	rot := &countingRot{inner: newTestRotator(t)}
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	dead.Close() // loopback port with nothing listening: dial is refused
 
@@ -849,6 +915,9 @@ func TestUpstreamDownSurfaces502(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newChatRequest(chatClientBody()))
 
+	if n := rot.attempts(); n != 1 {
+		t.Errorf("upstream attempts = %d, want 1 (transport failures are never re-issued)", n)
+	}
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
@@ -868,5 +937,60 @@ func TestUpstreamDownSurfaces502(t *testing.T) {
 	}
 	if _, ok := env["metadata"]; ok {
 		t.Errorf("metadata must appear only on 429 envelopes: %s", truncate(rec.Body.Bytes()))
+	}
+}
+
+// --- TestFirstEventBudgetCoversHeaders -------------------------------------
+
+// TestFirstEventBudgetCoversHeaders: an upstream that completes the
+// connection but writes NOTHING (no status line, no headers) must be cut
+// off by cfg.FirstEventTimeout — the budget covers connect + response
+// headers (the port arms FIRST_EVENT before fetch), not only the body's
+// first byte. Without a header-phase timer the handler goroutine would be
+// pinned inside http.Client.Do until the client disconnects.
+func TestFirstEventBudgetCoversHeaders(t *testing.T) {
+	cfg := config.Default()
+	cfg.FirstEventTimeout = 100 * time.Millisecond
+
+	rot := newTestRotator(t)
+	release := make(chan struct{})
+	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		// Accept the request, then write NOTHING: no status, no headers.
+		<-release
+	})
+	// Cleanups run LIFO: release the stalled handler BEFORE srv.Close waits
+	// on it, so the suite can never deadlock even in the failing state.
+	t.Cleanup(func() { close(release) })
+
+	h := New(rot, cfg)
+	h.Upstream = up.srv.URL
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(rec, newChatRequest(chatClientBody()))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handler still blocked after 2s: first-event budget (%s) did not cover the connect+headers phase",
+			cfg.FirstEventTimeout)
+	}
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
+	}
+	env := decodeJSONMap(t, rec.Body.Bytes())
+	inner, _ := env["error"].(map[string]any)
+	if inner == nil {
+		t.Fatalf("no error object: %s", truncate(rec.Body.Bytes()))
+	}
+	if typ, _ := inner["type"].(string); typ != "TransportError" {
+		t.Errorf("error.type = %v, want TransportError (KindTransport class)", inner["type"])
+	}
+	if n := len(up.requests()); n != 1 {
+		t.Errorf("upstream attempts = %d, want 1 (stalled-headers attempt is not re-issued)", n)
 	}
 }
