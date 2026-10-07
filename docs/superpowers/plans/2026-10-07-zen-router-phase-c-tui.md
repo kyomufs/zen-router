@@ -11,9 +11,11 @@ add `up --detach` + a daemon file log, build the `zen-router tui` Bubbletea dash
 **Architecture:** The TUI is a pure client: `internal/tui` models + views talk to the
 daemon exclusively through `cli.ControlClient` (`GET /_zenctl/status`, `POST rotate/use/
 stop`) over loopback — no in-process router access, so the dashboard works against any
-running daemon. All new dashboard data is added server-side into `Status` (quota state
-extensions + redacted identities). `install-systemd` renders a unit file and shells out
-to `systemctl --user` behind an injectable exec seam (tests never invoke real systemd).
+running daemon (the one exception: the log tail reads the daemon's XDG log file
+read-only inside `Update()`, never in `View()` — see review focus 2). All new dashboard
+data is added server-side into `Status` (quota state extensions + redacted identities).
+`install-systemd` renders a unit file and shells out to `systemctl --user` behind an
+injectable exec seam (tests never invoke real systemd).
 
 **Tech Stack:** Go 1.26; **Bubbletea v2** — `charm.land/bubbletea/v2` (v2.0.10,
 2026-09-24, min Go 1.26.0 = our go.mod), `charm.land/bubbles/v2` (v2.2.1),
@@ -34,8 +36,8 @@ gates), §13 phase C, §14 (registration-failure surfacing).
   `zen-router install-systemd`, `daemon-reload`, `enable --now` against the hand-written
   live unit — documented as a user action, never executed by executors.
 - **Live egress-IP echo calls** (public IP through the active transport) are
-  §12-gated: tests use an injectable echo seam + local fake; production calls only
-  after отмашка.
+  §12-gated behind the explicit `config.EgressIPEcho` switch (default `false`, see D3):
+  tests use an injectable echo seam + local fake; production calls only after отмашка.
 - Loopback default `127.0.0.1:8787`, override `ZEN_ROUTER_LISTEN` — unchanged.
 - Watchdog/quota/rotation semantics unchanged; `Status.State` stays the full
   `quota.State` snapshot (with NEW redaction at the control layer, `state.json` keeps
@@ -44,10 +46,11 @@ gates), §13 phase C, §14 (registration-failure surfacing).
   §7:222). 1s control-API poll (§7:218). Daemon-down screen offers start via
   `up --detach` (§7:219).
 - systemd unit: `~/.config/systemd/user/zen-router.service`,
-  `ExecStart=<binary> up`, **`Restart=on-failure`** (spec §8:226 — intentional
+  `ExecStart=<binary> up`, **`Restart=on-failure`** (spec:228 — intentional
   `stop` exits 0 so it is not restarted), `WantedBy=default.target`, keep the live
-  unit's NixOS `Environment=PATH=/run/wrappers/bin:…` (spec §14:352). Logs → journald;
-  the XDG file log (`$XDG_STATE_HOME/zen-router/zen.log`, already in
+  unit's NixOS `Environment=PATH=/run/wrappers/bin:…` (live hand-written unit /
+  NixOS user-unit reality — NOT spec §14:352, which is the sudo/ip note). Logs →
+  journald; the XDG file log (`$XDG_STATE_HOME/zen-router/zen.log`, already in
   `config.Paths.LogFile`) is written by a daemon-side tee for the TUI tail (NOT
   `StandardOutput=append:` — that would sacrifice journald).
 - Uninstall: `zen-router install-systemd --remove`.
@@ -64,9 +67,10 @@ gates), §13 phase C, §14 (registration-failure surfacing).
    (today `RecordKeySuccess` has zero production callers); latency recorded from
    both proxy and gateway paths; identity `token`/`privateKey` NEVER serialized into
    the status payload (grep the JSON output).
-2. **TUI as pure client** — every byte of dashboard data flows through
-   `cli.ControlClient`; no imports of `internal/router`/`internal/quota` from
-   `internal/tui`; daemon-down path surfaces a start offer without crashing.
+2. **TUI as pure client** — every byte of *status/control* data flows through
+   `cli.ControlClient`; the log tail reads the injected XDG file path, read only in
+   `Update()`, never in `View()`; no imports of `internal/router`/`internal/quota`
+   from `internal/tui`; daemon-down path surfaces a start offer without crashing.
 3. **Bubbletea v2 API** — `View() tea.View` (+`tea.NewView`/`SetContent`),
    `tea.KeyPressMsg` (not `tea.KeyMsg`), declarative `v.AltScreen` (no program
    options), `tea.Tick` for the 1s poll returned from `Init()`, bubbles v2
@@ -74,8 +78,8 @@ gates), §13 phase C, §14 (registration-failure surfacing).
    deterministic plain text).
 4. **systemd installer safety** — unit written only under `HOME`/`XDG_CONFIG_HOME`
    from the env; `systemctl` behind an exec seam (fake on PATH in tests) asserting
-   argv order `daemon-reload` → `enable --now`; `--remove` = stop/disable + unlink;
-   real HOME untouched in tests.
+   argv order `daemon-reload` → `enable --now`; `--remove` = `systemctl --user
+   disable --now` + unlink; real HOME untouched in tests.
 5. **Safety** — no live systemctl, no live echo-IP call, no `~/.dsh`, no
    `~/.local/bin` rebuild; отмашка checklist present and unexecuted.
 
@@ -84,12 +88,13 @@ gates), §13 phase C, §14 (registration-failure surfacing).
 | File | Responsibility |
 |---|---|
 | `internal/quota/state.go` (modify) | latency + success additions if they live in state; `Redacted()` view of identities (strip `token`, `privateKey`) |
-| `internal/gateway/handler.go` (modify) | record egress+key success on 2xx (`RecordSuccess`/`RecordKeySuccess`) and latency |
-| `internal/router/router.go` (modify) | record `Result.LatencyMS` (currently discarded at `OnResult`) into state |
+| `internal/gateway/handler.go` (modify) | record egress+key success on 2xx (`RecordSuccess`/`RecordKeySuccess`) and latency through an **optional `Recorder` field on `gateway.Handler`** (keeps the `Rotator` interface stable) |
+| `internal/gateway/handler_test.go`, `nonstream_test.go` (review) | existing fakes (`recordingRot`, `countingRot`, `oneShotRot`) — no changes needed while `Recorder` stays optional/nil |
+| `internal/router/router.go` + `stage.go` (modify) | record `Result.LatencyMS` (currently discarded at `OnResult`) into state; store `lastSpareError` in `stage.go`'s spare-registration path (today log-only, ~stage.go:424-426) and expose a getter |
 | `internal/cli/control.go` (modify) | serve redacted state; new fields (uptime, listen, `lastSpareError`, `registering`, egress IP, latency) |
-| `internal/cli/ip.go` (new, optional) | injectable egress-IP echo seam (fake in tests; live call отмашка-gated) |
-| `internal/config/config.go` (modify) | none expected — `LogFile` exists; document reuse |
-| `cmd/zen-router/main.go` (modify) | `up --detach`, `tui`, `install-systemd [--remove]` subcommands; logger tee to `Paths.LogFile` |
+| `internal/cli/ip.go` (new, optional) | injectable egress-IP echo seam (fake in tests; live call отмашка-gated behind `config.EgressIPEcho`) |
+| `internal/config/config.go` (modify) | add `EgressIPEcho` switch (default `false` — D3 gate); `LogFile` exists, document reuse |
+| `cmd/zen-router/main.go` (modify) | `up --detach`, `tui`, `install-systemd [--remove]` subcommands; logger tee to `Paths.LogFile`; Task 1 wires `Listen`/`StartedAt` into the `cli.Control` construction (main.go:163) — all main.go edits serialize in the 1 → 3 → 8 → 4 chain (see Task dependency notes) |
 | `internal/tui/model.go` (new) | Elm model: 1s poll loop, daemon-down state, key map, actions |
 | `internal/tui/view.go` (new) | lipgloss layout: header, quota/identity/rotation tables, log viewport, help |
 | `internal/tui/model_test.go` (new) | pure `Update`/`View().Content` suites (no PTY, no timers) |
@@ -104,18 +109,27 @@ gates), §13 phase C, §14 (registration-failure surfacing).
   2025-09, we need nothing teatest-only). Import paths `charm.land/bubbletea/v2`,
   `charm.land/bubbles/v2`, `charm.land/lipgloss/v2`.
 - **D2 — `s` semantics:** stop = `POST /_zenctl/stop` when the daemon responds;
-  start = spawn `zen-router up --detach`. When installed under systemd, the TUI
-  reports the unit as the supervisor (start/stop still via control API + spawn —
-  systemctl stays installer-only, keeping the TUI free of systemd coupling).
+  start = spawn `zen-router up --detach`. Under systemd the TUI reports the unit as
+  the supervisor; start/stop still goes through the control API + spawn (systemctl
+  stays installer-only).
 - **D3 — egress IP:** new `egress_ip` field refreshed by an injectable echo
   (Cloudflare `cdn-cgi/trace`-style) through the active transport, refreshed on
-  rotation and at most once per TUI poll interval (daemon-side, debounced); tests use
-  a fake, live calls отмашка-gated.
+  rotation and at most once per TUI poll interval (daemon-side, debounced).
+  **Gate: explicit switch `config.EgressIPEcho`, default `false`** — flipped only by
+  the Task 9 отмашка step; tests always use the injected fake; production echo code
+  is inert until the flag is on. Provenance: egress-IP echo has NO spec section — it
+  is a user-requested extra originating in this plan's own goal statement, so
+  spec-parity claims elsewhere stay honest.
 - **D4 — log tail:** daemon tees its logger to `config.Paths.LogFile`; the TUI tails
-  the file (not journald). systemd keeps `StandardOutput` default (journald).
+  the file (not journald), read only in `Update()` (never `View()` — consistent with
+  review focus 2). systemd keeps `StandardOutput` default (journald).
 - **D5 — dependencies install via `go get charm.land/bubbletea/v2@v2.0.10`
   (+bubbles/lipgloss) + `go mod tidy`, never by hand-editing `go.mod`** (skill rule);
-  versions cross-checked against proxy.golang.org in the research pass.
+  versions cross-checked against proxy.golang.org in the research pass. Offline
+  caveat: the module cache holds v2.0.9 (declared go 1.25.0) while the plan pins
+  v2.0.10, so `go get` needs network at execution time; either version is acceptable
+  under go 1.26, and the `go mod tidy` diff check accepts only `charm.land/* /v2`
+  entries.
 - **D6 — layout rules (skill `bubbletea`):** terminal-cell/ANSI-aware measurement —
   no byte-length string slicing (clamp small terminals; measure borders per
   `references/golden-rules.md`); effectful work (HTTP polls, file tails) stays OUT of
@@ -129,27 +143,51 @@ gates), §13 phase C, §14 (registration-failure surfacing).
       `RecordKeySuccess` called (counter increments visible in `/status`), latency
       recorded per egress (last/avg), `lastSpareError` + `registering` surfaced,
       status payload has NO `token`/`privateKey` (assert via JSON round-trip grep).
-- [ ] Implement: gateway 2xx path records success + latency; proxy `OnResult`
-      records `Result.LatencyMS` (today discarded); `Redacted()` identity view used
+- [ ] Implement: gateway 2xx path records success + latency through the **optional
+      `Recorder` field on `gateway.Handler`** (keeps the `Rotator` interface stable;
+      existing test fakes need no changes while the field is nil); proxy `OnResult`
+      records `Result.LatencyMS` (today discarded); `lastSpareError` stored in
+      `internal/router/stage.go`'s spare-registration path (today log-only,
+      ~stage.go:424-426) with an exposed getter; `Redacted()` identity view used
       by `/_zenctl/status` only (state.json keeps full fidelity); add
       `uptime_seconds`, `listen`, `last_rotate`, `rotating` header fields.
+- [ ] **Task 1 also edits `cmd/zen-router/main.go`:** wire `Listen`/`StartedAt` into
+      the `cli.Control` construction (main.go:163). Serialize ALL main.go editors in
+      one chain — 1 → 3 → 8 → 4 (see Task dependency notes).
 - [ ] Green + `gofmt -l .` empty + all gates; commit
       `Expose dashboard data in the control API`.
 
 ### Task 2 — Egress IP observation
 
 - [ ] RED: fake echo server → `/_zenctl/status` gains `egress_ip`; rotation refreshes
-      it; debounce prevents per-poll fan-out; no live network in tests.
-- [ ] Implement the injectable seam (interface + production echo impl, отмашка-gated
-      live call); record IP per egress on rotation.
+      it; debounce prevents per-poll fan-out; no live network in tests (production
+      path behind `config.EgressIPEcho`, default `false`).
+- [ ] Implement the injectable seam (interface + production echo impl gated by
+      `config.EgressIPEcho`, live call отмашка-gated); record IP per egress on
+      rotation.
+- [ ] Provenance: egress-IP echo has **no spec section** — it is a user-requested
+      extra from this plan's own origin (see D3); don't claim spec parity for it.
 - [ ] Green + gates; commit `Track egress IP per rotation`.
 
 ### Task 3 — XDG file log + `up --detach`
 
-- [ ] RED: daemon tees logger to `Paths.LogFile` (temp XDG state dir); `up --detach`
-      starts a child, parent waits until `/_zenctl/status` answers (or timeout),
-      exits 0; child handles SIGTERM cleanly. Never spawn against the live unit.
-- [ ] Implement tee + `--detach` flag in `cmdUp` (parse only; usage text updated).
+- [ ] RED (hermetic — must NEVER reach the live daemon on `127.0.0.1:8787`):
+      (a) pre-allocate a free port — `ln, err := net.Listen("127.0.0.1:0")`, take
+      `ln.Addr().String()`, `ln.Close()`, pass `--listen 127.0.0.1:<port>` to the
+      child (otherwise EADDRINUSE lets the LIVE daemon answer the parent's
+      status-wait → false green); (b) `t.Setenv` before spawn: `HOME`,
+      `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `ZEN_ROUTER_STATE` all → fresh
+      `t.TempDir()`; (c) build the child binary into `t.TempDir()`
+      (`go build -o <tmpdir>/zen-router ./cmd/zen-router`) — never `go install`,
+      never `~/.local/bin`. Assert: daemon tees its logger to `Paths.LogFile` under
+      the temp XDG state dir; the `up --detach` parent forks the child into that
+      prepared env/port, polls `/_zenctl/status` until it answers (bounded timeout),
+      exits 0; SIGTERM shuts the child down cleanly (test teardown always signals
+      the child).
+- [ ] Implement: daemon-side logger tee to `Paths.LogFile`; full `--detach` in
+      `cmdUp` — fork/exec the child with the prepared env + `--listen` port, inherit
+      stdio or reopen it to a tee file, parent waits for readiness by polling
+      `/_zenctl/status` with a timeout and then exits 0; usage text updated.
 - [ ] Green + gates; commit `Add detached start and daemon file log`.
 
 ### Task 4 — `internal/tui` skeleton
@@ -159,16 +197,17 @@ gates), §13 phase C, §14 (registration-failure surfacing).
       `View().Content` contains expected header strings; tests feed
       `tea.KeyPressMsg`/poll msgs directly (never run the Tick command).
 - [ ] Implement model/Init/Update/View skeleton + `zen-router tui` subcommand wiring
-      (refuses with a clear message when not a TTY? — no: run normally; tests don't
-      construct the program).
+      (main.go edit — last in the 1 → 3 → 8 → 4 chain) with **`tui` added to
+      `usage()`** (Task 9 gates on help listing it). Decision: run normally
+      regardless of TTY; tests don't construct the program.
 - [ ] Green + gates; commit `Add TUI skeleton with control API polling`.
 
 ### Task 5 — TUI dashboard sections
 
 - [ ] RED: canned `Status` fixtures → view contains: status header (mode, egress,
       IP, latency), quota table per egress AND per key with reset countdown, identity
-      pool table (redacted fields only), rotation history table (last N), log-tail
-      viewport, help line.
+      pool table (redacted fields only), rotation history table (accepted extra
+      beyond spec: data in `state.Rotations`, last 50), log-tail viewport, help line.
 - [ ] Implement `view.go` with lipgloss v2 + `bubbles/v2` table/viewport/help;
       layout adapts to `tea.WindowSizeMsg` (SetWidth/SetHeight).
 - [ ] Green + gates; commit `Render TUI dashboard sections`.
@@ -176,9 +215,13 @@ gates), §13 phase C, §14 (registration-failure surfacing).
 ### Task 6 — TUI actions
 
 - [ ] RED: `r` → Rotate request; `d`/`w` → Use; `s` → stop when up / spawn
-      `up --detach` when down; spinner while a request is in flight; action errors
-      surface in the view (e.g. rotate 409 → message).
-- [ ] Implement key handlers with in-flight guard (no double-fire during 1s poll).
+      `up --detach` when down — that spawn is a process spawn NOT covered by
+      `StatusSource`, so inject a second seam alongside it: **`Spawner func(ctx)
+      error`** (default = the real `up --detach`); tests inject a recording fake
+      asserting exactly one spawn and no live process. Spinner while a request is
+      in flight; action errors surface in the view (e.g. rotate 409 → message).
+- [ ] Implement key handlers with in-flight guard (no double-fire during 1s poll)
+      and wire the `Spawner` default to the detach path.
 - [ ] Green + gates; commit `Add TUI rotation and daemon actions`.
 
 ### Task 7 — TUI hardening tests
@@ -193,10 +236,12 @@ gates), §13 phase C, §14 (registration-failure surfacing).
 - [ ] RED: unit rendered with `ExecStart=<resolved binary> up`,
       `Restart=on-failure`, `RestartSec`, NixOS `Environment=PATH=…`,
       `WantedBy=default.target`; exec seam records `systemctl --user daemon-reload`
-      then `enable --now`; `--remove` records `disable --now` + unlinks the file.
-      **Fake `systemctl` on PATH, temp `HOME`.**
-- [ ] Implement `internal/systemd` + subcommand + usage (spec §11). Binary path
-      resolution: current executable path by default (never overwrites
+      then `enable --now`; `--remove` records `systemctl --user disable --now` +
+      unlinks the file. **Fake `systemctl` on PATH, temp `HOME`.**
+- [ ] Implement `internal/systemd` + subcommand + usage (spec §11); add
+      `install-systemd` to the same subcommand registry/`usage()` as `tui` (Task 4
+      and Task 8 both edit main.go — chain order 8 → 4, see Task dependency notes).
+      Binary path resolution: current executable path by default (never overwrites
       `~/.local/bin` — that is the отмашка-time user action).
 - [ ] Green + gates; commit `Add systemd user unit installer`.
 
@@ -204,26 +249,33 @@ gates), §13 phase C, §14 (registration-failure surfacing).
 
 - [ ] Full gates: `gofmt -l .` EMPTY, `go build ./...`, `go vet ./...`,
       `timeout 180 go test -count=1 -short ./...`, new packages included;
-      `go mod tidy` diff reviewed (adds `charm.land/*` v2 only).
-- [ ] `./bin/zen-router help` lists `tui` and `install-systemd [--remove]` (§11).
+      `go mod tidy` diff reviewed (adds `charm.land/*` v2 only — see D5 offline
+      caveat).
+- [ ] `go build -o bin/zen-router ./cmd/zen-router`, then `./bin/zen-router help`
+      lists `tui` and `install-systemd [--remove]` (§11).
 - [ ] Document the отмашка checklist in the plan (NOT executed): rebuild
       `~/.local/bin/zen-router`, run `zen-router install-systemd` against the live
       hand-written unit (overwrites it), `daemon-reload`+`enable --now` may restart
-      the running daemon, live egress-IP echo enables, README (Phase E).
+      the running daemon, flip `config.EgressIPEcho` to `true` to enable live
+      egress-IP echo.
 - [ ] Commit `Verify phase C gates and document live steps`.
 
-**Explicitly deferred (not in this plan):** executing the отмashка checklist (live
-unit overwrite, `~/.local/bin` rebuild, live echo-IP calls), README (Phase E), thin
-plugin (Plan 3), live DSH integration.
+**Explicitly deferred (not in this plan):** executing the отмашка checklist (live
+unit overwrite, `~/.local/bin` rebuild, live echo-IP calls), thin plugin (Plan 3),
+live DSH integration. README (Phase E) already shipped — 45f75b3, 1d851bf.
 
 ---
 
 ## Task dependency notes
 
-- Tasks 1, 3, 8 are parallel-startable (control API / detach+log / systemd — disjoint
-  files; serialize `cmd/zen-router/main.go` edits: 3 and 8 both touch it — run 3 then
-  8, or split the subcommand registry edit).
-- 2 after 1 (status fields); 4 after 1+3; 5 after 4 (+2 for IP field); 6 after 5;
-  7 after 6; 9 last.
+- Tasks 1, 3, 8 are parallel-startable for their package files (control API /
+  detach+log / systemd are disjoint), but **ALL `cmd/zen-router/main.go` editors
+  serialize in one chain: 1 → 3 → 8 → 4** — Task 1 wires `Listen`/`StartedAt` into
+  the `cli.Control` construction (main.go:163), Task 3 adds `up --detach` + logger
+  tee, Task 8 adds `install-systemd [--remove]`, Task 4 adds `tui`. Tasks 4 and 8
+  append their subcommands to the SAME subcommand registry and `usage()` — no
+  parallel registry edits.
+- 2 after 1 (status fields); 4 after 1+3 (and last in the main.go chain); 5 after
+  4 (+2 for IP field); 6 after 5; 7 after 6; 9 last.
 - `internal/tui` depends only on `internal/cli` + `charm.land/*` — no router/quota
   imports (review focus 2).
