@@ -85,9 +85,10 @@ decision).
    the EXACT DSH code string (and `providerRetryAfterMs` when `Retry-After` is present);
    `401 ModelError` vs `401 AuthError` split; 429 type-first: `429 +
    FreeUsageLimitError|GoUsageLimitError|BlackUsageLimitError` → `QUOTA` BEFORE the
-   generic 429 → `RATE_LIMIT` row (the daemon sets `Retry-After` on EVERY 429 —
-   `handler.go:397-400`, synthesized midnight/60s `errors.go:206-214` — so status-first
-   matching would steal the quota rows).
+   generic 429 → `RATE_LIMIT` row (the daemon sets `Retry-After` on every TYPED
+   quota/rate-limit 429 — synthesized midnight/60s `errors.go:206-214`, emitted
+   `handler.go:397-400` only when `ue.RetryAfter > 0`, so a bare-429 may carry no
+   header at all — hence status-first matching would steal the quota rows).
 2. **StreamChunk contract** — exactly one terminal `finish`, `usage` emitted BEFORE
    `finish` and nothing after; `block-start`/`block-end` pairing for text/reasoning/tool
    blocks; premature close (HTTP response received) BEFORE content → retryable `TIMEOUT`,
@@ -120,9 +121,9 @@ decision).
 | `cordis.patch.yml` (unchanged) | byte-identical to installed fragment |
 | `README.md` (modify) | describe the thin adapter + daemon prerequisite |
 
-`lib/quota.js` is to be deleted by THIS plan — it still EXISTS at base `c2471d2` (the
-`c2471d2` lineage already dropped `client.js` + `status.js`; only `index.js` and
-`quota.js` remain, and Task 7 verifies `lib/` ends up with `index.js` only).
+`lib/quota.js` is to be deleted by THIS plan (checkbox in Task 2) — it still EXISTS
+at base `c2471d2` (the `c2471d2` lineage already dropped `client.js` + `status.js`;
+only `index.js` and `quota.js` remain), and Task 7 checks `ls lib/ → index.js only`.
 
 ## Dependency-derived mapping table (binding — Task 5 implements exactly this)
 
@@ -151,7 +152,7 @@ matching a row below must fail a Task-1 fixture rather than pass silently.
 
 ¹ `providerRetryAfterMs` only takes effect while ≤ `policy.maxDelayMs` (default 10s,
 `dsh-llm/lib/index.js:249`); a longer window makes the host skip the retry entirely
-(`dsh-llm-retry/lib/index.js:165-167`). Moot for daily limits — the QUOTA row above
+(`dsh-llm-retry/lib/index.js:168-170` — condition + `return next()`). Moot for daily limits — the QUOTA row above
 takes them first (non-retryable) anyway.
 
 **413 note:** the daemon's only 413 is the 4 MiB request-body cap
@@ -166,8 +167,11 @@ daemon-side context classification = follow-up, out of plan scope.
 
 - [ ] In `test/smoke.cjs` (rewrite), stand up a local fake daemon (`node:http`) that
       serves: (a) canned OpenAI SSE chat streams (happy path with text+usage+`[DONE]`),
-      (b) each row of the mapping table (status + envelope + `Retry-After`),
-      (c) connection-refused (down socket), (d) premature close pre- and post-content,
+      (b) each HTTP-status row of the mapping table (status + envelope + `Retry-After`);
+      stream-outcome rows live in (d) + a zero-content clean-end case, apply()-down in
+      Task 6, salvage in Task 4,
+      (c) connection-refused (down socket), (d) premature close pre- and post-content
+      plus a clean `[DONE]` end with zero content (→ `EMPTY_RESPONSE`),
       (e) host `AbortSignal` fired mid-flight (adapter-side; no server involvement).
 - [ ] Write assertions FIRST against the thin adapter that does not exist yet: exact
       `StreamChunk` sequences (`block-start` → `text-delta`* → `block-end` → `usage` →
@@ -188,6 +192,7 @@ daemon-side context classification = follow-up, out of plan scope.
 
 - [ ] `lib/index.js`: `name='dsh-opencode-zen'`, `inject=['llm']`, `apply()`
       registering via `ctx.llm.registerAdapter(['opencode'], adapter)`.
+- [ ] Delete `lib/quota.js` (and confirm `client.js`/`status.js` already gone at base).
 - [ ] `MODELS`: copy the 9-entry array VERBATIM from `git show a416790:lib/index.js`
       — entry keys are `id,name,contextWindow,maxOutput,description,vision?,efforts?,
       responses?,reasoningRequired?` (INCLUDING `description`, `reasoningRequired`,
@@ -269,7 +274,9 @@ daemon-side context classification = follow-up, out of plan scope.
       open blocks closed; host-signal abort at any phase → `ABORTED` (non-retryable,
       parity `lib/index.js:877/889/1452`). `TIMEOUT` is reserved for the stream-death
       case only, `TRANSPORT` for sockets only — never for caller aborts.
-- [ ] One fixture per table row asserting the exact code (Task 1's RED goes GREEN).
+- [ ] One fixture per table row asserting the exact code — HTTP rows via Task 1(b),
+      stream outcomes via 1(d)/(e), apply()-down via Task 6, salvage via Task 4
+      (Task 1's RED goes GREEN).
 
 ### Task 6 — `apply()` health-check + registration
 
@@ -283,6 +290,7 @@ daemon-side context classification = follow-up, out of plan scope.
 ### Task 7 — Verify + budget + commit
 
 - [ ] `node test/smoke.cjs` green end-to-end (all Task-1 fixtures).
+- [ ] `ls lib/` → `index.js` only (quota.js deleted in Task 2, never re-created).
 - [ ] Report `wc -l lib/*.js` — target ~250 (compact path), acceptable ≤400 with the
       image-capable serializer; report the ACTUAL count; list any forbidden subsystem
       greps as ZERO hits.
