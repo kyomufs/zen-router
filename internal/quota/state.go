@@ -493,6 +493,25 @@ func (m *Manager) RecordKeySuccess(key string) {
 	m.saveLocked()
 }
 
+// RecordRequestSuccess increments BOTH success counters for one 2xx request —
+// per egress and (when key != "") per API key — under a single lock and a
+// single state.json save. The gateway path used to walk RecordSuccess and
+// RecordKeySuccess in sequence, writing the file twice per request
+// (review Task 1, finding F4). Existing single-purpose methods stay for
+// their other callers.
+func (m *Manager) RecordRequestSuccess(egress, key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b := m.egressLocked(egress)
+	b.OK++
+	b.LastOKAt = time.Now().UnixMilli()
+	b.SpentUntil = 0
+	if key != "" {
+		m.keyStatsLocked(key).OK++
+	}
+	m.saveLocked()
+}
+
 // KeyStats returns a value copy of the key's counters; unknown keys read as
 // the zero value.
 func (m *Manager) KeyStats(key string) KeyStats {

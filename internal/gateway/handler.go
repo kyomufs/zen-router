@@ -350,11 +350,14 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 					ws, meta
 			}
 
-			// 2xx: record the dashboard data (plan Task 1): the egress/key
-			// success counters and this attempt's response latency (headers).
-			// A nil Recorder (default; existing Rotator fakes) records
-			// nothing, so behavior without the seam is unchanged.
-			if h.Recorder != nil {
+			// 2xx ONLY: record the dashboard data (plan Task 1): the
+			// egress/key success counters and this attempt's response
+			// latency (headers). A nil Recorder (default; existing Rotator
+			// fakes) records nothing, so behavior without the seam is
+			// unchanged. The explicit < 300 gate keeps a pass-through 3xx
+			// (e.g. 304, which http.Client does not follow) out of the
+			// counters — parity with router.OnResult (review F3).
+			if h.Recorder != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 				h.Recorder.RecordSuccess(att.Egress, att.Key, time.Since(started).Milliseconds())
 			}
 

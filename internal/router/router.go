@@ -49,9 +49,11 @@ type Router struct {
 	// lastSpareError is the most recent background spare-registration
 	// failure ("" since the last success), surfaced by the control API.
 	lastSpareError string
-	// latency accumulates observed 2xx response latency per egress
+	// latency accumulates observed 2xx response latency per (kind, egress)
 	// (dashboard data, plan Task 1) — volatile, deliberately NOT persisted.
-	latency map[string]*latencyEntry
+	// The two kinds measure DIFFERENT windows (review F1) and must never
+	// average together.
+	latency map[latencyKey]*latencyEntry
 	// cooldownSwapped records that the first identity switch inside the
 	// current rotation-cooldown window was already persisted, so further
 	// reports in the window return false without churning the tunnel.
@@ -125,7 +127,7 @@ func New(opts Options) (*Router, error) {
 		identitySwitch:   opts.IdentitySwitch,
 		spareRegistrar:   opts.SpareRegistrar,
 		egress:           proxy.EgressDirect,
-		latency:          map[string]*latencyEntry{string(proxy.EgressDirect): {}, string(proxy.EgressWarp): {}},
+		latency:          seedLatency(),
 	}
 	// Restore the active egress from state; default to direct.
 	switch r.store.Current() {
@@ -196,14 +198,30 @@ func (r *Router) OnResult(res proxy.Result) {
 			res.Egress, res.Status, res.RetryAfter)
 		go r.rotate(fmt.Sprintf("daily limit on %s (HTTP %d)", res.Egress, res.Status))
 	case res.Status >= 200 && res.Status < 300:
-		// Shared success bookkeeping with the gateway path: egress counter
-		// and the latency view (Result.LatencyMS was discarded before
-		// plan Task 1). The legacy proxy carries no API key, hence "".
-		r.RecordSuccess(res.Egress, "", res.LatencyMS)
+		// Counter bookkeeping shared with the gateway path — one lock, one
+		// state.json save (review F4). The legacy proxy carries no API key,
+		// hence "". The latency observation goes into the STREAM bucket:
+		// Result.LatencyMS spans RoundTrip → body close (the full stream
+		// duration), a different window than the gateway's TTFB (review F1).
+		r.store.RecordRequestSuccess(string(res.Egress), "")
+		r.recordLatency(string(res.Egress), LatencyStream, res.LatencyMS)
 	}
 }
 
 // --- dashboard data (plan Task 1, spec §7) ---------------------------------
+
+// LatencyKind selects which measurement window an observation belongs to.
+// The two kinds are NEVER averaged together (review Task 1, finding F1).
+type LatencyKind string
+
+const (
+	// LatencyTTFB is the gateway path window: request start (around Do) →
+	// 2xx response headers. The dashboard-meaningful number (Task 5).
+	LatencyTTFB LatencyKind = "ttfb"
+	// LatencyStream is the legacy reverse-proxy window: RoundTrip → body
+	// close — the full stream duration of an OpenAI-style request.
+	LatencyStream LatencyKind = "stream"
+)
 
 // EgressLatency is the status-payload view of one egress's observed 2xx
 // response latency: the last sample, the running average and how many
@@ -214,6 +232,12 @@ type EgressLatency struct {
 	Count  int64 `json:"count"`
 }
 
+// latencyKey addresses one accumulator: measurement window × egress.
+type latencyKey struct {
+	kind   LatencyKind
+	egress string
+}
+
 // latencyEntry is the mutable accumulator behind EgressLatency, guarded by
 // Router.mu.
 type latencyEntry struct {
@@ -222,46 +246,63 @@ type latencyEntry struct {
 	count int64
 }
 
-// RecordSuccess implements the optional gateway.Recorder seam: a 2xx attempt
-// on the OpenAI surface feeds BOTH success counters — per egress
-// (quota.RecordSuccess) and per API key (quota.RecordKeySuccess, which had
-// zero production callers before plan Task 1) — plus the per-egress latency
-// view. The legacy reverse-proxy path reports through OnResult, which
-// delegates here with an empty key (no key on that wire).
-func (r *Router) RecordSuccess(egress proxy.Egress, key string, latencyMS int64) {
-	r.store.RecordSuccess(string(egress))
-	if key != "" {
-		r.store.RecordKeySuccess(key)
+// seedLatency pre-creates every (kind, egress) slot so the status payload
+// always presents both kinds for both egresses, zeroed until observed.
+func seedLatency() map[latencyKey]*latencyEntry {
+	m := make(map[latencyKey]*latencyEntry, 4)
+	for _, kind := range []LatencyKind{LatencyTTFB, LatencyStream} {
+		for _, eg := range []string{string(proxy.EgressDirect), string(proxy.EgressWarp)} {
+			m[latencyKey{kind: kind, egress: eg}] = &latencyEntry{}
+		}
 	}
-	r.recordLatency(string(egress), latencyMS)
+	return m
 }
 
-// recordLatency folds one 2xx observation into the egress accumulator.
-func (r *Router) recordLatency(egress string, latencyMS int64) {
+// RecordSuccess implements the optional gateway.Recorder seam: a 2xx attempt
+// on the OpenAI surface feeds BOTH success counters — per egress and per API
+// key — in ONE quota lock/save (quota.RecordRequestSuccess, review F4), plus
+// the TTFB latency bucket (gateway window: Do → response headers, review F1).
+// quota.RecordKeySuccess had zero production callers before plan Task 1.
+func (r *Router) RecordSuccess(egress proxy.Egress, key string, latencyMS int64) {
+	r.store.RecordRequestSuccess(string(egress), key)
+	r.recordLatency(string(egress), LatencyTTFB, latencyMS)
+}
+
+// recordLatency folds one 2xx observation into its (kind, egress)
+// accumulator.
+func (r *Router) recordLatency(egress string, kind LatencyKind, latencyMS int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e := r.latency[egress]
+	k := latencyKey{kind: kind, egress: egress}
+	e := r.latency[k]
 	if e == nil {
 		e = &latencyEntry{}
-		r.latency[egress] = e
+		r.latency[k] = e
 	}
 	e.last = latencyMS
 	e.sum += latencyMS
 	e.count++
 }
 
-// Latency returns a snapshot of the per-egress latency view for the status
-// payload. Both known egresses are always present (zeroed until observed).
-func (r *Router) Latency() map[string]EgressLatency {
+// Latency returns a snapshot of one kind's per-egress latency view for the
+// status payload. Both known egresses are always present (zeroed until
+// observed); the kinds live in separate maps and never mix (review F1).
+func (r *Router) Latency(kind LatencyKind) map[string]EgressLatency {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make(map[string]EgressLatency, len(r.latency))
-	for eg, e := range r.latency {
+	out := make(map[string]EgressLatency, 2)
+	for _, eg := range []string{string(proxy.EgressDirect), string(proxy.EgressWarp)} {
+		out[eg] = EgressLatency{}
+	}
+	for k, e := range r.latency {
+		if k.kind != kind {
+			continue
+		}
 		avg := int64(0)
 		if e.count > 0 {
 			avg = e.sum / e.count
 		}
-		out[eg] = EgressLatency{LastMS: e.last, AvgMS: avg, Count: e.count}
+		out[k.egress] = EgressLatency{LastMS: e.last, AvgMS: avg, Count: e.count}
 	}
 	return out
 }

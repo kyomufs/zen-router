@@ -267,6 +267,41 @@ func TestRecordKeySuccess(t *testing.T) {
 	}
 }
 
+// TestRecordRequestSuccess pins the batched gateway entry point (review
+// Task 1, F4): ONE call moves BOTH the per-egress and per-key success
+// counters, persists them for a fresh reader, and an empty key (legacy
+// proxy path) only moves the egress counter.
+func TestRecordRequestSuccess(t *testing.T) {
+	m, path := openTest(t)
+	m.RecordRequestSuccess("direct", "alpha")
+	snap := m.Snapshot()
+	if e := snap.Egress["direct"]; e == nil || e.OK != 1 {
+		t.Errorf("egress[direct].OK = %#v, want 1 after one batched call", snap.Egress["direct"])
+	}
+	if ks := m.KeyStats("alpha"); ks.OK != 1 {
+		t.Errorf("keys[alpha].OK = %d, want 1 after one batched call", ks.OK)
+	}
+	// A fresh reader sees BOTH increments: one lock, one save.
+	m2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-open %q: %v", path, err)
+	}
+	if e := m2.Snapshot().Egress["direct"]; e == nil || e.OK != 1 {
+		t.Errorf("persisted egress[direct].OK = %#v, want 1", e)
+	}
+	if ks := m2.KeyStats("alpha"); ks.OK != 1 {
+		t.Errorf("persisted keys[alpha].OK = %d, want 1", ks.OK)
+	}
+	// Proxy path: empty key touches only the egress counter.
+	m.RecordRequestSuccess("warp", "")
+	if ks := m.KeyStats("alpha"); ks.OK != 1 {
+		t.Errorf("keys[alpha].OK = %d after keyless call, want 1 (unchanged)", ks.OK)
+	}
+	if e := m.Snapshot().Egress["warp"]; e == nil || e.OK != 1 {
+		t.Errorf("egress[warp].OK = %#v, want 1", e)
+	}
+}
+
 func TestSetKeySpent(t *testing.T) {
 	m, _ := openTest(t)
 	until := time.UnixMilli(1700000000000)

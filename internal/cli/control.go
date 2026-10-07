@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -23,8 +25,9 @@ type Status struct {
 	Mode    string `json:"mode"`
 	Current string `json:"current"`
 	Up      bool   `json:"up"`
-	// State is the quota snapshot with identity credentials stripped by
-	// Redacted() — state.json on disk keeps the full fidelity.
+	// State is the quota snapshot with identity credentials and raw API
+	// keys stripped by the control layer — state.json on disk keeps the
+	// full fidelity.
 	State quota.State `json:"state"`
 
 	// Listen is the resolved listen address ("host:port").
@@ -41,8 +44,13 @@ type Status struct {
 	// LastSpareError is the most recent spare-registration failure
 	// ("" = none since the last success).
 	LastSpareError string `json:"lastSpareError"`
-	// Latency is the per-egress 2xx response latency view (last/avg/count).
-	Latency map[string]router.EgressLatency `json:"latency"`
+	// LatencyTTFB is the per-egress GATEWAY window (request start → 2xx
+	// response headers) — the dashboard number Task 5 renders.
+	LatencyTTFB map[string]router.EgressLatency `json:"latency_ttfb_ms"`
+	// LatencyStream is the per-egress REVERSE-PROXY window (RoundTrip →
+	// body close = full stream duration). Never averaged with TTFB
+	// (review F1).
+	LatencyStream map[string]router.EgressLatency `json:"latency_stream_ms"`
 }
 
 // Control exposes CLI control endpoints over an existing router + proxy.
@@ -109,6 +117,7 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 		redacted := snap.Warp.Redacted()
 		snap.Warp = &redacted
 	}
+	snap.Keys = fingerprintKeys(snap.Keys)
 
 	var uptime int64
 	if !c.StartedAt.IsZero() {
@@ -132,8 +141,32 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 		Rotating:       c.Router.Rotating(),
 		Registering:    c.Router.Registering(),
 		LastSpareError: c.Router.LastSpareError(),
-		Latency:        c.Router.Latency(),
+		LatencyTTFB:    c.Router.Latency(router.LatencyTTFB),
+		LatencyStream:  c.Router.Latency(router.LatencyStream),
 	})
+}
+
+// fingerprintKeys replaces every raw API key in state.keys with a display
+// fingerprint (sha256[:8] hex); the per-key COUNTERS stay intact and so does
+// state.json on disk (review Task 1, finding F5). Control layer only — the
+// payload must never carry a full raw key value.
+func fingerprintKeys(in map[string]*quota.KeyStats) map[string]*quota.KeyStats {
+	if len(in) == 0 {
+		return in
+	}
+	out := make(map[string]*quota.KeyStats, len(in))
+	for k, v := range in {
+		out[fingerprintKey(k)] = v
+	}
+	return out
+}
+
+// fingerprintKey derives the stable display name for one raw API key.
+// 8 hex chars of sha256: enough to tell keys apart in the TUI without
+// disclosing any part of the secret.
+func fingerprintKey(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:4])
 }
 
 func (c *Control) handleRotate(w http.ResponseWriter) {

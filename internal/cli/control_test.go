@@ -165,26 +165,28 @@ func TestGateway2xxRecordsSuccessCounters(t *testing.T) {
 		t.Errorf("state.egress.direct.ok = %d, want 1 — gateway 2xx must call quota.RecordSuccess", egressOK)
 	}
 	var keyOK int64
-	if k := st.State.Keys["public"]; k != nil {
+	if k := st.State.Keys[fingerprintKey("public")]; k != nil {
 		keyOK = k.OK
 	}
 	if keyOK != 1 {
-		t.Errorf("state.keys[\"public\"].ok = %d, want 1 — gateway 2xx must call quota.RecordKeySuccess", keyOK)
+		t.Errorf("state.keys[%q].ok = %d, want 1 — gateway 2xx must feed the per-key counter", fingerprintKey("public"), keyOK)
 	}
 
-	// Latency of the 2xx attempt recorded per egress (upstream slept 30ms).
-	lat, ok := st.Latency["direct"]
-	if !ok {
-		t.Fatalf("status.latency has no \"direct\" entry: %#v", st.Latency)
-	}
+	// TTFB latency of the 2xx attempt recorded per egress (upstream slept
+	// 30ms). The STREAM bucket must stay untouched — the two windows are
+	// separate (review F1).
+	lat := st.LatencyTTFB["direct"]
 	if lat.Count != 1 {
-		t.Errorf("status.latency.direct.count = %d, want 1", lat.Count)
+		t.Errorf("status.latency_ttfb_ms.direct.count = %d, want 1", lat.Count)
 	}
 	if lat.LastMS < 10 {
-		t.Errorf("status.latency.direct.last_ms = %d, want >= 10 (upstream slept 30ms)", lat.LastMS)
+		t.Errorf("status.latency_ttfb_ms.direct.last_ms = %d, want >= 10 (upstream slept 30ms)", lat.LastMS)
 	}
 	if lat.AvgMS != lat.LastMS {
-		t.Errorf("status.latency.direct.avg_ms = %d, want last_ms %d for a single sample", lat.AvgMS, lat.LastMS)
+		t.Errorf("status.latency_ttfb_ms.direct.avg_ms = %d, want last_ms %d for a single sample", lat.AvgMS, lat.LastMS)
+	}
+	if stream := st.LatencyStream["direct"]; stream.Count != 0 {
+		t.Errorf("status.latency_stream_ms.direct.count = %d, want 0 (gateway path must not feed the stream bucket)", stream.Count)
 	}
 }
 
@@ -192,8 +194,10 @@ func TestGateway2xxRecordsSuccessCounters(t *testing.T) {
 
 // TestProxyOnResultRecordsLatency: the legacy reverse-proxy path observes
 // Result.LatencyMS (previously discarded at router.OnResult) — a 2xx result
-// must land it in the per-egress latency view AND increment the egress
-// success counter, both visible in /_zenctl/status.
+// must land it in the STREAM bucket of the per-egress latency view AND
+// increment the egress success counter, both visible in /_zenctl/status.
+// The TTFB bucket must stay untouched: different measurement window
+// (review F1).
 func TestProxyOnResultRecordsLatency(t *testing.T) {
 	rot := newTestRouter(t, nil, 0)
 	rot.OnResult(proxy.Result{
@@ -205,12 +209,12 @@ func TestProxyOnResultRecordsLatency(t *testing.T) {
 	h := newTestControl(rot).Handler(http.NewServeMux())
 
 	_, st := getStatus(t, h)
-	lat, ok := st.Latency["direct"]
-	if !ok {
-		t.Fatalf("status.latency has no \"direct\" entry: %#v", st.Latency)
-	}
+	lat := st.LatencyStream["direct"]
 	if lat.LastMS != 42 || lat.AvgMS != 42 || lat.Count != 1 {
-		t.Errorf("status.latency.direct = %+v, want {last_ms:42 avg_ms:42 count:1} (Result.LatencyMS must not be discarded)", lat)
+		t.Errorf("status.latency_stream_ms.direct = %+v, want {last_ms:42 avg_ms:42 count:1} (Result.LatencyMS must not be discarded)", lat)
+	}
+	if ttfb := st.LatencyTTFB["direct"]; ttfb.Count != 0 {
+		t.Errorf("status.latency_ttfb_ms.direct.count = %d, want 0 (proxy path must not feed the ttfb bucket)", ttfb.Count)
 	}
 	var egressOK int64
 	if e := st.State.Egress["direct"]; e != nil {
@@ -252,15 +256,23 @@ func TestStatusHeaderFields(t *testing.T) {
 	if !st.Up {
 		t.Error("status.up = false, want true")
 	}
-	// Fresh daemon: both egresses report a zeroed latency view.
-	for _, eg := range []string{"direct", "warp"} {
-		lat, ok := st.Latency[eg]
-		if !ok {
-			t.Errorf("status.latency missing %q entry: %#v", eg, st.Latency)
-			continue
-		}
-		if lat.Count != 0 || lat.LastMS != 0 || lat.AvgMS != 0 {
-			t.Errorf("status.latency[%q] = %+v, want zeros before any request", eg, lat)
+	// Fresh daemon: both kinds × both egresses report a zeroed view.
+	for _, m := range []struct {
+		name string
+		byEg map[string]router.EgressLatency
+	}{
+		{"latency_ttfb_ms", st.LatencyTTFB},
+		{"latency_stream_ms", st.LatencyStream},
+	} {
+		for _, eg := range []string{"direct", "warp"} {
+			lat, ok := m.byEg[eg]
+			if !ok {
+				t.Errorf("status.%s missing %q entry: %#v", m.name, eg, m.byEg)
+				continue
+			}
+			if lat.Count != 0 || lat.LastMS != 0 || lat.AvgMS != 0 {
+				t.Errorf("status.%s[%q] = %+v, want zeros before any request", m.name, eg, lat)
+			}
 		}
 	}
 }
@@ -401,6 +413,70 @@ func TestStatusHidesIdentityCredentials(t *testing.T) {
 	}
 	if len(st.State.Identities) == 0 || st.State.Identities[0].DeviceID != "dev-redact-1" {
 		t.Errorf("decoded identities = %#v, want dev-redact-1 present", st.State.Identities)
+	}
+}
+
+// --- TestGateway3xxNotRecorded ---------------------------------------------
+
+// TestGateway3xxNotRecorded: a pass-through 3xx (304 — http.Client does not
+// follow it, so the handler sees the status) must NOT feed the dashboard
+// counters nor the TTFB latency view: only 200..299 counts as success,
+// parity with router.OnResult (review F3).
+func TestGateway3xxNotRecorded(t *testing.T) {
+	rot := newTestRouter(t, nil, 0)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	t.Cleanup(up.Close)
+	h := gatewayStack(t, rot, up)
+
+	// Whatever envelope the relay ends up writing, nothing may be recorded.
+	h.ServeHTTP(httptest.NewRecorder(), newChatReq())
+
+	_, st := getStatus(t, h)
+	if e := st.State.Egress["direct"]; e != nil && e.OK != 0 {
+		t.Errorf("state.egress.direct.ok = %d, want 0 (3xx is not a success)", e.OK)
+	}
+	for fp, k := range st.State.Keys {
+		if k != nil && k.OK != 0 {
+			t.Errorf("state.keys[%q].ok = %d, want 0 (3xx must not reach the key counter)", fp, k.OK)
+		}
+	}
+	if lat := st.LatencyTTFB["direct"]; lat.Count != 0 {
+		t.Errorf("status.latency_ttfb_ms.direct.count = %d, want 0 (3xx must not be recorded)", lat.Count)
+	}
+}
+
+// --- TestStatusFingerprintsAPIKeys -----------------------------------------
+
+// TestStatusFingerprintsAPIKeys: state.keys in the status payload must never
+// carry a full raw API key value (review F5) — each key is replaced by its
+// sha256[:8] display fingerprint while the per-key counters stay intact.
+// state.json on disk keeps the raw key (control layer only).
+func TestStatusFingerprintsAPIKeys(t *testing.T) {
+	const rawKey = "sk-test-FULLVALUE-123"
+	rot := newTestRouter(t, nil, 0)
+	rot.Store().RecordRequestSuccess("direct", rawKey)
+	h := newTestControl(rot).Handler(http.NewServeMux())
+
+	raw, st := getStatus(t, h)
+	body := string(raw)
+	if strings.Contains(body, rawKey) {
+		t.Errorf("status payload leaks raw API key %q: %s", rawKey, truncate(raw))
+	}
+	fp := fingerprintKey(rawKey)
+	if len(fp) != 8 {
+		t.Errorf("fingerprint %q length = %d, want 8 hex chars", fp, len(fp))
+	}
+	if len(st.State.Keys) != 1 {
+		t.Fatalf("state.keys = %#v, want exactly the fingerprinted key", st.State.Keys)
+	}
+	ks, ok := st.State.Keys[fp]
+	if !ok {
+		t.Fatalf("state.keys has no fingerprint %q: %#v", fp, st.State.Keys)
+	}
+	if ks.OK != 1 {
+		t.Errorf("state.keys[%q].ok = %d, want 1 — counters must survive redaction", fp, ks.OK)
 	}
 }
 
