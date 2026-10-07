@@ -7,8 +7,10 @@ package main
 //   (a) a free port is pre-allocated (net.Listen on 127.0.0.1:0, then
 //       closed) and pinned with --listen, so the LIVE daemon cannot answer
 //       the readiness poll and produce a false green;
-//   (b) HOME, XDG_CONFIG_HOME, XDG_STATE_HOME and ZEN_ROUTER_STATE all point
-//       into fresh t.TempDir()s BEFORE the child is spawned;
+//   (b) HOME, XDG_CONFIG_HOME, XDG_STATE_HOME, ZEN_ROUTER_STATE and DSH_HOME
+//       all point into fresh t.TempDir()s BEFORE the child is spawned (the
+//       explicit DSH_HOME keeps config.LegacyStatePath away from the real
+//       ~/.dsh/state/zen-router/state.json — fix F2);
 //   (c) the child binary is built into a fresh t.TempDir()
 //       (`go build -o <tmp>/zen-router ./cmd/zen-router`) — never go
 //       install, never ~/.local/bin;
@@ -20,6 +22,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -54,8 +57,26 @@ func TestUpDetach(t *testing.T) {
 	// env var is a state FILE path, and quota.Open rejects a directory
 	// (EISDIR), so the directory itself cannot be the value.
 	t.Setenv("ZEN_ROUTER_STATE", filepath.Join(tmp, "state.json"))
+	// (b) DSH_HOME too: LegacyStatePath must never read the real
+	// ~/.dsh/state/zen-router/state.json (fix F2).
+	dshHome := filepath.Join(t.TempDir(), "dsh")
+	t.Setenv("DSH_HOME", dshHome)
 	t.Setenv("OPENCODE_ZEN_API_KEY", "")
 	t.Setenv("OPENCODE_GO_API_KEY", "")
+
+	// Plant a legacy state file at the ISOLATED DSH_HOME with a marker
+	// timestamp: the daemon's one-shot migration must copy THIS file into
+	// the XDG state path — cheap proof the legacy path stayed inside the
+	// temp root (fix F2 assertion).
+	const legacyMarker = 1700000001
+	legacyDir := filepath.Join(dshHome, "state", "zen-router")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatalf("plant legacy dir: %v", err)
+	}
+	legacyJSON := fmt.Sprintf(`{"version":2,"mode":"auto","current":"direct","updatedAt": %d,"egress":{"direct":{},"warp":{}},"keys":{},"active":0}`+"\n", legacyMarker)
+	if err := os.WriteFile(filepath.Join(legacyDir, "state.json"), []byte(legacyJSON), 0o644); err != nil {
+		t.Fatalf("plant legacy state: %v", err)
+	}
 
 	// (a) Pre-allocated free port — the only address the child may serve.
 	listen := freeListen(t)
@@ -103,6 +124,20 @@ func TestUpDetach(t *testing.T) {
 	data := waitFileContains(t, logFile, "zen-router up on http://"+listen, 15*time.Second)
 	t.Logf("file log %s (%d bytes):\n%s", logFile, len(data), data)
 
+	// Fix F2 hermeticity proof: the one-shot migration copied the PLANTED
+	// legacy file from the isolated DSH_HOME into the XDG state path
+	// ($XDG_STATE_HOME/zen-router/state.json — MigrateLegacyState's target;
+	// the ZEN_ROUTER_STATE override is the quota layer's separate path), so
+	// the real ~/.dsh state can never have been read: its timestamp would
+	// not match the marker.
+	migrated, err := os.ReadFile(filepath.Join(tmp, "zen-router", "state.json"))
+	if err != nil {
+		t.Fatalf("read migrated state: %v", err)
+	}
+	if want := fmt.Sprintf(`"updatedAt": %d`, legacyMarker); !strings.Contains(string(migrated), want) {
+		t.Fatalf("migrated state does not carry the planted DSH_HOME marker %q (real ~/.dsh read instead?):\n%s", want, migrated)
+	}
+
 	// SIGTERM shuts the child down cleanly (recipe teardown): the explicit
 	// signal here asserts graceful exit; t.Cleanup repeats it defensively.
 	if err := syscall.Kill(daemonPid, syscall.SIGTERM); err != nil {
@@ -124,6 +159,7 @@ func TestUpForegroundTeesLogFile(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 	t.Setenv("XDG_STATE_HOME", tmp)
 	t.Setenv("ZEN_ROUTER_STATE", filepath.Join(tmp, "state.json"))
+	t.Setenv("DSH_HOME", filepath.Join(t.TempDir(), "dsh")) // fix F2: keep LegacyStatePath inside the temp root
 	t.Setenv("OPENCODE_ZEN_API_KEY", "")
 	t.Setenv("OPENCODE_GO_API_KEY", "")
 
@@ -176,6 +212,94 @@ func TestUpForegroundTeesLogFile(t *testing.T) {
 	}
 }
 
+// TestUpDetachRefusesDuplicate: `up --detach` must never declare readiness
+// from a daemon that was ALREADY serving the pinned port (fix F1). A status
+// answer whose pid is not the spawned child's cannot turn the poll green:
+// the parent refuses with a non-zero exit and an "already running (pid N)"
+// message, terminates its own child, and leaves daemon #1 untouched.
+func TestUpDetachRefusesDuplicate(t *testing.T) {
+	bin := buildZenRouter(t)
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("XDG_STATE_HOME", tmp)
+	t.Setenv("ZEN_ROUTER_STATE", filepath.Join(tmp, "state.json"))
+	t.Setenv("DSH_HOME", filepath.Join(t.TempDir(), "dsh")) // fix F2
+	t.Setenv("OPENCODE_ZEN_API_KEY", "")
+	t.Setenv("OPENCODE_GO_API_KEY", "")
+
+	listen := freeListen(t)
+
+	// Always stop every process running bin (daemon #1 and any stray child);
+	// pid2 stays 0 — the refused detach must not leave a second child.
+	var pid2 int
+	t.Cleanup(func() { stopDaemons(t, bin, &pid2) })
+
+	// Daemon #1: foreground child of THIS test, owns the port first.
+	d1 := exec.Command(bin, "up", "--listen", listen)
+	var out1 bytes.Buffer
+	d1.Stdout = &out1
+	d1.Stderr = &out1
+	if err := d1.Start(); err != nil {
+		t.Fatalf("start daemon #1: %v", err)
+	}
+	pid1 := d1.Process.Pid
+	done1 := make(chan error, 1)
+	go func() { done1 <- d1.Wait() }()
+	t.Cleanup(func() {
+		_ = d1.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-done1:
+		case <-time.After(10 * time.Second):
+			_ = d1.Process.Kill()
+			<-done1
+		}
+	})
+	st1 := waitStatus(t, listen, 15*time.Second)
+	if st1.Pid != pid1 {
+		t.Fatalf("status.pid = %d, want daemon #1's %d — the pid field must report the process serving /_zenctl/status", st1.Pid, pid1)
+	}
+
+	// Second detach for the SAME port must be refused.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	parent := exec.CommandContext(ctx, bin, "up", "--detach", "--listen", listen)
+	var out bytes.Buffer
+	parent.Stdout = &out
+	parent.Stderr = &out
+	err := parent.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("duplicate `up --detach` did not exit within 60s\noutput:\n%s", out.String())
+	}
+	// Capture a SUCCESS pid line (buggy green) BEFORE asserting, so a wrong
+	// exit 0 still gets its doomed child torn down by stopDaemons; the
+	// refusal message's pid belongs to daemon #1, not to a spawned child.
+	if m := regexp.MustCompile(`started \(pid (\d+)\)`).FindStringSubmatch(out.String()); m != nil {
+		pid2, _ = strconv.Atoi(m[1])
+	}
+	if err == nil {
+		t.Fatalf("second `up --detach` went green against the already-running daemon (pid %d); want non-zero exit\noutput:\n%s", pid1, out.String())
+	}
+	if want := fmt.Sprintf("already running (pid %d)", pid1); !strings.Contains(out.String(), want) {
+		t.Fatalf("detach error does not identify the running daemon (%q)\noutput:\n%s", want, out.String())
+	}
+
+	// No second child may be left behind, and daemon #1 keeps serving.
+	alive := daemonPIDs(t, bin)
+	if len(alive) != 1 || alive[0] != pid1 {
+		t.Fatalf("after the refused detach, processes running %s = %v, want only daemon #1 (pid %d)", bin, alive, pid1)
+	}
+	if err := syscall.Kill(pid1, 0); err != nil {
+		t.Fatalf("daemon #1 (pid %d) must survive the refused detach: %v", pid1, err)
+	}
+	if pid2 > 0 {
+		if err := syscall.Kill(pid2, 0); err == nil {
+			t.Fatalf("doomed second child (pid %d) still alive after refusal", pid2)
+		}
+	}
+}
+
 // buildZenRouter builds the zen-router binary into a fresh t.TempDir()
 // (recipe (c): never go install, never ~/.local/bin) and returns its path.
 // It runs BEFORE the hermetic t.Setenv calls so `go build` keeps the warm
@@ -225,7 +349,13 @@ func waitStatus(t *testing.T, listen string, timeout time.Duration) *cli.Status 
 		if err == nil && st.Up {
 			return st
 		}
-		last = err
+		// Keep a REAL reason for the final Fatal — a bare `err` would print
+		// `: <nil>` whenever the endpoint answered with up=false (fix F4).
+		if err != nil {
+			last = err
+		} else {
+			last = fmt.Errorf("status up=false (listen=%q, mode=%q)", st.Listen, st.Mode)
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("status on %s not ready within %s: %v", listen, timeout, last)
@@ -275,7 +405,12 @@ func waitGone(t *testing.T, pid int, timeout time.Duration) {
 func stopDaemons(t *testing.T, bin string, pid *int) {
 	t.Helper()
 	pids := daemonPIDs(t, bin)
-	if *pid > 0 && !containsInt(pids, *pid) {
+	// The raw pid came from parsed stdout and may already be a recycled id
+	// if the daemon died — never signal it without re-verifying that
+	// /proc/<pid>/exe still IS the built binary (fix F3). On the normal path
+	// the daemon is already gone after SIGTERM+waitGone, so this appends
+	// nothing.
+	if *pid > 0 && !containsInt(pids, *pid) && pidRunsBinary(*pid, bin) {
 		pids = append(pids, *pid)
 	}
 	for _, p := range pids {
@@ -329,6 +464,21 @@ func daemonPIDs(t *testing.T, bin string) []int {
 		}
 	}
 	return pids
+}
+
+// pidRunsBinary reports whether pid is alive and /proc/<pid>/exe resolves to
+// bin (fix F3): parsed pids are only ever signalled after this re-check.
+func pidRunsBinary(pid int, bin string) bool {
+	exe, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
+	if err != nil {
+		return false
+	}
+	want, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return false
+	}
+	got, err := filepath.EvalSymlinks(exe)
+	return err == nil && got == want
 }
 
 func containsInt(haystack []int, needle int) bool {

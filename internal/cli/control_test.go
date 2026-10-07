@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -274,6 +275,29 @@ func TestStatusHeaderFields(t *testing.T) {
 				t.Errorf("status.%s[%q] = %+v, want zeros before any request", m.name, eg, lat)
 			}
 		}
+	}
+}
+
+// --- TestStatusReportsPID --------------------------------------------------
+
+// TestStatusReportsPID (fix F1): status.pid is the pid of the process
+// serving GET /_zenctl/status — `up --detach` binds its readiness check on
+// it, so a pre-existing daemon can never satisfy the poll. The control layer
+// reports its own process (here: the test binary itself), and `pid` is an
+// additive JSON field.
+func TestStatusReportsPID(t *testing.T) {
+	rot := newTestRouter(t, nil, 0)
+	h := newTestControl(rot).Handler(http.NewServeMux())
+
+	raw, st := getStatus(t, h)
+	if !strings.Contains(string(raw), `"pid"`) {
+		t.Fatalf("raw status payload lacks the additive pid field:\n%s", raw)
+	}
+	if st.Pid == 0 {
+		t.Fatalf("status.pid = 0, want the serving process's pid %d", os.Getpid())
+	}
+	if st.Pid != os.Getpid() {
+		t.Errorf("status.pid = %d, want %d (the process running this handler)", st.Pid, os.Getpid())
 	}
 }
 

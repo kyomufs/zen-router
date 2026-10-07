@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ type Status struct {
 
 	// Listen is the resolved listen address ("host:port").
 	Listen string `json:"listen"`
+	// Pid is the pid of the daemon process serving this endpoint — `up
+	// --detach` binds its readiness poll on it, so a pre-existing daemon
+	// on the same address can never turn the poll green (fix F1; additive
+	// JSON field, Task 4/5 TUI renders it).
+	Pid int `json:"pid"`
 	// UptimeSeconds is the daemon uptime (whole seconds, clamped at 0).
 	UptimeSeconds int64 `json:"uptime_seconds"`
 	// LastRotate is the RFC3339 stamp of the last rotation completed by
@@ -146,6 +152,7 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 		Up:             true,
 		State:          snap,
 		Listen:         c.Listen,
+		Pid:            os.Getpid(), // this very process serves the endpoint
 		UptimeSeconds:  uptime,
 		LastRotate:     lastRotate,
 		Rotating:       c.Router.Rotating(),

@@ -163,8 +163,10 @@ const detachReadyTimeout = 30 * time.Second
 // the XDG file log (which the child's own logger tees into anyway — fileLog
 // collapses the duplicate — preserving pre-logger "error:" lines too).
 //
-// The status-wait also demands status.listen == listen: an answer from any
-// other process can never turn the poll green.
+// The status-wait also demands status.listen == listen AND
+// status.pid == <our child's pid> (fix F1): an answer from any other
+// process can never turn the poll green, and a pre-existing daemon on the
+// same address is reported instead of being forked over.
 func detachUp(listen string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -214,6 +216,18 @@ func detachUp(listen string) error {
 		return fmt.Errorf("daemon exited before becoming ready (%s); see %s or run `zen-router up --listen %s` in the foreground",
 			desc, paths.LogFile, listen)
 	}
+	// stopChild terminates the forked child and reaps it (SIGTERM, 5s
+	// grace, SIGKILL) — used whenever the parent refuses to go green, so no
+	// doomed child is ever left behind.
+	stopChild := func() {
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			_ = child.Process.Kill()
+			<-exited
+		}
+	}
 
 	client := cli.NewControlClient(listen)
 	deadline := time.Now().Add(detachReadyTimeout)
@@ -236,19 +250,20 @@ func detachUp(listen string) error {
 			lastErr = fmt.Errorf("status up=false")
 		case st.Listen != listen:
 			lastErr = fmt.Errorf("status.listen=%q, want %q", st.Listen, listen)
+		case st.Pid != child.Process.Pid:
+			// Readiness must come from OUR forked child: an answer with the
+			// right listen address but a DIFFERENT pid is a pre-existing
+			// daemon (or a squatter) — never green on it, and take our
+			// doomed child down before refusing (fix F1).
+			stopChild()
+			return fmt.Errorf("zen-router already running (pid %d) — not starting a duplicate", st.Pid)
 		default:
 			fmt.Printf("zen-router started (pid %d) on http://%s (log: %s)\n",
 				child.Process.Pid, listen, paths.LogFile)
 			return nil
 		}
 		if time.Now().After(deadline) {
-			_ = child.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-exited:
-			case <-time.After(5 * time.Second):
-				_ = child.Process.Kill()
-				<-exited
-			}
+			stopChild()
 			return fmt.Errorf("daemon not ready within %s (%v); see %s", detachReadyTimeout, lastErr, paths.LogFile)
 		}
 		select {
