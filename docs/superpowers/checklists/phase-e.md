@@ -26,7 +26,7 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
       over-budget; responses.go:379-398, doc :368-371).
 - [x] **DM-4** (closed 0c44866) T2 ClampEffort tie-break test (ruled to plan ledger:13, documented
       models.go:97, unreachable today).
-- [ ] **DM-5** T10 Active-remap: null-slot → remap `Active` (state.go:138-146 filters
+- [x] **DM-5** (closed ade6f88) T10 Active-remap: null-slot → remap `Active` (state.go:138-146 filters
       but does not remap; only hand-edited/corrupt JSON can trigger; clamped on read
       state.go:203-210).
 - [ ] **DM-6** T5 bare-429 → KindClient: keep (accepted T12, errors.go:225-227) — revisit
@@ -36,7 +36,7 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ### From T14 re-review (6)
 
-- [ ] **DM-8** buffer.go `merge` concatenates ALL choices (n>1 hypothetical — upstream is
+- [x] **DM-8** (closed ade6f88) buffer.go `merge` concatenates ALL choices (n>1 hypothetical — upstream is
       Zen/Anthropic-backed, no `n`): skip `c.Index > 0` or reject `n>1` in shaping + test.
 - [x] **DM-9** (closed c1acea6) handler.go:571 comment cites "§5/§9d metadata rule" — actual rule is §4:140.
       Comment-only fix.
@@ -48,7 +48,7 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
       then dies, attempt 2 succeeds, assert final JSON has only attempt-2 content.
 - [x] **DM-12** (closed 0c44866) Zero-frame flush untested: 2xx upstream stream with only [DONE] →
       200 + `content:""` + finish `"stop"` (valid semantics, pin it).
-- [ ] **DM-13** Upstream `"metadata":null` passes `json.Valid` → client gets
+- [x] **DM-13** (closed ade6f88) Upstream `"metadata":null` passes `json.Valid` → client gets
       `metadata:null` instead of `{}` (handler.go:586-591 + probeEnvelope:505-507).
       Treat `null` as absent.
 
@@ -57,7 +57,7 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 - [x] **N-1** (closed c1acea6) `TestResponsesAutoRoute` subtest-1 is no longer a force-proof (client already
       sends `stream:true`); note in test comment — force pinned by
       TestNonStreamingResponsesLane instead.
-- [ ] **N-2** `review-package.sh`: empty `=== PLAN SLICE ===` header when a plan arg is
+- [x] **N-2** (closed ade6f88) `review-package.sh`: empty `=== PLAN SLICE ===` header when a plan arg is
       absent — emit the header only when content follows.
 - [x] **N-3** (closed 0c44866) No responses-lane test with `stream` key *omitted* (redundant — same
       `body["stream"].(bool)` path as `false`; add for symmetry if touching the file anyway).
