@@ -139,6 +139,19 @@ func cmdUp(args []string) error {
 		return err
 	}
 
+	// Egress IP observation (plan Task 2): the production echo re-reads the
+	// ACTIVE transport on every attempt (so it follows rotation) and is
+	// built ONLY when the user opted in via config.EgressIPEcho — the §12
+	// gate, default false: no live echo call exists without that explicit
+	// opt-in. A rotation marks the observation stale (debounced by
+	// egressIPMinInterval), status reads refresh it lazily.
+	echoer := cli.NewEgressIPEchoer(cfg.EgressIPEcho, func() http.RoundTripper {
+		_, rt := r.Egress()
+		return rt
+	})
+	egressIP := cli.NewEgressIPTracker(echoer)
+	r.OnRotated = egressIP.Refresh
+
 	// Warm the WARP path up front if state says we were on it, so the first
 	// agent request does not pay the registration latency.
 	if r.Current() == proxy.EgressWarp {
@@ -168,6 +181,7 @@ func cmdUp(args []string) error {
 		Shutdown:  stop,
 		Listen:    listen,
 		StartedAt: started,
+		IPTracker: egressIP,
 	}
 	// Three surfaces, ONE listener (plan Task 13): control stays outermost
 	// and unchanged (it intercepts /_zenctl/* by prefix), the OpenAI

@@ -51,6 +51,13 @@ type Status struct {
 	// body close = full stream duration). Never averaged with TTFB
 	// (review F1).
 	LatencyStream map[string]router.EgressLatency `json:"latency_stream_ms"`
+	// EgressIP is the last observed public IP of the active egress
+	// ("" = unknown: echo disabled via config.EgressIPEcho, not yet
+	// performed, or the last attempt failed). Refreshed after each
+	// successful rotation and lazily on status reads, debounced by
+	// egressIPMinInterval — plan Task 2 (plan-local extra, no spec
+	// section; provenance D3).
+	EgressIP string `json:"egress_ip"`
 }
 
 // Control exposes CLI control endpoints over an existing router + proxy.
@@ -65,6 +72,9 @@ type Control struct {
 	// StartedAt is when the daemon started, surfaced as
 	// status.uptime_seconds. Zero means unknown (reported as 0).
 	StartedAt time.Time
+	// IPTracker observes the egress public IP for status.egress_ip
+	// (plan Task 2). Nil reports "" — no echo, no fan-out.
+	IPTracker *EgressIPTracker
 }
 
 // Handler returns an http.Handler that routes ControlPrefix to the control
@@ -143,6 +153,10 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 		LastSpareError: c.Router.LastSpareError(),
 		LatencyTTFB:    c.Router.Latency(router.LatencyTTFB),
 		LatencyStream:  c.Router.Latency(router.LatencyStream),
+		// IP() also triggers the debounced lazy refresh when the value is
+		// stale; the echo itself runs asynchronously, so this read never
+		// blocks and a status-poll burst cannot fan out echo requests.
+		EgressIP: c.IPTracker.IP(),
 	})
 }
 

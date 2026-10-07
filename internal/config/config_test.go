@@ -232,7 +232,43 @@ func TestLoadDefaults(t *testing.T) {
 		if d.ResponsesIdleTimeout != 300*time.Second {
 			t.Errorf("default ResponsesIdleTimeout = %s, want 300s", d.ResponsesIdleTimeout)
 		}
+		// §12 gate (plan Task 2): egress-IP echo stays OFF until the user
+		// explicitly opts in — no live call may exist behind a default.
+		if d.EgressIPEcho {
+			t.Error("default EgressIPEcho = true, want false (live echo requires explicit opt-in)")
+		}
 	})
+}
+
+// TestLoadEgressIPEcho: egressIPEcho is a config.json boolean — absent keeps
+// the default (false), true/false round-trips. This is the opt-in switch for
+// the live egress-IP echo (plan Task 2).
+func TestLoadEgressIPEcho(t *testing.T) {
+	cases := []struct {
+		name string
+		file string // "" = no config.json
+		want bool
+	}{
+		{"absent keeps the default false", "", false},
+		{"explicit true enables the echo", `{"egressIPEcho": true}`, true},
+		{"explicit false keeps it disabled", `{"egressIPEcho": false}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			if tc.file != "" {
+				writeConfig(t, tc.file)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.EgressIPEcho != tc.want {
+				t.Errorf("Load().EgressIPEcho = %v, want %v", cfg.EgressIPEcho, tc.want)
+			}
+		})
+	}
 }
 
 func TestLoadMalformedJSON(t *testing.T) {

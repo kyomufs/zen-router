@@ -58,6 +58,15 @@ type Router struct {
 	// current rotation-cooldown window was already persisted, so further
 	// reports in the window return false without churning the tunnel.
 	cooldownSwapped bool
+
+	// OnRotated is an optional callback fired after each SUCCESSFUL
+	// rotation — at every site that records one (rotate, RotateNow, the
+	// stage-2 identity switch, the stage-3 direct fallback). Nil (the
+	// default) fires nothing. It is set once at wiring time (before the
+	// HTTP server starts) and runs on the rotating/request goroutine
+	// outside router locks: it must not block (plan Task 2: the egress-IP
+	// refresh trigger).
+	OnRotated func()
 }
 
 // Options configures a Router.
@@ -353,6 +362,15 @@ func (r *Router) finishRotation() {
 	r.mu.Unlock()
 }
 
+// fireRotated invokes the optional OnRotated callback after a SUCCESSFUL
+// rotation (every site that records one). Nil-safe and non-blocking by
+// contract of OnRotated — used as the egress-IP refresh trigger (Task 2).
+func (r *Router) fireRotated() {
+	if r.OnRotated != nil {
+		r.OnRotated()
+	}
+}
+
 // rotate switches egress in response to a spent bucket. Direct -> warp the
 // first time; warp -> fresh WARP identity (new IP) on subsequent hits.
 func (r *Router) rotate(reason string) {
@@ -378,6 +396,7 @@ func (r *Router) rotate(reason string) {
 		return
 	}
 	r.store.RecordRotation(string(from), string(to), reason)
+	r.fireRotated()
 	r.log.Printf("rotated %s -> %s (%s)", from, to, reason)
 }
 
@@ -401,6 +420,7 @@ func (r *Router) RotateNow(reason string) (proxy.Egress, error) {
 		return from, err
 	}
 	r.store.RecordRotation(string(from), string(to), reason)
+	r.fireRotated()
 	r.log.Printf("rotated %s -> %s (%s)", from, to, reason)
 	return to, nil
 }

@@ -102,6 +102,11 @@ type Config struct {
 	FirstEventTimeout    time.Duration `json:"firstEventTimeout"`
 	IdleTimeout          time.Duration `json:"idleTimeout"`
 	ResponsesIdleTimeout time.Duration `json:"responsesIdleTimeout"`
+	// EgressIPEcho enables the live egress-IP echo (plan Task 2): when true
+	// the daemon GETs an IP-echo endpoint through the active transport to
+	// populate status.egress_ip. Default false — §12 gate: the live call
+	// exists only after explicit user opt-in, never by default.
+	EgressIPEcho bool `json:"egressIPEcho"`
 }
 
 // Default returns the built-in configuration defaults.
@@ -150,6 +155,7 @@ type rawConfig struct {
 	FirstEventTimeout    *string `json:"firstEventTimeout"`
 	IdleTimeout          *string `json:"idleTimeout"`
 	ResponsesIdleTimeout *string `json:"responsesIdleTimeout"`
+	EgressIPEcho         *bool   `json:"egressIPEcho"`
 }
 
 func (r *rawConfig) apply(cfg *Config) error {
@@ -174,6 +180,9 @@ func (r *rawConfig) apply(cfg *Config) error {
 	}
 	if r.PoolSpare != nil {
 		cfg.PoolSpare = *r.PoolSpare
+	}
+	if r.EgressIPEcho != nil {
+		cfg.EgressIPEcho = *r.EgressIPEcho
 	}
 	durations := []struct {
 		name string

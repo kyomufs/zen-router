@@ -267,6 +267,10 @@ func (r *Router) identityStep(rep Report, now time.Time) (Attempt, bool) {
 	if from != proxy.EgressWarp {
 		r.store.RecordRotation(string(from), string(proxy.EgressWarp), "fresh warp identity")
 	}
+	// Successful switch = rotation, even warp→warp (new identity = new IP,
+	// recordRotation only skips the unchanged egress name): fire the
+	// refresh hook before the in-window early return.
+	r.fireRotated()
 	if inside {
 		return Attempt{}, false // latch already claimed above
 	}
@@ -371,6 +375,7 @@ func (r *Router) directStep(rep Report) (Attempt, bool) {
 	r.setEgress(proxy.EgressDirect)
 	if from != proxy.EgressDirect {
 		r.store.RecordRotation(string(from), string(proxy.EgressDirect), "all identities spent")
+		r.fireRotated() // egress changed → the egress-IP observation is stale
 	}
 	return Attempt{Key: rep.Key, Egress: proxy.EgressDirect, Transport: r.directRT, Step: 3}, true
 }
