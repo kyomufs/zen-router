@@ -334,6 +334,23 @@ func TestImportBoundaries(t *testing.T) {
 			path := strings.Trim(imp.Path.Value, `"`)
 			if forbidden[path] {
 				t.Errorf("%s imports forbidden daemon-side package %q (tui may only import internal/cli)", name, path)
+				continue
+			}
+			// Positive allowlist (Task 5): stdlib, the charm.land UI
+			// stack, and the control client — nothing else. Keeps the
+			// tui package a pure control-API client.
+			first, _, _ := strings.Cut(path, "/")
+			var allowed bool
+			switch {
+			case strings.HasPrefix(path, "zen-router/"):
+				allowed = path == "zen-router/internal/cli"
+			case strings.HasPrefix(path, "charm.land/"):
+				allowed = true
+			default:
+				allowed = !strings.Contains(first, ".") // stdlib: no dot in first segment
+			}
+			if !allowed {
+				t.Errorf("%s imports %q: tui may only import stdlib, charm.land/*, zen-router/internal/cli", name, path)
 			}
 		}
 	}

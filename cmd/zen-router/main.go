@@ -569,16 +569,22 @@ func cmdInstallSystemd(args []string) error {
 	return nil
 }
 
-// cmdTui runs the interactive control dashboard (plan Task 4, spec §7):
+// cmdTui runs the interactive control dashboard (plan Task 4/5, spec §7):
 // a Bubble Tea v2 program that polls the control API once per second
-// through the tui.StatusSource seam (*cli.ControlClient here). Per the task
-// decision it runs normally regardless of TTY — no isatty gate.
+// through the tui.StatusSource seam (*cli.ControlClient here) and tails the
+// daemon file log through the tui.LogSource seam (NewFileLogTail on the
+// same XDG path fileLog() tees to; omitted if XDG resolution fails).
+// Per the task decision it runs normally regardless of TTY — no isatty gate.
 func cmdTui(args []string) error {
 	listen, err := parseListen(args)
 	if err != nil {
 		return err
 	}
-	p := tea.NewProgram(tui.New(cli.NewControlClient(listen)))
+	var opts []tui.Option
+	if paths, perr := config.DefaultPaths(); perr == nil {
+		opts = append(opts, tui.WithLogTail(tui.NewFileLogTail(paths.LogFile)))
+	}
+	p := tea.NewProgram(tui.New(cli.NewControlClient(listen), opts...))
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("tui: %w", err)
 	}

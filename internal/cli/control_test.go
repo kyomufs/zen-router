@@ -504,6 +504,32 @@ func TestStatusFingerprintsAPIKeys(t *testing.T) {
 	}
 }
 
+// TestStatusExposesRotationHistory (Task 5) pins the TUI data source: the
+// status payload already carries state.rotations (quota store caps it at
+// the last 50), so cli.Status needs no extra field for the dashboard's
+// rotation table. Rotation rows are display-safe by construction
+// (at/from/to/reason — egress names and a fixed reason string).
+func TestStatusExposesRotationHistory(t *testing.T) {
+	rot := newTestRouter(t, nil, 0)
+	rot.Store().RecordRotation("warp", "direct", "manual rotate via CLI")
+	h := newTestControl(rot).Handler(http.NewServeMux())
+
+	raw, st := getStatus(t, h)
+	if !strings.Contains(string(raw), `"rotations"`) {
+		t.Fatalf("status payload lacks state.rotations: %s", truncate(raw))
+	}
+	if len(st.State.Rotations) != 1 {
+		t.Fatalf("state.rotations = %d rows, want 1: %#v", len(st.State.Rotations), st.State.Rotations)
+	}
+	r := st.State.Rotations[0]
+	if r.From != "warp" || r.To != "direct" || r.Reason != "manual rotate via CLI" {
+		t.Errorf("rotation row = %+v, want warp -> direct with the CLI reason", r)
+	}
+	if r.At == 0 {
+		t.Errorf("rotation row has no At stamp: %+v", r)
+	}
+}
+
 // identityViews extracts the identity objects under the given JSON path:
 // "state.identities" is an array, "state.warp" a single object.
 func identityViews(t *testing.T, root map[string]any, path ...string) []map[string]any {
