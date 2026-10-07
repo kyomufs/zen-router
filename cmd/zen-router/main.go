@@ -162,7 +162,11 @@ const detachReadyTimeout = 30 * time.Second
 // (the caller's prepared HOME/XDG/ZEN_ROUTER_* values travel verbatim),
 // pinned to the resolved listen address — reopens the child's console onto
 // stable files, and polls /_zenctl/status until it answers. On readiness it
-// prints the child pid to stdout and returns nil (main exits 0). If the
+// writes the "zen-router started (pid N) …" success line to out and returns
+// nil (main exits 0). out selects the destination: `up --detach` passes
+// os.Stdout; the TUI Spawner passes nil — a raw line there would garble the
+// live altscreen until the next poll repaint (whole-branch F1), and errors
+// are reported through the returned error either way. If the
 // child dies first, or readiness does not arrive within
 // detachReadyTimeout, it returns an error (main prints it to stderr and
 // exits non-zero); a readiness timeout also terminates the forked child, so
@@ -178,7 +182,7 @@ const detachReadyTimeout = 30 * time.Second
 // status.pid == <our child's pid> (fix F1): an answer from any other
 // process can never turn the poll green, and a pre-existing daemon on the
 // same address is reported instead of being forked over.
-func detachUp(listen string) error {
+func detachUp(listen string, out io.Writer) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve own executable: %w", err)
@@ -269,8 +273,12 @@ func detachUp(listen string) error {
 			stopChild()
 			return fmt.Errorf("zen-router already running (pid %d) — not starting a duplicate", st.Pid)
 		default:
-			fmt.Printf("zen-router started (pid %d) on http://%s (log: %s)\n",
-				child.Process.Pid, listen, paths.LogFile)
+			// Silent when out is nil (TUI Spawner path): never write raw
+			// text into the live altscreen (whole-branch F1).
+			if out != nil {
+				fmt.Fprintf(out, "zen-router started (pid %d) on http://%s (log: %s)\n",
+					child.Process.Pid, listen, paths.LogFile)
+			}
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -297,7 +305,9 @@ func cmdUp(args []string) error {
 		return err
 	}
 	if detach {
-		return detachUp(listen)
+		// os.Stdout: `up --detach` must keep its pid line (TestUpDetach
+		// parses `pid (\d+)` from this output).
+		return detachUp(listen, os.Stdout)
 	}
 
 	// File log (plan Task 3, spec §10: the XDG state dir holds state.json +
@@ -583,7 +593,10 @@ func cmdTui(args []string) error {
 		return err
 	}
 	opts := tuiOptions(func(context.Context) error {
-		return detachUp(listen)
+		// nil writer: the TUI owns the terminal (altscreen) while this
+		// runs — a success line here would garble it (whole-branch F1);
+		// failures surface through the returned error instead.
+		return detachUp(listen, nil)
 	})
 	p := tea.NewProgram(tui.New(cli.NewControlClient(listen), opts...))
 	if _, err := p.Run(); err != nil {

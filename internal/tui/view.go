@@ -21,7 +21,9 @@ import (
 )
 
 // rotationHistory is how many rotation rows the history table keeps
-// (spec §14/§7: the store keeps the last 50; the view renders that tail).
+// (plan Task 5: an accepted extra beyond spec — data in state.Rotations;
+// the quota store keeps the last 50 rotations, quota.RecordRotation — the
+// view renders that tail).
 const rotationHistory = 50
 
 // View assembles the dashboard screen. Pure render — it reads model state
@@ -402,8 +404,9 @@ func latencyLine(st *cli.Status, kind string, stream bool) string {
 
 // resetCountdown is the time until the quota window resets: the key/egress
 // spentUntil stamp when it is still in the future, otherwise the next
-// midnight UTC (spec §9 daily windows). Renders as a string once, in
-// Update's precompute — never in View.
+// midnight UTC (spec §3:65 architecture + §4:161 quota semantics — quota
+// windows are midnight-UTC daily). Renders as a string once, in Update's
+// precompute — never in View.
 func resetCountdown(spentUntil int64, now time.Time) string {
 	at := time.UnixMilli(spentUntil)
 	if !at.After(now) {

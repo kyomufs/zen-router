@@ -272,11 +272,11 @@ func TestQuitOnQ(t *testing.T) {
 	}
 }
 
-// TestStubKeysAreNoOps: r/d/w/s are spec §7 action keys (Task 6) that the
+// TestKeysAreNoOpsWithoutSeams: r/d/w/s are spec §7 action keys (Task 6) that the
 // model only enables when the injected source exposes the ActionSource
 // seam. A plain StatusSource fake (like this one) keeps them no-ops: no
 // command, no quit, no state change.
-func TestStubKeysAreNoOps(t *testing.T) {
+func TestKeysAreNoOpsWithoutSeams(t *testing.T) {
 	m := New(newFake(fakeResult{status: upStatus()}))
 	msg := runCmd(t, m.Init())
 	m, _ = update(t, m, msg)

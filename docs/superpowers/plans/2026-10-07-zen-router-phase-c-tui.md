@@ -300,7 +300,10 @@ live DSH integration. README (Phase E) already shipped — 45f75b3, 1d851bf.
 - [ ] `systemctl --user daemon-reload && systemctl --user enable --now
       zen-router` — may restart the running daemon (127.0.0.1:8787).
 - [ ] Flip `config.EgressIPEcho` to `true` (config.json `egressIPEcho`, default
-      `false` per D3) to enable live egress-IP echo.
+      `false` per D3) to enable live egress-IP echo. Before flipping, re-confirm
+      the hard-coded `https://api.ipify.org/` endpoint/provider first (Task 2
+      deferred concern: the endpoint is a const and its choice needs an
+      explicit user re-confirm before any live echo call).
 
 ### Post-отмашка hardening
 
@@ -322,6 +325,10 @@ live DSH integration. README (Phase E) already shipped — 45f75b3, 1d851bf.
 - [ ] Task 6 residual: nothing pins `cmdTui` → `tuiOptions` assembly
       (inline-bypass would evade the wiring test); the `detachUp` closure is
       compile-checked only.
+- [ ] As-found minors (tracked in the plan-2 ledger): Task 1 fingerprint
+      collision (display-only); Task 3 state-path split + pid-0 cosmetic;
+      Task 4 pin-not-RED + dropped-timer; Task 8 argv-assert / remove-msg /
+      install-path / exit-code-comment / symlink-space.
 
 ### Cross-phase re-runs (per `docs/superpowers/checklists/phase-e.md`)
 
