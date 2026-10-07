@@ -8,11 +8,14 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -68,7 +71,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `zen-router — local reverse proxy for OpenCode Zen with WARP IP rotation
 
 Usage:
-  zen-router up      [--listen ADDR]     start the proxy daemon (foreground)
+  zen-router up      [--listen ADDR] [--detach]  start the proxy daemon (foreground; --detach forks it
+                                                 into the background and returns once it is ready)
   zen-router status  [--listen ADDR]     show egress, mode and quota counters
   zen-router rotate  [--listen ADDR]     force an egress IP rotation now
   zen-router use     <direct|warp>       force the active egress path
@@ -83,6 +87,9 @@ Environment:
 `, config.Default().Listen)
 }
 
+// parseListen parses the shared --listen flag of every foreground/control
+// subcommand. `up` parses its own flag set (parseUp) because it also owns
+// --detach.
 func parseListen(args []string) (string, error) {
 	fs := flag.NewFlagSet("zen-router", flag.ContinueOnError)
 	listen := fs.String("listen", "", "listen address (default "+config.Default().Listen+")")
@@ -92,32 +99,206 @@ func parseListen(args []string) (string, error) {
 	return cli.Listen(*listen)
 }
 
+// parseUp parses the `up` flag set: --listen like every other subcommand,
+// plus --detach (plan Task 3, spec §11: `zen-router up [--detach]`).
+func parseUp(args []string) (listen string, detach bool, err error) {
+	fs := flag.NewFlagSet("zen-router up", flag.ContinueOnError)
+	listenFlag := fs.String("listen", "", "listen address (default "+config.Default().Listen+")")
+	detachFlag := fs.Bool("detach", false, "start the daemon in the background; exit once it is ready")
+	if err := fs.Parse(args); err != nil {
+		return "", false, err
+	}
+	addr, err := cli.Listen(*listenFlag)
+	if err != nil {
+		return "", false, err
+	}
+	return addr, *detachFlag, nil
+}
+
+// fileLog attaches the XDG file log (plan Task 3, spec §10: the state dir
+// holds state.json + zen.log) to the daemon logger: it returns the writer
+// the logger should write to and a closer for the file. Failure to open the
+// log is reported but NOT fatal — the daemon still serves, only the file
+// copy of its output is missing.
+//
+// A detached child (`up --detach`) reopens its stderr onto this same file so
+// main's pre-logger "error:" lines stay inspectable after the parent is
+// gone. In that case the tee collapses to a single destination (stderr IS
+// the log file), so every line is still written exactly once.
+func fileLog(path string) (io.Writer, func(), error) {
+	noop := func() {}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return os.Stderr, noop, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return os.Stderr, noop, err
+	}
+	if st, serr := os.Stderr.Stat(); serr == nil {
+		if fst, ferr := f.Stat(); ferr == nil && os.SameFile(st, fst) {
+			f.Close()
+			return os.Stderr, noop, nil
+		}
+	}
+	return io.MultiWriter(os.Stderr, f), func() { f.Close() }, nil
+}
+
+// detachReadyTimeout bounds how long `up --detach` waits for the forked
+// daemon's control API to answer before giving up.
+const detachReadyTimeout = 30 * time.Second
+
+// detachUp forks a background copy of THIS executable — same environment
+// (the caller's prepared HOME/XDG/ZEN_ROUTER_* values travel verbatim),
+// pinned to the resolved listen address — reopens the child's console onto
+// stable files, and polls /_zenctl/status until it answers. On readiness it
+// prints the child pid to stdout and returns nil (main exits 0). If the
+// child dies first, or readiness does not arrive within
+// detachReadyTimeout, it returns an error (main prints it to stderr and
+// exits non-zero); a readiness timeout also terminates the forked child, so
+// a failed start never leaves a half-running daemon behind.
+//
+// The child's stdio is never inherited: once this parent exits, a pipe's
+// read end dies with it, and the daemon's next write to fd 1/2 would raise
+// SIGPIPE and kill it on the spot. stdout goes to /dev/null and stderr to
+// the XDG file log (which the child's own logger tees into anyway — fileLog
+// collapses the duplicate — preserving pre-logger "error:" lines too).
+//
+// The status-wait also demands status.listen == listen: an answer from any
+// other process can never turn the poll green.
+func detachUp(listen string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve own executable: %w", err)
+	}
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.LogFile), 0o755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	}
+	defer devnull.Close()
+	logf, err := os.OpenFile(paths.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open file log %s: %w", paths.LogFile, err)
+	}
+	defer logf.Close()
+
+	child := exec.Command(exe, "up", "--listen", listen)
+	child.Env = os.Environ()
+	child.Stdout = devnull
+	child.Stderr = logf
+	// child.Stdin stays nil → /dev/null (exec.Cmd default).
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("start daemon: %w", err)
+	}
+
+	// Reap the child if it dies before we do. The channel is buffered so
+	// this goroutine never blocks when we return on the success path and
+	// exit without consuming the status; the send publishes ProcessState
+	// to the poll loop.
+	exited := make(chan *os.ProcessState, 1)
+	go func() {
+		_ = child.Wait() // reaps the child; ProcessState is set by then
+		exited <- child.ProcessState
+	}()
+	earlyExit := func(st *os.ProcessState) error {
+		desc := "unknown status"
+		if st != nil {
+			desc = st.String()
+		}
+		return fmt.Errorf("daemon exited before becoming ready (%s); see %s or run `zen-router up --listen %s` in the foreground",
+			desc, paths.LogFile, listen)
+	}
+
+	client := cli.NewControlClient(listen)
+	deadline := time.Now().Add(detachReadyTimeout)
+	var lastErr error
+	for {
+		select {
+		case st := <-exited:
+			return earlyExit(st)
+		default:
+		}
+		// Short per-attempt read: connection refused while the child boots
+		// is the normal case, not an error.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		st, serr := client.Status(ctx)
+		cancel()
+		switch {
+		case serr != nil:
+			lastErr = serr
+		case !st.Up:
+			lastErr = fmt.Errorf("status up=false")
+		case st.Listen != listen:
+			lastErr = fmt.Errorf("status.listen=%q, want %q", st.Listen, listen)
+		default:
+			fmt.Printf("zen-router started (pid %d) on http://%s (log: %s)\n",
+				child.Process.Pid, listen, paths.LogFile)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			_ = child.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-exited:
+			case <-time.After(5 * time.Second):
+				_ = child.Process.Kill()
+				<-exited
+			}
+			return fmt.Errorf("daemon not ready within %s (%v); see %s", detachReadyTimeout, lastErr, paths.LogFile)
+		}
+		select {
+		case st := <-exited:
+			return earlyExit(st)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // cmdUp starts the daemon: control API + OpenAI gateway + legacy reverse
-// proxy on one listener, in the foreground.
+// proxy on one listener. Foreground by default; with --detach it forks that
+// foreground run into the background and returns once it is ready.
 func cmdUp(args []string) error {
 	// Daemon start stamp for status.uptime_seconds (plan Task 1), taken
 	// before any setup so uptime covers init time too.
 	started := time.Now()
-	listen, err := parseListen(args)
+	listen, detach, err := parseUp(args)
 	if err != nil {
 		return err
 	}
-	logger := log.New(os.Stderr, "zen-router ", log.LstdFlags|log.Lmsgprefix)
+	if detach {
+		return detachUp(listen)
+	}
+
+	// File log (plan Task 3, spec §10: the XDG state dir holds state.json +
+	// zen.log — the TUI tails it). paths is needed before the logger exists,
+	// so it resolves here, ahead of config.Load.
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	logw, closeLog, logErr := fileLog(paths.LogFile)
+	defer closeLog()
+	logger := log.New(logw, "zen-router ", log.LstdFlags|log.Lmsgprefix)
+	if logErr != nil {
+		// Non-fatal: stderr-only logging, the daemon keeps serving.
+		logger.Printf("warn: file log disabled: %v", logErr)
+	}
 
 	// Full config: the gateway needs the upstream base URL and watchdog
 	// budgets; the rotator needs the key pool, identity-pool sizing,
-	// cooldown and address family. parseListen already resolved Listen
-	// through the same loader — config.json is a tiny read-only file, so
-	// reading it again here beats duplicating flag-parsing logic.
+	// cooldown and address family. parseUp already resolved Listen through
+	// the same loader — config.json is a tiny read-only file, so reading it
+	// again here beats duplicating flag-parsing logic.
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 	// One-shot legacy-state migration, BEFORE the state file is opened.
-	paths, err := config.DefaultPaths()
-	if err != nil {
-		return err
-	}
 	if _, err := config.MigrateLegacyState(paths); err != nil {
 		return fmt.Errorf("migrate legacy state: %w", err)
 	}
