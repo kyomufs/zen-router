@@ -223,6 +223,14 @@ func (b *completionBuffer) merge(data string) {
 		b.usage = append(b.usage[:0], ch.Usage...)
 	}
 	for _, c := range ch.Choices {
+		// DM-8, first-wins: the flushed body carries exactly one choice
+		// (OpenAI non-streaming semantics, n=1), so anything beyond index 0
+		// must not concatenate into that one message. The upstream is
+		// Zen/Anthropic-backed (no n>1 today) — defended anyway. Buffer
+		// only: the SSE path never goes through merge.
+		if c.Index > 0 {
+			continue
+		}
 		if c.Delta != nil {
 			if c.Delta.Content != nil {
 				b.content.WriteString(*c.Delta.Content)

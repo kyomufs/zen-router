@@ -521,3 +521,40 @@ func TestNonStreamingZeroFrameFlush(t *testing.T) {
 		t.Errorf("usage.total_tokens = %v, want 0 default", usage["total_tokens"])
 	}
 }
+
+// TestBufferFirstChoiceWins (DM-8): a buffered stream whose frames carry
+// MORE than one choice (indexes 0 and 1, different contents) flushes only
+// the index-0 message. OpenAI non-streaming semantics are a single choice,
+// so completionBuffer.merge skips choices with Index > 0 instead of
+// concatenating every choice's deltas into the one message. The upstream
+// is Zen/Anthropic-backed (no n>1) — this defends the merge anyway. The
+// SSE path is untouched: the skip lives in the buffer only.
+func TestBufferFirstChoiceWins(t *testing.T) {
+	rot := newTestRotator(t)
+	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		writeSSE(wrap(w),
+			`data: {"id":"c","choices":[{"index":0,"delta":{"content":"alpha"}},`+
+				`{"index":1,"delta":{"content":"beta"}}]}`+"\n\n",
+			`data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n",
+			"data: [DONE]"+"\n\n",
+		)
+	})
+	h := New(rot, config.Default())
+	h.Upstream = up.srv.URL
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newChatRequest(nonStreamBody(`"stream":false,`)))
+	env := requireJSONCompletion(t, rec)
+
+	msg, finish := requireChoice(t, env)
+	if c, _ := msg["content"].(string); c != "alpha" {
+		t.Errorf("message.content = %q, want %q (choices with index > 0 must not concatenate)",
+			c, "alpha")
+	}
+	if body := rec.Body.String(); strings.Contains(body, "beta") {
+		t.Errorf("index-1 content leaked into the flushed body: %s", truncate(rec.Body.Bytes()))
+	}
+	if finish != "stop" {
+		t.Errorf("finish_reason = %q, want stop", finish)
+	}
+}

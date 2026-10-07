@@ -492,6 +492,52 @@ func TestOpenHandlesNullIdentitySlot(t *testing.T) {
 			t.Error("Open rewrote the file; want disk untouched for a non-migrated v2 load")
 		}
 	})
+
+	t.Run("active points at null slot", func(t *testing.T) {
+		// DM-5: Active itself indexed a null slot. After the load-time
+		// filter, Active must be REMAPPED to the first valid identity —
+		// without the remap the index shift silently activates whatever
+		// entry slid into the filtered slot (dev-b instead of dev-a).
+		raw := `{"version":2,"mode":"auto","current":"direct","updatedAt":1,` +
+			`"egress":{"direct":{},"warp":{}},` +
+			`"identities":[{"deviceId":"dev-a","token":"ta","privateKey":"pa","publicKey":"qa","registeredAt":8},null,` +
+			`{"deviceId":"dev-b","token":"tb","privateKey":"pb","publicKey":"qb","registeredAt":9}],` +
+			`"active":1,"rotations":[]}`
+		path := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+
+		m, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open with Active on a null slot: %v", err)
+		}
+
+		s := m.Snapshot()
+		if s.Active < 0 || s.Active >= len(s.Identities) {
+			t.Fatalf("Snapshot().Active = %d out of range for %d entries", s.Active, len(s.Identities))
+		}
+		if s.Identities[s.Active] == nil {
+			t.Errorf("Snapshot().Identities[%d] is null — Active must not reference a null slot", s.Active)
+		}
+		if act := m.ActiveIdentity(); act == nil || act.DeviceID != "dev-a" {
+			t.Errorf("ActiveIdentity() = %+v, want dev-a (remapped to the first valid identity)", act)
+		}
+		if w := m.GetWarp(); w == nil || w.DeviceID != "dev-a" {
+			t.Errorf("GetWarp() = %+v, want dev-a (legacy mirror follows the remap)", w)
+		}
+		if ids := m.Identities(); len(ids) != 2 || ids[0].DeviceID != "dev-a" || ids[1].DeviceID != "dev-b" {
+			t.Errorf("Identities() = %+v, want [dev-a dev-b] (null slot dropped, order kept)", ids)
+		}
+
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("re-read fixture: %v", err)
+		}
+		if !bytes.Equal([]byte(raw), after) {
+			t.Error("Open rewrote the file; want disk untouched for a non-migrated v2 load")
+		}
+	})
 }
 
 // TestAddIdentityNilGuard: AddIdentity(nil) must not panic and must report

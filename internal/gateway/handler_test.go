@@ -659,6 +659,42 @@ func TestBudgetExhaustedSurfaces429(t *testing.T) {
 	}
 }
 
+// TestMetadataNullUpstreamBecomesEmptyObject (DM-13): an upstream 429
+// whose body carries "metadata":null must NOT reach the client as
+// metadata:null — JSON null is treated as absent, so the envelope falls
+// back to writeError's documented {} else-branch (429 metadata is always
+// an object, spec §4:140).
+func TestMetadataNullUpstreamBecomesEmptyObject(t *testing.T) {
+	rot := newTestRotator(t)
+	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"type":"error","error":{"type":"FreeUsageLimitError",`+
+			`"message":"Free usage limit reached"},"metadata":null}`)
+	})
+	h := New(rot, config.Default())
+	h.Upstream = up.srv.URL
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newChatRequest(chatClientBody()))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
+	}
+	env := requireOpenAIError(t, rec, "FreeUsageLimitError")
+	md, ok := env["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("429 envelope metadata = %#v, want {} (upstream null is absent, never null): %s",
+			env["metadata"], truncate(rec.Body.Bytes()))
+	}
+	if len(md) != 0 {
+		t.Errorf("429 envelope metadata = %#v, want empty {}", md)
+	}
+	if body := rec.Body.String(); strings.Contains(body, `"metadata":null`) {
+		t.Errorf("client body carries metadata:null: %s", truncate(rec.Body.Bytes()))
+	}
+}
+
 // recordingRot is a rotator that always offers a next attempt and records
 // every Report it receives — it proves the handler consults the rotator for
 // bookkeeping even when the first-byte guard forbids the re-issue.

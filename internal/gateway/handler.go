@@ -502,7 +502,9 @@ func probeEnvelope(raw []byte) (string, json.RawMessage) {
 			workspace = md.Workspace
 		}
 	}
-	if !json.Valid(top.Metadata) {
+	// DM-13: JSON null is absent, not a value — an upstream
+	// "metadata":null must not pass json.Valid as a real payload.
+	if !json.Valid(top.Metadata) || bytes.Equal(top.Metadata, []byte("null")) {
 		top.Metadata = nil
 	}
 	return workspace, top.Metadata
@@ -585,7 +587,9 @@ func writeError(w http.ResponseWriter, status int, typ, msg string, metadata jso
 		"error": map[string]any{"message": msg, "type": typ, "code": typ},
 	}
 	if status == http.StatusTooManyRequests {
-		if len(metadata) > 0 && json.Valid(metadata) {
+		// DM-13: JSON null metadata is treated as absent — it falls back to
+		// the {} else-branch instead of reaching the client as null.
+		if len(metadata) > 0 && json.Valid(metadata) && !bytes.Equal(metadata, []byte("null")) {
 			env["metadata"] = metadata
 		} else {
 			env["metadata"] = map[string]any{}

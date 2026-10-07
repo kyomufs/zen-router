@@ -136,6 +136,15 @@ func Open(path string) (*Manager, error) {
 			// Active always indexes a real entry. In-memory only: the file is
 			// rewritten on the next save (or now, when migrating).
 			if len(parsed.Identities) > 0 {
+				// DM-5: did Active itself point at a slot being filtered out?
+				// After filtering, the first valid identity sits at index 0,
+				// so a null-targeted Active remaps there; an all-null pool
+				// keeps the documented empty state (mirrorWarpLocked clamp:
+				// Active 0, Warp nil). Active values that survive the filter
+				// are untouched — out-of-range ones remain clamp-covered by
+				// mirrorWarpLocked.
+				activeWasNull := parsed.Active >= 0 && parsed.Active < len(parsed.Identities) &&
+					parsed.Identities[parsed.Active] == nil
 				kept := parsed.Identities[:0]
 				for _, id := range parsed.Identities {
 					if id != nil {
@@ -143,6 +152,9 @@ func Open(path string) (*Manager, error) {
 					}
 				}
 				parsed.Identities = kept
+				if activeWasNull && len(kept) > 0 {
+					parsed.Active = 0
+				}
 			}
 			migrated := false
 			if parsed.Version == 1 || (parsed.Warp != nil && len(parsed.Identities) == 0) {
