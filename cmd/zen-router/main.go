@@ -95,6 +95,9 @@ func parseListen(args []string) (string, error) {
 // cmdUp starts the daemon: control API + OpenAI gateway + legacy reverse
 // proxy on one listener, in the foreground.
 func cmdUp(args []string) error {
+	// Daemon start stamp for status.uptime_seconds (plan Task 1), taken
+	// before any setup so uptime covers init time too.
+	started := time.Now()
 	listen, err := parseListen(args)
 	if err != nil {
 		return err
@@ -160,7 +163,12 @@ func cmdUp(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ctrl := &cli.Control{Router: r, Shutdown: stop}
+	ctrl := &cli.Control{
+		Router:    r,
+		Shutdown:  stop,
+		Listen:    listen,
+		StartedAt: started,
+	}
 	// Three surfaces, ONE listener (plan Task 13): control stays outermost
 	// and unchanged (it intercepts /_zenctl/* by prefix), the OpenAI
 	// gateway takes /v1/*, and everything else — including the legacy
@@ -169,7 +177,9 @@ func cmdUp(args []string) error {
 	// plugin's traffic) and /v1/* must never reach the path-preserving
 	// proxy (the OpenAI path would leak straight to the upstream).
 	root := http.NewServeMux()
-	root.Handle("/v1/", gateway.Mux(r, cfg))
+	gw := gateway.New(r, cfg)
+	gw.Recorder = r // dashboard seam (plan Task 1): 2xx counters + latency
+	root.Handle("/v1/", gw)
 	root.Handle("/", srv.Handler())
 	handler := ctrl.Handler(root)
 

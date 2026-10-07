@@ -422,7 +422,18 @@ func (r *Router) scheduleSpareRegistration() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := reg(ctx); err != nil {
+			// Surface the failure through the control API (spec §14: the
+			// pool falls back to the live identities and the TUI shows WHY
+			// the spare did not refill).
 			r.log.Printf("spare registration failed: %v", err)
+			r.mu.Lock()
+			r.lastSpareError = err.Error()
+			r.mu.Unlock()
+		} else {
+			// A clean registration retires the stale error.
+			r.mu.Lock()
+			r.lastSpareError = ""
+			r.mu.Unlock()
 		}
 	}()
 }

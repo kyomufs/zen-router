@@ -63,10 +63,14 @@ type EgressStats struct {
 
 // WarpIdentity is the registered WARP device.
 type WarpIdentity struct {
-	DeviceID     string `json:"deviceId"`
-	Token        string `json:"token"`
+	DeviceID string `json:"deviceId"`
+	// Token and PrivateKey are credentials: omitempty keeps them out of
+	// JSON when empty, so the control layer's Redacted() view omits the
+	// fields entirely. Registered identities always carry real values, so
+	// state.json on disk keeps full fidelity.
+	Token        string `json:"token,omitempty"`
 	License      string `json:"license,omitempty"`
-	PrivateKey   string `json:"privateKey"`
+	PrivateKey   string `json:"privateKey,omitempty"`
 	PublicKey    string `json:"publicKey"`
 	AddressV4    string `json:"addressV4,omitempty"`
 	AddressV6    string `json:"addressV6,omitempty"`
@@ -86,6 +90,17 @@ type Rotation struct {
 	From   string `json:"from"`
 	To     string `json:"to"`
 	Reason string `json:"reason"`
+}
+
+// Redacted returns the control-layer view of the identity with the
+// credential fields (Token, PrivateKey) stripped. The control API's
+// /_zenctl/status serves this copy ONLY — state.json on disk keeps the
+// full-fidelity struct. With omitempty on those fields the redacted JSON
+// payload contains neither the field names nor the values.
+func (id WarpIdentity) Redacted() WarpIdentity {
+	id.Token = ""
+	id.PrivateKey = ""
+	return id
 }
 
 // Manager owns the persisted state with a mutex; every mutation saves.

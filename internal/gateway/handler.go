@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"zen-router/internal/config"
+	"zen-router/internal/proxy"
 	"zen-router/internal/router"
 	"zen-router/internal/zen"
 )
@@ -30,6 +31,17 @@ import (
 type Rotator interface {
 	Attempt() router.Attempt
 	NextAttempt(rep router.Report) (router.Attempt, bool)
+}
+
+// Recorder is the optional dashboard-data seam (plan Task 1, spec §7): after
+// an attempt receives a 2xx upstream response, the handler reports the
+// egress, the API key and the response latency (time to upstream headers).
+// internal/router.Router implements it — success counters per egress AND per
+// key plus the per-egress latency view. The Handler field defaults to nil:
+// a nil Recorder makes no calls, so behavior is unchanged for every existing
+// caller and for Rotator fakes that do not implement it.
+type Recorder interface {
+	RecordSuccess(egress proxy.Egress, key string, latencyMS int64)
 }
 
 const (
@@ -56,6 +68,10 @@ type Handler struct {
 	// Upstream is the Zen gateway base URL (test seam). It shadows
 	// Cfg.Upstream when non-empty.
 	Upstream string
+	// Recorder optionally receives every 2xx upstream attempt (plan Task 1).
+	// Nil — the default and the state of every existing test fake — records
+	// nothing.
+	Recorder Recorder
 }
 
 // New builds the gateway handler for one rotator + config pair.
@@ -290,6 +306,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 			if firstEvent > 0 {
 				headerTimer = time.AfterFunc(firstEvent, cancel)
 			}
+			started := time.Now()
 			resp, err := (&http.Client{Transport: att.Transport}).Do(req)
 			// Stop() reports false iff the timer already expired (or its
 			// callback is running): the budget was blown. Re-issue cancel —
@@ -331,6 +348,14 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 				return false,
 					zen.Classify(resp.StatusCode, fb, resp.Header.Get("Retry-After")),
 					ws, meta
+			}
+
+			// 2xx: record the dashboard data (plan Task 1): the egress/key
+			// success counters and this attempt's response latency (headers).
+			// A nil Recorder (default; existing Rotator fakes) records
+			// nothing, so behavior without the seam is unchanged.
+			if h.Recorder != nil {
+				h.Recorder.RecordSuccess(att.Egress, att.Key, time.Since(started).Milliseconds())
 			}
 
 			// 2xx: stream the lane. The watchdog wraps the body itself;

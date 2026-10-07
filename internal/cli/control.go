@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
@@ -16,12 +17,32 @@ import (
 // traffic, and it keeps control on the same localhost-only port.
 const ControlPrefix = "/_zenctl/"
 
-// Status is the JSON payload served by GET /_zenctl/status.
+// Status is the JSON payload served by GET /_zenctl/status: the dashboard
+// header fields plus the redacted quota state (plan Task 1, spec §7).
 type Status struct {
-	Mode    string      `json:"mode"`
-	Current string      `json:"current"`
-	Up      bool        `json:"up"`
-	State   quota.State `json:"state"`
+	Mode    string `json:"mode"`
+	Current string `json:"current"`
+	Up      bool   `json:"up"`
+	// State is the quota snapshot with identity credentials stripped by
+	// Redacted() — state.json on disk keeps the full fidelity.
+	State quota.State `json:"state"`
+
+	// Listen is the resolved listen address ("host:port").
+	Listen string `json:"listen"`
+	// UptimeSeconds is the daemon uptime (whole seconds, clamped at 0).
+	UptimeSeconds int64 `json:"uptime_seconds"`
+	// LastRotate is the RFC3339 stamp of the last rotation completed by
+	// THIS process ("" = none this run).
+	LastRotate string `json:"last_rotate"`
+	// Rotating reports an in-flight rotation.
+	Rotating bool `json:"rotating"`
+	// Registering reports an in-flight background spare registration.
+	Registering bool `json:"registering"`
+	// LastSpareError is the most recent spare-registration failure
+	// ("" = none since the last success).
+	LastSpareError string `json:"lastSpareError"`
+	// Latency is the per-egress 2xx response latency view (last/avg/count).
+	Latency map[string]router.EgressLatency `json:"latency"`
 }
 
 // Control exposes CLI control endpoints over an existing router + proxy.
@@ -29,6 +50,13 @@ type Control struct {
 	Router *router.Router
 	// Shutdown triggers a graceful daemon stop (wired to context cancel).
 	Shutdown func()
+
+	// Listen is the resolved listen address (main.go from config), surfaced
+	// to the dashboard as status.listen.
+	Listen string
+	// StartedAt is when the daemon started, surfaced as
+	// status.uptime_seconds. Zero means unknown (reported as 0).
+	StartedAt time.Time
 }
 
 // Handler returns an http.Handler that routes ControlPrefix to the control
@@ -68,11 +96,43 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func (c *Control) handleStatus(w http.ResponseWriter) {
+	// Control-layer redaction ONLY: state.json on disk keeps credentials,
+	// the loopback dashboard payload never sees them (plan Task 1).
+	snap := c.Router.Store().Snapshot()
+	for i, id := range snap.Identities {
+		if id != nil {
+			redacted := id.Redacted()
+			snap.Identities[i] = &redacted
+		}
+	}
+	if snap.Warp != nil {
+		redacted := snap.Warp.Redacted()
+		snap.Warp = &redacted
+	}
+
+	var uptime int64
+	if !c.StartedAt.IsZero() {
+		if u := int64(time.Since(c.StartedAt).Seconds()); u > 0 {
+			uptime = u
+		}
+	}
+	lastRotate := ""
+	if t := c.Router.LastRotate(); !t.IsZero() {
+		lastRotate = t.Format(time.RFC3339)
+	}
+
 	writeJSON(w, http.StatusOK, Status{
-		Mode:    c.Router.Store().Mode(),
-		Current: string(c.Router.Current()),
-		Up:      true,
-		State:   c.Router.Store().Snapshot(),
+		Mode:           c.Router.Store().Mode(),
+		Current:        string(c.Router.Current()),
+		Up:             true,
+		State:          snap,
+		Listen:         c.Listen,
+		UptimeSeconds:  uptime,
+		LastRotate:     lastRotate,
+		Rotating:       c.Router.Rotating(),
+		Registering:    c.Router.Registering(),
+		LastSpareError: c.Router.LastSpareError(),
+		Latency:        c.Router.Latency(),
 	})
 }
 

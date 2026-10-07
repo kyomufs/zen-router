@@ -46,6 +46,12 @@ type Router struct {
 	identitySwitch func(*quota.WarpIdentity) (http.RoundTripper, error)
 	spareRegistrar func(context.Context) error
 	registering    bool
+	// lastSpareError is the most recent background spare-registration
+	// failure ("" since the last success), surfaced by the control API.
+	lastSpareError string
+	// latency accumulates observed 2xx response latency per egress
+	// (dashboard data, plan Task 1) — volatile, deliberately NOT persisted.
+	latency map[string]*latencyEntry
 	// cooldownSwapped records that the first identity switch inside the
 	// current rotation-cooldown window was already persisted, so further
 	// reports in the window return false without churning the tunnel.
@@ -119,6 +125,7 @@ func New(opts Options) (*Router, error) {
 		identitySwitch:   opts.IdentitySwitch,
 		spareRegistrar:   opts.SpareRegistrar,
 		egress:           proxy.EgressDirect,
+		latency:          map[string]*latencyEntry{string(proxy.EgressDirect): {}, string(proxy.EgressWarp): {}},
 	}
 	// Restore the active egress from state; default to direct.
 	switch r.store.Current() {
@@ -189,8 +196,105 @@ func (r *Router) OnResult(res proxy.Result) {
 			res.Egress, res.Status, res.RetryAfter)
 		go r.rotate(fmt.Sprintf("daily limit on %s (HTTP %d)", res.Egress, res.Status))
 	case res.Status >= 200 && res.Status < 300:
-		r.store.RecordSuccess(string(res.Egress))
+		// Shared success bookkeeping with the gateway path: egress counter
+		// and the latency view (Result.LatencyMS was discarded before
+		// plan Task 1). The legacy proxy carries no API key, hence "".
+		r.RecordSuccess(res.Egress, "", res.LatencyMS)
 	}
+}
+
+// --- dashboard data (plan Task 1, spec §7) ---------------------------------
+
+// EgressLatency is the status-payload view of one egress's observed 2xx
+// response latency: the last sample, the running average and how many
+// samples back them up (count 0 = no request observed yet).
+type EgressLatency struct {
+	LastMS int64 `json:"last_ms"`
+	AvgMS  int64 `json:"avg_ms"`
+	Count  int64 `json:"count"`
+}
+
+// latencyEntry is the mutable accumulator behind EgressLatency, guarded by
+// Router.mu.
+type latencyEntry struct {
+	last  int64
+	sum   int64
+	count int64
+}
+
+// RecordSuccess implements the optional gateway.Recorder seam: a 2xx attempt
+// on the OpenAI surface feeds BOTH success counters — per egress
+// (quota.RecordSuccess) and per API key (quota.RecordKeySuccess, which had
+// zero production callers before plan Task 1) — plus the per-egress latency
+// view. The legacy reverse-proxy path reports through OnResult, which
+// delegates here with an empty key (no key on that wire).
+func (r *Router) RecordSuccess(egress proxy.Egress, key string, latencyMS int64) {
+	r.store.RecordSuccess(string(egress))
+	if key != "" {
+		r.store.RecordKeySuccess(key)
+	}
+	r.recordLatency(string(egress), latencyMS)
+}
+
+// recordLatency folds one 2xx observation into the egress accumulator.
+func (r *Router) recordLatency(egress string, latencyMS int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.latency[egress]
+	if e == nil {
+		e = &latencyEntry{}
+		r.latency[egress] = e
+	}
+	e.last = latencyMS
+	e.sum += latencyMS
+	e.count++
+}
+
+// Latency returns a snapshot of the per-egress latency view for the status
+// payload. Both known egresses are always present (zeroed until observed).
+func (r *Router) Latency() map[string]EgressLatency {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]EgressLatency, len(r.latency))
+	for eg, e := range r.latency {
+		avg := int64(0)
+		if e.count > 0 {
+			avg = e.sum / e.count
+		}
+		out[eg] = EgressLatency{LastMS: e.last, AvgMS: avg, Count: e.count}
+	}
+	return out
+}
+
+// LastRotate reports when this process last completed a rotation (zero =
+// none this run); surfaced as status.last_rotate.
+func (r *Router) LastRotate() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastRotate
+}
+
+// Rotating reports whether a rotation is currently in flight.
+func (r *Router) Rotating() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rotating
+}
+
+// Registering reports whether a background spare registration is in flight
+// (spec §14: surfaced by the TUI while the pool refills).
+func (r *Router) Registering() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registering
+}
+
+// LastSpareError returns the most recent background spare-registration
+// failure ("" = none since the last success), surfaced by the control API.
+func (r *Router) LastSpareError() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastSpareError
 }
 
 // finishRotation is the shared body of the rotate()/RotateNow deferred
