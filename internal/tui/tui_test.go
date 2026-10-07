@@ -315,6 +315,7 @@ func TestImportBoundaries(t *testing.T) {
 		"zen-router/internal/gateway": true,
 		"zen-router/internal/proxy":   true,
 		"zen-router/internal/systemd": true,
+		"zen-router/internal/config":  true, // daemon-side config paths (XDG dirs, unit files)
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {

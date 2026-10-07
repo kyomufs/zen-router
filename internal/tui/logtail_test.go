@@ -151,7 +151,10 @@ func TestWindowSizeSetsWidgetSizes(t *testing.T) {
 	if h := mm.logVP.Height(); h < 3 {
 		t.Errorf("log viewport height = %d, want >= 3", h)
 	}
-	if h := mm.rotationTable.Height(); h < 3 {
-		t.Errorf("rotation table height = %d, want >= 3", h)
+	// table.Height() is the viewport height (SetHeight minus the header):
+	// at 30 rows the rotation table gets header + one visible row —
+	// header-only is allowed only under tighter pressure (F1 budget).
+	if h := mm.rotationTable.Height(); h < 1 {
+		t.Errorf("rotation table viewport height = %d, want >= 1", h)
 	}
 }

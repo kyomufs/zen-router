@@ -93,7 +93,13 @@ func dashboardJSON(t *testing.T) string {
 func dashboardModel(t *testing.T) Model {
 	t.Helper()
 	st := statusFromJSON(t, dashboardJSON(t))
-	m := New(newFake(fakeResult{status: st}))
+	// A log tail is part of the dashboard (spec §7): the fixture feeds one
+	// so every render exercises the viewport budget path, not the notice.
+	m := New(newFake(fakeResult{status: st}), WithLogTail(&fakeLogSource{lines: []string{
+		"daemon starting",
+		"control api listening on 127.0.0.1:8787",
+		"tail line 3",
+	}}))
 	msg := runCmd(t, m.Init())
 	nm, _ := update(t, m, msg)
 	return nm
@@ -254,6 +260,43 @@ func TestViewWindowSizeAdaptsLayout(t *testing.T) {
 	for _, line := range strings.Split(content, "\n") {
 		if strings.Contains(line, "rotation-") && len(line) > 60 {
 			t.Errorf("rotation line width %d > window width 60: %q", len(line), line)
+		}
+	}
+}
+
+// --- fix round 1: terminal fit (F1) -----------------------------------------
+
+// TestViewFitsTerminalSize: bubbletea v2 altscreen clips the BOTTOM of the
+// frame, so the whole dashboard — including the brief-mandated help line —
+// must fit the terminal height at common sizes.
+func TestViewFitsTerminalSize(t *testing.T) {
+	cases := []struct{ w, h int }{
+		{80, 24},
+		{60, 30},
+	}
+	for _, tc := range cases {
+		m := dashboardModel(t)
+		nm, _ := update(t, m, tea.WindowSizeMsg{Width: tc.w, Height: tc.h})
+		content := nm.View().Content
+		lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+		if len(lines) > tc.h {
+			t.Errorf("%dx%d: view renders %d lines, want <= %d:\n%s",
+				tc.w, tc.h, len(lines), tc.h, content)
+		}
+		if !strings.Contains(content, "quit") {
+			t.Errorf("%dx%d: help line missing from content:\n%s", tc.w, tc.h, content)
+		}
+	}
+}
+
+// TestViewDegenerateSizesNoPanic: 0x0 / 1x1 window messages must not crash
+// (fit is only claimed for typical sizes; degenerate ones just render).
+func TestViewDegenerateSizesNoPanic(t *testing.T) {
+	m := dashboardModel(t)
+	for _, tc := range []struct{ w, h int }{{0, 0}, {1, 1}} {
+		nm, _ := update(t, m, tea.WindowSizeMsg{Width: tc.w, Height: tc.h})
+		if content := nm.View().Content; content == "" {
+			t.Errorf("%dx%d: empty content", tc.w, tc.h)
 		}
 	}
 }
