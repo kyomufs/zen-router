@@ -164,6 +164,60 @@ func TestPollChainDaemonUpThenDown(t *testing.T) {
 	}
 }
 
+// TestDownToUpRecovery: after a down poll, the next successful statusMsg
+// must clear the error — the start offer disappears and `daemon: up`
+// returns (review F1). Regression pin for the statusMsg arm of Update; the
+// pre-fix code already behaved this way, so no RED was possible — the test
+// is mutation-verified instead (breaking err-clearing makes it fail; see
+// the fix report).
+func TestDownToUpRecovery(t *testing.T) {
+	src := newFake(
+		fakeResult{status: upStatus()},
+		fakeResult{err: errDaemonDown},
+		fakeResult{status: upStatus()},
+	)
+	m := New(src)
+
+	// Cycle 1: Init fetch → up.
+	msg := runCmd(t, m.Init())
+	m, _ = update(t, m, msg)
+	if !strings.Contains(m.View().Content, "daemon: up") {
+		t.Fatalf("cycle 1 must be up, got:\n%s", m.View().Content)
+	}
+
+	// Cycle 2: tick → fetch → down (start offer appears).
+	m, fetch := update(t, m, pollMsg(time.Now()))
+	if fetch == nil {
+		t.Fatal("pollMsg must trigger a status fetch command")
+	}
+	m, _ = update(t, m, runCmd(t, fetch))
+	down := m.View().Content
+	if !strings.Contains(down, "daemon: down") || !strings.Contains(down, "XDG state") {
+		t.Fatalf("cycle 2 must show the down state and start offer, got:\n%s", down)
+	}
+
+	// Cycle 3: tick → fetch → recovered.
+	m, fetch = update(t, m, pollMsg(time.Now()))
+	if fetch == nil {
+		t.Fatal("pollMsg must trigger a status fetch command after recovery")
+	}
+	m, nextTick := update(t, m, runCmd(t, fetch))
+	if nextTick == nil {
+		t.Fatal("a recovered poll must schedule the next 1s tick")
+	}
+	if src.calls != 3 {
+		t.Fatalf("StatusSource calls = %d, want 3", src.calls)
+	}
+
+	content := m.View().Content
+	if !strings.Contains(content, "daemon: up") {
+		t.Errorf("recovered view must show `daemon: up`, got:\n%s", content)
+	}
+	if strings.Contains(content, "XDG state") {
+		t.Errorf("start offer must disappear after recovery, got:\n%s", content)
+	}
+}
+
 // --- view --------------------------------------------------------------------
 
 // TestViewHeader: View().Content always carries the dashboard header, and

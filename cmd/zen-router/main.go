@@ -87,7 +87,7 @@ Usage:
   zen-router install-systemd [--remove]  write $XDG_CONFIG_HOME/systemd/user/zen-router.service for this
                                          executable's foreground "up", then daemon-reload + enable --now;
                                          --remove disables (--now) and deletes the unit file
-  zen-router tui    [--listen ADDR]     interactive control dashboard (1s poll of the control API)
+  zen-router tui     [--listen ADDR]     interactive control dashboard (1s poll of the control API)
 
 OpenAI surface (on the same listener):
   GET /v1/models, POST /v1/chat/completions — OpenAI-compatible endpoints

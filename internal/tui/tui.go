@@ -141,6 +141,8 @@ func (m Model) View() tea.View {
 			st.Listen, st.Pid, st.UptimeSeconds)
 	}
 
+	// TODO(Task 5): render the dashboard sections — egress + latency,
+	// quota table, identity pool, log tail (spec §7 screen).
 	b.WriteString("\nsections (Task 5): egress + latency, quota, identity pool, log tail\n")
 	b.WriteString("keys: q quit | r rotate, d/w egress, s daemon — stubs until Task 6\n")
 
