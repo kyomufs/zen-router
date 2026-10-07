@@ -48,7 +48,11 @@ superseded by the OpenAI-shim decision).
   count is reported, not hard-failed, at ≤275).
 - **No in-process retry loop** — host retry policy owns retries
   (`dsh-llm-retry/lib/index.js:160` gates on `policy.retryableCodes`).
-- Map errors by **status + `error.type`**, never by message text (§9d).
+- Map errors by **status + `error.type`**, never by message text (§9d). The daemon's
+  client envelope is the OpenAI shape `{"error":{"message","type","code"},"metadata"?}`
+  (T14 fix `6d50b7e`; `error.type` sits at the same JSON path the plugin parser reads,
+  `code` mirrors `type`, `metadata` only on 429, never `null` after `ade6f88`) —
+  contract tests in Task 1 must fixture this exact shape.
 - Preserve the 401 trap: `401 + ModelError` (upstream unknown-model) → non-retryable
   `PROVIDER_ERROR`, NOT terminal `INVALID_CREDENTIAL` (parity: installed
   `lib/index.js:737`). Terminal `INVALID_CREDENTIAL` is only `401 + AuthError`.
