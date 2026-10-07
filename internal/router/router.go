@@ -59,13 +59,16 @@ type Router struct {
 	// reports in the window return false without churning the tunnel.
 	cooldownSwapped bool
 
-	// OnRotated is an optional callback fired after each SUCCESSFUL
-	// rotation — at every site that records one (rotate, RotateNow, the
-	// stage-2 identity switch, the stage-3 direct fallback). Nil (the
-	// default) fires nothing. It is set once at wiring time (before the
-	// HTTP server starts) and runs on the rotating/request goroutine
-	// outside router locks: it must not block (plan Task 2: the egress-IP
-	// refresh trigger).
+	// OnRotated is an optional callback fired whenever the ACTIVE EGRESS
+	// actually changes — rotation branches (direct→warp via setEgress, the
+	// warp fresh-identity mint), the ensureWarp-failure direct fallback
+	// (even though the rotation failed: no success-only history row, but the
+	// transport changed), the stage-2 identity switch (setEgress, plus a
+	// direct fire for warp→warp where the egress name is unchanged), and the
+	// manual /_zenctl/use mode switch (setEgress). Nil (the default) fires
+	// nothing. It is set once at wiring time (before the HTTP server starts)
+	// and runs on the rotating/request goroutine outside router locks: it
+	// must not block (plan Task 2: the egress-IP refresh trigger).
 	OnRotated func()
 }
 
@@ -362,9 +365,12 @@ func (r *Router) finishRotation() {
 	r.mu.Unlock()
 }
 
-// fireRotated invokes the optional OnRotated callback after a SUCCESSFUL
-// rotation (every site that records one). Nil-safe and non-blocking by
-// contract of OnRotated — used as the egress-IP refresh trigger (Task 2).
+// fireRotated invokes the optional OnRotated callback after an EFFECTIVE
+// change of the active egress — a value change through setEgress (rotation,
+// its direct fallback, the manual Use switch) or a fresh-identity rotation
+// whose egress name is unchanged. Nil-safe and non-blocking by contract of
+// OnRotated — used as the egress-IP refresh trigger (Task 2). RecordRotation
+// stays success-only: the history semantics are unchanged by this hook.
 func (r *Router) fireRotated() {
 	if r.OnRotated != nil {
 		r.OnRotated()
@@ -395,8 +401,9 @@ func (r *Router) rotate(reason string) {
 		r.log.Printf("rotation failed (%s): %v", reason, err)
 		return
 	}
+	// Observation hook already fired inside applyRotation (setEgress on the
+	// direct branch, the fresh-identity fire on the warp branch).
 	r.store.RecordRotation(string(from), string(to), reason)
-	r.fireRotated()
 	r.log.Printf("rotated %s -> %s (%s)", from, to, reason)
 }
 
@@ -419,8 +426,8 @@ func (r *Router) RotateNow(reason string) (proxy.Egress, error) {
 		r.log.Printf("manual rotation failed (%s): %v", reason, err)
 		return from, err
 	}
+	// Observation hook already fired inside applyRotation (see rotate).
 	r.store.RecordRotation(string(from), string(to), reason)
-	r.fireRotated()
 	r.log.Printf("rotated %s -> %s (%s)", from, to, reason)
 	return to, nil
 }
@@ -441,16 +448,28 @@ func (r *Router) applyRotation(from proxy.Egress, reason string) (proxy.Egress, 
 
 	// Already on warp and it is spent: mint a fresh WARP identity for a new IP.
 	if err := r.ensureWarp(ctx, true); err != nil {
-		// Fall back to direct so requests keep flowing.
+		// Fall back to direct so requests keep flowing. The active egress
+		// changes here even though the rotation FAILED (no success-only
+		// RecordRotation row) — the observed IP is stale either way, and
+		// setEgress fires the hook.
 		r.setEgress(proxy.EgressDirect)
 		return proxy.EgressDirect, err
 	}
+	// Fresh identity registered: the egress NAME is unchanged (no setEgress
+	// call, no success-only history row needed beyond the caller's), but the
+	// public IP is new → fire the observation hook directly.
+	r.fireRotated()
 	return proxy.EgressWarp, nil
 }
 
-// setEgress swaps the active path and persists it.
+// setEgress swaps the active path and persists it — the SINGLE point where
+// the active egress changes (rotation, its direct fallback, and the manual
+// /_zenctl/use mode switch all route through here), so an egress change
+// always fires the OnRotated observation hook exactly once (changed-value
+// only: no fire when the mode is re-asserted unchanged).
 func (r *Router) setEgress(e proxy.Egress) {
 	r.mu.Lock()
+	changed := r.egress != e
 	r.egress = e
 	if e == proxy.EgressWarp && r.warpRT != nil {
 		// keep existing warpRT
@@ -459,6 +478,9 @@ func (r *Router) setEgress(e proxy.Egress) {
 	}
 	r.mu.Unlock()
 	r.store.SetCurrent(string(e))
+	if changed {
+		r.fireRotated() // active transport changed → observed IP is stale
+	}
 }
 
 // Use forces the active egress (direct or warp), bringing WARP up if needed.

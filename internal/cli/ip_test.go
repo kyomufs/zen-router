@@ -390,3 +390,150 @@ func TestHTTPEchoerProduction(t *testing.T) {
 		}
 	})
 }
+
+// --- Fix round 1 ------------------------------------------------------------
+//
+// Findings F1–F5 of review round 1: staleness generation, Use/fallback hook
+// coverage, interval-gate isolation, value trimming. All hermetic.
+
+// TestEgressIPRotationDuringInFlight (F1): a rotation landing WHILE an echo
+// attempt is in flight must force a follow-up attempt — the in-flight result
+// carries the pre-rotation IP, so committing it may not clear staleness
+// (staleness generation counter: maybeStart snapshots gen, run clears the
+// stale flag only when gen is unchanged). Without the generation the test
+// times out waiting for the post-rotation value.
+func TestEgressIPRotationDuringInFlight(t *testing.T) {
+	fake := &fakeEchoer{
+		ip:      "203.0.113.1",
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	now, advance := newFakeClock(time.Now())
+	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/_zenctl/status", nil))
+	}()
+	<-fake.started // attempt 1 in flight, blocked, will succeed with the PRE-rotation IP
+
+	// Rotation lands mid-attempt: marks stale + bumps the generation, but
+	// cannot start a second echo (single-in-flight gate).
+	driveIdentityRotation(t, rot)
+
+	close(fake.release)
+	<-done
+	waitFor(t, "the pre-rotation attempt to land", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.1"
+	})
+
+	// The in-flight attempt must NOT have cleared staleness (its gen is
+	// older than the rotation's) → once the window elapses a SECOND attempt
+	// fires with the post-rotation IP.
+	fake.set("203.0.113.2", nil)
+	advance(egressIPMinInterval + time.Second)
+	getStatus(t, h)
+	waitFor(t, "a follow-up attempt after the rotation", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.2"
+	})
+	if got := fake.count(); got < 2 {
+		t.Errorf("echo calls = %d, want >= 2 (the rotation during flight forced a second attempt)", got)
+	}
+}
+
+// TestEgressIPUseTriggersRefresh (F2): the manual /_zenctl/use mode switch
+// (Router.Use) changes the ACTIVE egress without any rotation — it must mark
+// the observation stale and re-echo, or status.egress_ip would keep showing
+// the previous path's IP forever. Hermetic: onto warp via the fake
+// IdentitySwitch, then Use(direct) needs no Cloudflare call.
+func TestEgressIPUseTriggersRefresh(t *testing.T) {
+	fake := newFakeEchoer("203.0.113.1")
+	now, advance := newFakeClock(time.Now())
+	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+
+	waitFor(t, "the initial echo", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.1"
+	})
+
+	// Onto warp (rotation refresh — already covered), fresh value observed.
+	advance(egressIPMinInterval + time.Second)
+	fake.set("203.0.113.2", nil)
+	driveIdentityRotation(t, rot)
+	waitFor(t, "the post-rotation echo", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.2"
+	})
+
+	// Manual switch back to direct: NOT a rotation, but the active egress
+	// changed → the observed IP must refresh anyway.
+	advance(egressIPMinInterval + time.Second)
+	fake.set("203.0.113.3", nil)
+	if err := rot.Use(context.Background(), proxy.EgressDirect); err != nil {
+		t.Fatalf("Use(direct): %v", err)
+	}
+	if rot.Current() != proxy.EgressDirect {
+		t.Fatalf("Current() = %s after Use(direct), want direct", rot.Current())
+	}
+	waitFor(t, "status.egress_ip to refresh after the manual Use switch", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.3"
+	})
+	if got := fake.count(); got != 3 {
+		t.Errorf("echo calls = %d, want 3 (initial + rotation + Use)", got)
+	}
+}
+
+// TestEgressIPBurstIntervalGateWithFailingEcho (F4): unlike the success
+// burst test (where obsStale=false already bounds the reads), every attempt
+// here FAILS so obsStale stays true throughout — the 100-read burst is
+// bounded ONLY by the lastTry interval gate. Expect exactly 2 calls at the
+// burst, and a third once the window elapses (proving the gate, not
+// staleness, was the bound).
+func TestEgressIPBurstIntervalGateWithFailingEcho(t *testing.T) {
+	fake := &fakeEchoer{err: errors.New("echo endpoint down")}
+	now, advance := newFakeClock(time.Now())
+	_, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+
+	waitFor(t, "the first (failing) attempt", func() bool {
+		getStatus(t, h)
+		return fake.count() >= 1
+	})
+	advance(egressIPMinInterval + time.Second)
+	getStatus(t, h)
+	waitFor(t, "the second (failing) attempt after the window", func() bool {
+		getStatus(t, h)
+		return fake.count() >= 2
+	})
+
+	// obsStale is still true (both attempts failed) — only the interval
+	// gate may bound this burst.
+	for i := 0; i < 100; i++ {
+		getStatus(t, h)
+	}
+	if got := fake.count(); got != 2 {
+		t.Errorf("echo calls after a 100-read burst with a failing echoer = %d, want 2 — the interval gate must be load-bearing", got)
+	}
+
+	advance(egressIPMinInterval + time.Second)
+	getStatus(t, h)
+	waitFor(t, "a third attempt once the window elapses", func() bool {
+		getStatus(t, h)
+		return fake.count() >= 3
+	})
+}
+
+// TestEgressIPTrimsCommittedValue (F5): run() validates TrimSpace(ip) but
+// must commit the TRIMMED value — status.egress_ip is a bare IP.
+func TestEgressIPTrimsCommittedValue(t *testing.T) {
+	fake := newFakeEchoer("  203.0.113.55 \n")
+	_, _, h := newEchoControl(t, fake, egressIPMinInterval, time.Now)
+
+	waitFor(t, "status.egress_ip to show the trimmed IP", func() bool {
+		_, st := getStatus(t, h)
+		return st.EgressIP == "203.0.113.55"
+	})
+}

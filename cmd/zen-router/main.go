@@ -140,11 +140,13 @@ func cmdUp(args []string) error {
 	}
 
 	// Egress IP observation (plan Task 2): the production echo re-reads the
-	// ACTIVE transport on every attempt (so it follows rotation) and is
-	// built ONLY when the user opted in via config.EgressIPEcho — the §12
+	// ACTIVE transport on every attempt (so it follows the active path) and
+	// is built ONLY when the user opted in via config.EgressIPEcho — the §12
 	// gate, default false: no live echo call exists without that explicit
-	// opt-in. A rotation marks the observation stale (debounced by
-	// egressIPMinInterval), status reads refresh it lazily.
+	// opt-in. Every effective active-egress change (rotation, its direct
+	// fallback, manual mode switch) marks the observation stale via
+	// OnRotated (debounced by egressIPMinInterval), status reads refresh it
+	// lazily.
 	echoer := cli.NewEgressIPEchoer(cfg.EgressIPEcho, func() http.RoundTripper {
 		_, rt := r.Egress()
 		return rt

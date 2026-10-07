@@ -23,10 +23,10 @@ import (
 
 const (
 	// egressIPMinInterval is the debounce: the minimum time between two
-	// echo attempts, no matter which trigger fires (status read or
-	// rotation) and no matter whether the previous attempt succeeded or
-	// failed. 30s against a 1s TUI poll bounds the echo rate to ≤ 2
-	// requests/minute with zero per-poll fan-out.
+	// echo attempts, no matter which trigger fires (status read or an
+	// active-egress change) and no matter whether the previous attempt
+	// succeeded or failed. 30s against a 1s TUI poll bounds the echo rate
+	// to ≤ 2 requests/minute with zero per-poll fan-out.
 	egressIPMinInterval = 30 * time.Second
 	// egressIPEchoTimeout bounds one echo attempt; the spawned refresh
 	// never outlives it even if the endpoint hangs.
@@ -50,7 +50,7 @@ type IPEchoer interface {
 // nil echoer makes every tracker refresh a silent no-op, so no live call can
 // exist without the user's opt-in. transport must yield the ACTIVE egress
 // transport (router.Egress) and is re-read on every call so observations
-// follow rotation.
+// follow the active path (rotation, fallback, manual switch).
 func NewEgressIPEchoer(enabled bool, transport func() http.RoundTripper) IPEchoer {
 	if !enabled {
 		return nil
@@ -106,9 +106,16 @@ func (e *httpEchoer) EgressIP(ctx context.Context) (string, error) {
 
 // EgressIPTracker holds the last observed egress IP and schedules debounced
 // refreshes. It starts STALE (never observed) and becomes stale again after
-// every successful rotation (Router.OnRotated → Refresh) or failed attempt —
-// while a clean value only changes on rotation, because in this daemon the
-// egress IP only ever changes via rotation.
+// every effective change of the active egress — rotation (identity switch,
+// direct fallback, manual mode switch via Router.Use — Router.OnRotated →
+// Refresh) — or a failed attempt: in this daemon the egress IP follows the
+// active transport, so a clean value only changes when that transport does.
+//
+// Refresh also bumps a staleness GENERATION counter: maybeStart snapshots it
+// into the spawned attempt, and run clears the stale flag only when the
+// generation is unchanged — a rotation landing WHILE an attempt is in flight
+// cannot be lost to the in-flight result (it carries the pre-rotation IP);
+// staleness survives the commit and forces a follow-up attempt.
 //
 // Debounce rule (both triggers funnel into maybeStart):
 //   - at most ONE echo in flight (inFlight gate);
@@ -121,10 +128,11 @@ type EgressIPTracker struct {
 	now      func() time.Time // clock seam for tests
 
 	mu       sync.Mutex
-	ip       string    // last SUCCESSFUL observation ("" = unknown)
+	ip       string    // last SUCCESSFUL observation, trimmed ("" = unknown)
 	lastTry  time.Time // start of the last attempt (zero = never)
 	inFlight bool      // at most one spawned attempt
 	obsStale bool      // value needs a refresh (starts true; set by Refresh)
+	gen      uint64    // staleness generation; bumped by every Refresh
 }
 
 // NewEgressIPTracker builds a tracker with the production debounce
@@ -157,15 +165,18 @@ func (t *EgressIPTracker) IP() string {
 	return t.ip
 }
 
-// Refresh is the rotation trigger (Router.OnRotated): it marks the value
-// stale and starts an echo immediately when the debounce window allows —
-// otherwise the next status read picks it up once the window elapses.
+// Refresh is the egress-changed trigger (Router.OnRotated): it marks the
+// value stale, bumps the staleness generation (so any attempt already in
+// flight cannot clear the flag with a pre-change result), and starts an echo
+// immediately when the debounce window allows — otherwise the next status
+// read picks it up once the window elapses.
 func (t *EgressIPTracker) Refresh() {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	t.obsStale = true
+	t.gen++
 	t.mu.Unlock()
 	t.maybeStart()
 }
@@ -186,14 +197,19 @@ func (t *EgressIPTracker) maybeStart() {
 	}
 	t.inFlight = true
 	t.lastTry = t.now()
+	gen := t.gen // snapshot: staleness events landing mid-attempt bump it
 	t.mu.Unlock()
-	go t.run()
+	go t.run(gen)
 }
 
-// run performs one attempt: only a successful, non-empty observation commits
-// the new value; failures keep the previous one (and the still-stale flag
-// schedules the next attempt after the debounce window).
-func (t *EgressIPTracker) run() {
+// run performs one attempt on behalf of the staleness generation gen: only a
+// successful, non-empty observation commits the (trimmed) new value; failures
+// keep the previous one (and the still-stale flag schedules the next attempt
+// after the debounce window). The stale flag is cleared ONLY when gen is
+// still current — if an egress change landed while this attempt was running,
+// its result predates that change, so staleness survives the commit and the
+// next allowed window runs a follow-up attempt (F1).
+func (t *EgressIPTracker) run(gen uint64) {
 	defer func() {
 		t.mu.Lock()
 		t.inFlight = false
@@ -203,11 +219,14 @@ func (t *EgressIPTracker) run() {
 	ctx, cancel := context.WithTimeout(context.Background(), egressIPEchoTimeout)
 	defer cancel()
 	ip, err := t.echoer.EgressIP(ctx)
-	if err != nil || strings.TrimSpace(ip) == "" {
+	ip = strings.TrimSpace(ip)
+	if err != nil || ip == "" {
 		return // keep the last value; stale stays set for a later retry
 	}
 	t.mu.Lock()
 	t.ip = ip
-	t.obsStale = false
+	if t.gen == gen {
+		t.obsStale = false
+	}
 	t.mu.Unlock()
 }
