@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,6 +59,14 @@ func (c *ControlClient) do(ctx context.Context, method, route string, body io.Re
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
+		// A request killed by OUR context is a wedged (or overloaded)
+		// daemon, not a dead one: mapping it to ErrNotRunning would render
+		// "daemon is not running (start it with `zen-router up`)" against a
+		// daemon that is up — exactly what the TUI's 60s action timeout can
+		// hit below the client's own 90s timeout (review F2).
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, fmt.Errorf("control %s %s: %w", method, route, err)
+		}
 		return nil, ErrNotRunning
 	}
 	defer resp.Body.Close()

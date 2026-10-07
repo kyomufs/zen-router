@@ -582,18 +582,29 @@ func cmdTui(args []string) error {
 	if err != nil {
 		return err
 	}
-	var opts []tui.Option
-	if paths, perr := config.DefaultPaths(); perr == nil {
-		opts = append(opts, tui.WithLogTail(tui.NewFileLogTail(paths.LogFile)))
-	}
-	opts = append(opts, tui.WithSpawner(func(context.Context) error {
+	opts := tuiOptions(func(context.Context) error {
 		return detachUp(listen)
-	}))
+	})
 	p := tea.NewProgram(tui.New(cli.NewControlClient(listen), opts...))
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("tui: %w", err)
 	}
 	return nil
+}
+
+// tuiOptions assembles the TUI seams for cmdTui: the daemon file-log tail
+// (when XDG resolves) and the daemon-start Spawner (the real `up --detach`
+// path in cmdTui, a recorder in tests). The spawner is a parameter so
+// TestTuiSpawnerWiringIsLive proves the WithSpawner wiring is live by
+// running the `s`-on-down command without ever launching a process
+// (review F1).
+func tuiOptions(spawn tui.Spawner) []tui.Option {
+	var opts []tui.Option
+	if paths, perr := config.DefaultPaths(); perr == nil {
+		opts = append(opts, tui.WithLogTail(tui.NewFileLogTail(paths.LogFile)))
+	}
+	opts = append(opts, tui.WithSpawner(spawn))
+	return opts
 }
 
 // cmdWGConfig is the privileged helper: it runs as root (via sudo) and applies

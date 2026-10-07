@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
@@ -109,10 +110,42 @@ func (m Model) statusLines() []string {
 		lines = append(lines, m.wrap(fmt.Sprintf("%s %s in flight",
 			m.spinner.View(), m.actionLabel)))
 	case m.actionErr != nil:
-		lines = append(lines, m.wrap(fmt.Sprintf("%s failed: %v",
-			m.actionLabel, m.actionErr)))
+		lines = append(lines, m.wrap(fmt.Sprintf("%s failed: %s",
+			m.actionLabel, sanitizeActionErr(m.actionErr))))
 	}
 	return lines
+}
+
+// actionErrMaxRunes bounds the rendered action-error content: control-API
+// errors echo response bodies verbatim (409/502 replies, HTML error
+// pages), so the line is truncated like LastSpareError's 300-byte cap
+// (review F5).
+const actionErrMaxRunes = 200
+
+// sanitizeActionErr renders an action error safe for one dashboard line:
+// newlines/tabs flatten to spaces, other control runes (ESC, NUL, ...) are
+// dropped, and oversized text is truncated with a unicode ellipsis. Pure
+// display hygiene — no content inspection (review F5).
+func sanitizeActionErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range err.Error() {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case unicode.IsControl(r):
+			// dropped: escapes and other non-printable runes
+		default:
+			b.WriteRune(r)
+		}
+	}
+	runes := []rune(b.String())
+	if len(runes) > actionErrMaxRunes {
+		return string(runes[:actionErrMaxRunes-1]) + "…"
+	}
+	return string(runes)
 }
 
 // writeSection appends one titled table section. table.View() ends without

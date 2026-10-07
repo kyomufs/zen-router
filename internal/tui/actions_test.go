@@ -259,6 +259,29 @@ func TestActionErrorSurfacesInView(t *testing.T) {
 	if !strings.Contains(m.View().Content, "HTTP 409") {
 		t.Errorf("action error must survive a status poll:\n%s", m.View().Content)
 	}
+
+	// Clear-on-next-action (review F3): pressing `r` again drops the stale
+	// message the moment the new request is armed — not when it completes.
+	af.rotateErr = nil // second rotate succeeds
+	m, cmd2 := actionKey(t, m, "r")
+	if cmd2 == nil {
+		t.Fatal("`r` must return the rotate request command")
+	}
+	content := m.View().Content
+	if strings.Contains(content, "HTTP 409") || strings.Contains(content, "rotate failed") {
+		t.Errorf("stale action error must clear when the next action starts:\n%s", content)
+	}
+	if !strings.Contains(content, "in flight") {
+		t.Errorf("second rotate must be in flight:\n%s", content)
+	}
+
+	// Clear-on-success: a completed action with no error leaves no failure
+	// line at all.
+	m, _ = update(t, m, runActionBatch(t, cmd2))
+	content = m.View().Content
+	if strings.Contains(content, "rotate failed") || strings.Contains(content, "HTTP 409") {
+		t.Errorf("successful action must leave no error line:\n%s", content)
+	}
 }
 
 // --- spinner ----------------------------------------------------------------
@@ -480,5 +503,101 @@ func TestSpawnErrorSurfacesInView(t *testing.T) {
 	}
 	if sp.calls != 1 {
 		t.Errorf("spawn calls = %d, want exactly 1", sp.calls)
+	}
+}
+
+// TestFailedPollRoutesSpawnAfterUp (review F4) — pinning test for how `s`
+// reads poll failures. The statusMsg handler records each fetch result as a
+// whole: a failed poll (e.g. a >2s slow fetch) replaces the last snapshot
+// with (nil, err), so the daemon counts as DOWN and `s` arms the spawn
+// branch — deliberately. The real Spawner path (detachUp) pid-checks
+// readiness ("zen-router already running (pid N) — not starting a
+// duplicate", cmd/zen-router/main.go), so a merely-wedged daemon cannot be
+// double-started, while a genuinely dead daemon stays reachable through
+// `s`. Before the failed poll, an up daemon routes `s` to the stop branch.
+func TestFailedPollRoutesSpawnAfterUp(t *testing.T) {
+	af := newActionFake(
+		fakeResult{status: upStatus()},
+		fakeResult{err: errors.New(`Get "http://127.0.0.1:8787/_zenctl/status": context deadline exceeded`)},
+	)
+	sp := &recordingSpawner{}
+	m := New(af, WithSpawner(sp.spawn))
+	m, _ = update(t, m, runCmd(t, m.Init())) // first poll: up
+
+	// An up daemon: `s` stops it, never spawns.
+	m, cmd := actionKey(t, m, "s")
+	if cmd == nil {
+		t.Fatal("`s` on an up daemon must return the stop command")
+	}
+	m, _ = update(t, m, runActionBatch(t, cmd))
+	if af.stopCalls != 1 || sp.calls != 0 {
+		t.Fatalf("up daemon: stopCalls = %d, spawnCalls = %d, want stop = 1, spawn = 0",
+			af.stopCalls, sp.calls)
+	}
+
+	// A failed poll clears the snapshot and records the error (down view).
+	m, fetch := update(t, m, pollMsg(time.Now()))
+	m, _ = update(t, m, runCmd(t, fetch))
+	if !strings.Contains(m.View().Content, "daemon: down") {
+		t.Fatalf("view must report the daemon down after a failed poll:\n%s", m.View().Content)
+	}
+
+	// Pinned semantics: after the failed poll `s` arms the SPAWN branch —
+	// exactly once; the earlier stop call is not re-fired.
+	m, cmd = actionKey(t, m, "s")
+	if cmd == nil {
+		t.Fatal("`s` after a failed poll must return the spawn command (pinned semantics, review F4)")
+	}
+	if line := inflightLine(t, m); !strings.Contains(line, "start") {
+		t.Errorf("in-flight line %q must carry the spawn label, view:\n%s", line, m.View().Content)
+	}
+	m, _ = update(t, m, runActionBatch(t, cmd))
+	if sp.calls != 1 {
+		t.Errorf("spawn calls = %d, want exactly 1", sp.calls)
+	}
+	if af.stopCalls != 1 {
+		t.Errorf("stop calls = %d, want 1 (the failed poll must not re-fire stop)", af.stopCalls)
+	}
+}
+
+// --- action error sanitization ----------------------------------------------
+
+// TestActionErrorLineSanitizedInView (review F5): control-API failures can
+// echo raw response bodies (Router errors, HTML error pages) into the
+// action error line. The rendered line must drop control runes (ESC/NUL/
+// newlines) and truncate oversized text with an ellipsis — display hygiene
+// only, no content inspection (mirrors LastSpareError's bounded rendering).
+func TestActionErrorLineSanitizedInView(t *testing.T) {
+	af := newActionFake(fakeResult{status: upStatus()})
+	af.rotateErr = errors.New("\x1b[31m" + strings.Repeat("<script>alert(1)</script>", 30) + "\x00DONE\r\n\x1b[0m")
+	m := New(af)
+	m, _ = update(t, m, runCmd(t, m.Init()))
+	m, cmd := actionKey(t, m, "r")
+	if cmd == nil {
+		t.Fatal("`r` must return the rotate request command")
+	}
+	m, _ = update(t, m, runActionBatch(t, cmd))
+
+	var line string
+	for _, l := range strings.Split(m.View().Content, "\n") {
+		if strings.Contains(l, "rotate failed") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("view lacks the action error line:\n%s", m.View().Content)
+	}
+	if strings.Contains(line, "\x1b") || strings.Contains(line, "\x00") {
+		t.Errorf("control runes not stripped from the error line: %q", line)
+	}
+	if strings.Contains(line, "\n") || strings.Contains(line, "\r") {
+		t.Errorf("error line must stay a single line: %q", line)
+	}
+	if n := len([]rune(line)); n > 230 {
+		t.Errorf("error line is %d runes, want label + <=200 content: %q", n, line)
+	}
+	if !strings.Contains(line, "…") {
+		t.Errorf("oversized error must be truncated with an ellipsis: %q", line)
 	}
 }
