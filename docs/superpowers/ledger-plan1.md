@@ -103,3 +103,8 @@ PLAN 1 CLOSED: all 14 ledger entries + APPROVE-PLAN1. Ready for user review of P
 Agent 4553f24e: commits 0c44866 (tests: DM-1 translation edges, DM-2 immutability, DM-3 null-cap, DM-4 clamp tie-break, DM-11 oneShotRot buf.reset pin, DM-12 zero-frame flush, N-3 omitted-stream responses variant) + c1acea6 (comments: DM-9 §4:140 citation, DM-10 Retry-After parity divergence note, N-1 force-proof pointer).
 RED via mutation experiments (temp mutate → real FAIL → restore, worktree clean). Gates green, tree clean.
 Remaining in checklist: DM-5 (Active-remap), DM-6/DM-7 (bare-429, daily-regex corpus decisions), DM-8 (buffer merge n>1), DM-13 (metadata:null), N-2 (package generator) + all отмашка-gated live items + README.
+
+## Phase E safe-minors batch 2 (2026-10-07 03:12 MSK) — DM-5/8/13/N-2 closed
+Agent e6b4cf67: commit ade6f88 (RED→GREEN: DM-5 null-slot Active remap state.go:146-157; DM-8 buffer merge first-wins Index>0 skip buffer.go:226-233; DM-13 metadata null→absent at BOTH gates handler.go:505-508 probeEnvelope + :589-596 writeError; N-2 review-package.sh header-only-with-content, byte-identical output when content present) + 91d15d9 (checklist marks).
+Rulings: probeEnvelope is in handler.go not zen/errors.go (checklist line correction); DM-13 dual-gate kept (either alone suffices — minimal variant available on request).
+Remaining in phase-e.md: DM-6/DM-7 (corpus decisions), Part 2a batch, Part 2b/2c/2d live отмашка items, Part 3 final gate. ALL gated items untouched — отмашка required.
