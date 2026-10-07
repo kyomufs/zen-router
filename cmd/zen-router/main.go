@@ -28,8 +28,10 @@ import (
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
 	"zen-router/internal/systemd"
+	"zen-router/internal/tui"
 	"zen-router/internal/warp"
 
+	tea "charm.land/bubbletea/v2"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -55,6 +57,8 @@ func main() {
 		err = cmdStop(args)
 	case "install-systemd":
 		err = cmdInstallSystemd(args)
+	case "tui":
+		err = cmdTui(args)
 	case "__wgcfg":
 		err = cmdWGConfig(args)
 	case "help", "-h", "--help":
@@ -83,6 +87,7 @@ Usage:
   zen-router install-systemd [--remove]  write $XDG_CONFIG_HOME/systemd/user/zen-router.service for this
                                          executable's foreground "up", then daemon-reload + enable --now;
                                          --remove disables (--now) and deletes the unit file
+  zen-router tui    [--listen ADDR]     interactive control dashboard (1s poll of the control API)
 
 OpenAI surface (on the same listener):
   GET /v1/models, POST /v1/chat/completions — OpenAI-compatible endpoints
@@ -561,6 +566,22 @@ func cmdInstallSystemd(args []string) error {
 		return err
 	}
 	fmt.Printf("installed %s (systemctl --user daemon-reload + enable --now)\n", path)
+	return nil
+}
+
+// cmdTui runs the interactive control dashboard (plan Task 4, spec §7):
+// a Bubble Tea v2 program that polls the control API once per second
+// through the tui.StatusSource seam (*cli.ControlClient here). Per the task
+// decision it runs normally regardless of TTY — no isatty gate.
+func cmdTui(args []string) error {
+	listen, err := parseListen(args)
+	if err != nil {
+		return err
+	}
+	p := tea.NewProgram(tui.New(cli.NewControlClient(listen)))
+	if _, err := p.Run(); err != nil {
+		return fmt.Errorf("tui: %w", err)
+	}
 	return nil
 }
 
