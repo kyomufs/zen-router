@@ -279,3 +279,53 @@ live DSH integration. README (Phase E) already shipped — 45f75b3, 1d851bf.
   4 (+2 for IP field); 6 after 5; 7 after 6; 9 last.
 - `internal/tui` depends only on `internal/cli` + `charm.land/*` — no router/quota
   imports (review focus 2).
+
+## Отмашка checklist (Phase C live steps — documented by Task 9, NEVER executed here)
+
+> **§12 gate:** every item below runs only after the user's explicit "отмашка".
+> Task 9 documents this checklist; executors do not run any of it (no rebuild, no
+> `install-systemd`, no live daemon touch, no config edits). Keep items `- [ ]`
+> until the user completes them. Cross-phase re-runs live in
+> `docs/superpowers/checklists/phase-e.md` and are referenced below by item id —
+> not duplicated.
+
+### Live install steps
+
+- [ ] Rebuild `~/.local/bin/zen-router` (`go install` is forbidden while the
+      live hand-written unit runs — global constraint).
+- [ ] Run `zen-router install-systemd` against the live hand-written unit
+      `~/.config/systemd/user/zen-router.service` — it **overwrites** that unit
+      (spec §8: `ExecStart=<binary> up`, `Restart=on-failure`, keep the NixOS
+      `Environment=PATH=/run/wrappers/bin:…` line).
+- [ ] `systemctl --user daemon-reload && systemctl --user enable --now
+      zen-router` — may restart the running daemon (127.0.0.1:8787).
+- [ ] Flip `config.EgressIPEcho` to `true` (config.json `egressIPEcho`, default
+      `false` per D3) to enable live egress-IP echo.
+
+### Post-отмашка hardening
+
+- [ ] Task 8 deferred F5: run `daemon-reload` after
+      `zen-router install-systemd --remove` (disable/unlink currently skips it).
+- [ ] Task 7 F2: sanitize data-borne ESC/terminal sequences at view
+      write-points (`lastSpareError`, log tail, rotation reason, `deviceId`) —
+      only the action-error line is sanitized today (`sanitizeActionErr`).
+
+### Deferred follow-ups (docs/tests-only, safe anytime)
+
+- [ ] Task 7 F3: fingerprint `state.keys` view-side too — today full-value
+      absence rests on the 10-col key-column truncation; the real boundary is
+      control-layer fingerprinting (Task 1 F5, `internal/cli/control.go`).
+- [ ] Task 5 deferred: rotation table renders header-only at 80×24 (UX
+      priority, title renders); `wrap()` clamps to the window width (raw
+      `m.width` degenerate below 30 cols); document the ~18-row floor (report's
+      "~15 rows" understates 18/19/22 by width).
+- [ ] Task 6 residual: nothing pins `cmdTui` → `tuiOptions` assembly
+      (inline-bypass would evade the wiring test); the `detachUp` closure is
+      compile-checked only.
+
+### Cross-phase re-runs (per `docs/superpowers/checklists/phase-e.md`)
+
+- [ ] Re-run phase-e **DM-6/DM-7** corpus checks (bare-429 / daily-regex).
+- [ ] Re-run phase-e **Part 2b** live smoke (status, `/v1/models`, TUI actions).
+- [ ] Re-run phase-e **Part 2c** — Plan 3 §H cutover fence (thin plugin).
+- [ ] Re-run phase-e **Part 3** final gate at HEAD.
