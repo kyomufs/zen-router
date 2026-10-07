@@ -27,6 +27,7 @@ import (
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
+	"zen-router/internal/systemd"
 	"zen-router/internal/warp"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -52,6 +53,8 @@ func main() {
 		err = cmdUse(args)
 	case "stop":
 		err = cmdStop(args)
+	case "install-systemd":
+		err = cmdInstallSystemd(args)
 	case "__wgcfg":
 		err = cmdWGConfig(args)
 	case "help", "-h", "--help":
@@ -77,6 +80,9 @@ Usage:
   zen-router rotate  [--listen ADDR]     force an egress IP rotation now
   zen-router use     <direct|warp>       force the active egress path
   zen-router stop    [--listen ADDR]     gracefully stop the daemon
+  zen-router install-systemd [--remove]  write $XDG_CONFIG_HOME/systemd/user/zen-router.service for this
+                                         executable's foreground "up", then daemon-reload + enable --now;
+                                         --remove disables (--now) and deletes the unit file
 
 OpenAI surface (on the same listener):
   GET /v1/models, POST /v1/chat/completions — OpenAI-compatible endpoints
@@ -519,6 +525,42 @@ func cmdStop(args []string) error {
 		return err
 	}
 	fmt.Println("stop requested")
+	return nil
+}
+
+// cmdInstallSystemd manages the systemd user unit (plan Task 8, spec §8,
+// §11). By default it renders the unit for THIS executable, writes
+// $XDG_CONFIG_HOME/systemd/user/zen-router.service and runs
+// `systemctl --user daemon-reload` + `enable --now`. With --remove it runs
+// `systemctl --user disable --now` and deletes the file.
+//
+// It never installs or overwrites the binary itself (~/.local/bin stays an
+// отмашка-time user action), and running it against the live environment is
+// gated behind the отмашка (spec §12) — this function must not be invoked
+// outside hermetic tests until then.
+func cmdInstallSystemd(args []string) error {
+	fs := flag.NewFlagSet("zen-router install-systemd", flag.ContinueOnError)
+	remove := fs.Bool("remove", false, "uninstall the user unit (disable --now and delete the file)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *remove {
+		path, err := systemd.Remove()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("removed %s\n", path)
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve own executable: %w", err)
+	}
+	path, err := systemd.Install(exe)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("installed %s (systemctl --user daemon-reload + enable --now)\n", path)
 	return nil
 }
 
