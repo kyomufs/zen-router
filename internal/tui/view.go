@@ -75,30 +75,44 @@ func (m Model) View() tea.View {
 // View and coreLineCount share it so the layout budget can never drift
 // from what is actually rendered.
 func (m Model) statusLines() []string {
+	var lines []string
 	switch {
 	case m.err != nil:
-		return []string{
+		lines = []string{
 			fmt.Sprintf("daemon: down (%v)", m.err),
 			m.wrap(startOffer),
 		}
 	case m.status == nil:
-		return []string{"daemon: waiting for the first status poll..."}
+		lines = []string{"daemon: waiting for the first status poll..."}
+	default:
+		st := m.status
+		lines = []string{
+			fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
+				orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds)),
+			m.wrap(fmt.Sprintf("mode: %s | egress: %s | ip: %s",
+				orDash(st.Mode), orDash(st.Current), orDash(st.EgressIP))),
+			m.wrap(fmt.Sprintf("last rotate: %s | rotating: %t | registering: %t",
+				orDash(st.LastRotate), st.Rotating, st.Registering)),
+		}
+		if st.LastSpareError != "" {
+			lines = append(lines, m.wrap("spare registration error: "+st.LastSpareError))
+		}
+		lines = append(lines,
+			m.wrap(latencyLine(st, "ttfb", false)),
+			m.wrap(latencyLine(st, "stream", true)))
 	}
-	st := m.status
-	lines := []string{
-		fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
-			orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds)),
-		m.wrap(fmt.Sprintf("mode: %s | egress: %s | ip: %s",
-			orDash(st.Mode), orDash(st.Current), orDash(st.EgressIP))),
-		m.wrap(fmt.Sprintf("last rotate: %s | rotating: %t | registering: %t",
-			orDash(st.LastRotate), st.Rotating, st.Registering)),
+	// Task 6: the action line in the status/error area — the spinner while
+	// a request is in flight, otherwise the last request error. A poll
+	// result (statusMsg) never clears it; only the next action start does.
+	switch {
+	case m.pending:
+		lines = append(lines, m.wrap(fmt.Sprintf("%s %s in flight",
+			m.spinner.View(), m.actionLabel)))
+	case m.actionErr != nil:
+		lines = append(lines, m.wrap(fmt.Sprintf("%s failed: %v",
+			m.actionLabel, m.actionErr)))
 	}
-	if st.LastSpareError != "" {
-		lines = append(lines, m.wrap("spare registration error: "+st.LastSpareError))
-	}
-	return append(lines,
-		m.wrap(latencyLine(st, "ttfb", false)),
-		m.wrap(latencyLine(st, "stream", true)))
+	return lines
 }
 
 // writeSection appends one titled table section. table.View() ends without

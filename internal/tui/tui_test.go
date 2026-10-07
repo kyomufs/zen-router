@@ -272,8 +272,10 @@ func TestQuitOnQ(t *testing.T) {
 	}
 }
 
-// TestStubKeysAreNoOps: r/d/w/s are spec §7 keys owned by Tasks 5/6 — in the
-// skeleton they must not quit, not emit commands, and not alter state.
+// TestStubKeysAreNoOps: r/d/w/s are spec §7 action keys (Task 6) that the
+// model only enables when the injected source exposes the ActionSource
+// seam. A plain StatusSource fake (like this one) keeps them no-ops: no
+// command, no quit, no state change.
 func TestStubKeysAreNoOps(t *testing.T) {
 	m := New(newFake(fakeResult{status: upStatus()}))
 	msg := runCmd(t, m.Init())
@@ -283,10 +285,10 @@ func TestStubKeysAreNoOps(t *testing.T) {
 	for _, key := range []string{"r", "d", "w", "s"} {
 		m, cmd := update(t, m, tea.KeyPressMsg{Code: rune(key[0]), Text: key})
 		if cmd != nil {
-			t.Errorf("key %q must be a no-op stub until Task 6, got a command", key)
+			t.Errorf("key %q must stay a no-op without the ActionSource/Spawner seams, got a command", key)
 		}
 		if after := m.View().Content; after != before {
-			t.Errorf("key %q must not change the view yet:\nbefore:\n%s\nafter:\n%s", key, before, after)
+			t.Errorf("key %q must not change the view without the action seams:\nbefore:\n%s\nafter:\n%s", key, before, after)
 		}
 	}
 }
