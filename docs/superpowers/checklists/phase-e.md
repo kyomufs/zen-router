@@ -102,9 +102,11 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ### 2d. README (Phase E per spec §13)
 
-- [ ] Repo README: purpose, install, CLI surface (`up/status/rotate/use/stop/tui/
+- [x] Repo README: purpose, install, CLI surface (`up/status/rotate/use/stop/tui/
       install-systemd`), config/XDG paths, systemd notes, отмашка-safe defaults,
-      architecture diagram (three prefixes, D1 rotation).
+      architecture diagram (three prefixes, D1 rotation). — DONE (45f75b3): docs-only,
+      no live surface, executed before отмашка; `tui`/`install-systemd`/`up --detach`
+      marked "planned (phase C)" until Plan 2 lands — re-check those lines after C.
 
 ---
 
