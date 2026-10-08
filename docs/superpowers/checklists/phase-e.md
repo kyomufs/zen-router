@@ -106,7 +106,16 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
       install-systemd`), config/XDG paths, systemd notes, отмашка-safe defaults,
       architecture diagram (three prefixes, D1 rotation). — DONE (45f75b3): docs-only,
       no live surface, executed before отмашка; `tui`/`install-systemd`/`up --detach`
-      marked "planned (phase C)" until Plan 2 lands — re-check those lines after C.
+      marked "planned (phase C)" until Plan 2 lands — **re-check DONE** (see 2e).
+
+### 2e. README re-check after Plans C/D close (docs-only, from 2d)
+
+- [x] Removed "planned (phase C/D)" markers: status table C/D now **done**
+      (D: rewritten, not installed); CLI block merged with the canonical
+      `usage()` text (`up --detach`, `tui [--listen ADDR]`, `install-systemd [--remove]`);
+      repo layout adds `internal/tui/, systemd/`; installed-plugin paragraph names
+      v0.15.1 (pinned) vs rebuilt thin v0.16.0 awaiting
+      `docs/superpowers/cutover-plan3-thin.md`.
 
 ---
 

@@ -21,12 +21,14 @@ Solves three problems the previous JS-only plugin could not:
 |---|---|---|
 | A | Gateway shim (OpenAI surface, Zen wire port, watchdogs, error classification) | **done** |
 | B | Staged rotation (key pool, identity pool, router stage machine) | **done** |
-| C | TUI dashboard + systemd installer | planned — `docs/superpowers/plans/2026-10-07-zen-router-phase-c-tui.md` |
-| D | Thin DSH plugin (entry point only) | planned — `docs/superpowers/plans/2026-10-07-dsh-opencode-zen-thin.md` |
+| C | TUI dashboard + systemd installer | **done** |
+| D | Thin DSH plugin (entry point only) | **done** — rewritten in `dsh-opencode-zen` repo, not installed yet |
 | E | README, deferred-minor cleanup, live verification | in progress — `docs/superpowers/checklists/phase-e.md` |
 
-The installed `dsh-opencode-zen` plugin (v0.15.1) is **not** touched until the
-user's explicit go-ahead (see `docs/superpowers/specs/…-gateway-design.md` §12).
+The **installed** `dsh-opencode-zen` plugin (v0.15.1, transport-proxy variant) is
+**not** touched until the user's explicit go-ahead (see
+`docs/superpowers/specs/…-gateway-design.md` §12); the rebuilt thin v0.16.0 waits
+for the Phase E cutover (`docs/superpowers/cutover-plan3-thin.md`).
 
 ## Build and test
 
@@ -44,15 +46,16 @@ no `-race` (the target environment has no cgo).
 ## CLI
 
 ```
-zen-router up      [--listen ADDR]     start the daemon (foreground)
+zen-router up      [--listen ADDR] [--detach]  start the daemon (foreground; --detach
+                                               forks it into the background)
 zen-router status  [--listen ADDR]     show egress, mode and quota counters
 zen-router rotate  [--listen ADDR]     force an egress rotation now
 zen-router use     <direct|warp>       force the active egress path
 zen-router stop    [--listen ADDR]     gracefully stop the daemon
+zen-router tui     [--listen ADDR]     interactive control dashboard (1s poll of the control API)
+zen-router install-systemd [--remove]  write the user unit, daemon-reload + enable --now;
+                                       --remove disables and deletes it
 ```
-
-Planned (phase C): `zen-router tui`, `zen-router up --detach`,
-`zen-router install-systemd [--remove]`.
 
 ### Environment
 
@@ -105,6 +108,7 @@ internal/quota/        quota/identity/rotation state (XDG)
 internal/keys/         key pool
 internal/warp/         WARP/WireGuard lifecycle
 internal/zen/          OpenCode Zen wire: models, translation, classification
+internal/tui/, systemd/
 internal/proxy/, cli/, config/
 docs/superpowers/      spec, plans, ledger, checklists
 ```
