@@ -50,6 +50,15 @@ Requires explicit отмашка (spec §12): profile pin move off `a416790`, du
 DSH restart, rebuilt zen-router + live systemd, live smoke + DSH round-trip.
 Phase E open items: DM-6, DM-7, Part 2a/2b/2c, Part 3 final gate — all §12-gated.
 
+## Rulings (extracted from plan3 workspace before archiving)
+
+- Ledger ruling (progress.md:2): serial order T1→T8 — one implementer at a time in `lib/index.js`, even though plan allowed 2-5 parallel.
+- Ruling A: LOC table + thinning log discipline for ≤400 budget (task-3-report §4, 17-row log).
+- Ruling B: body-shape gate — tests assert `stream:true` only, `stream_options` OMITTED; fixes were tests-only add/extend (task-3-report §3).
+- Ruling C: HTTP status rows stay RED until Task 5; `error.response` stashed for Task 5 to map (task-3-report:199).
+
+Workspace `.superpowers/sdd/plan3/` archived to Trash after close (reports/review packages recoverable there).
+
 ## ⚠️ Cannot verify (recorded)
 
 - Full recount of T7 ref-sweep (~289 replacements; ~54-ref sample, 0 errors).
