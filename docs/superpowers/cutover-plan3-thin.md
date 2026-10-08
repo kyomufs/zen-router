@@ -162,17 +162,22 @@ only under the Phase E / отмашка umbrella (phase-e Part 2 `:67-69`).
 - **TUI** (Plan 2).
 - **README of zen-router** (Phase E).
 
-Note on §H: no literal "§H" heading exists in this repo (repo-wide grep returns only the
-references plan `:111`, plan `:313`, phase-e `:9`, phase-e `:92`). Its concrete fence
-list is phase-e Part 2c "Plan 3 cutover fence (§H — thin plugin)" (phase-e `:92-101`)
-plus the plan's Global Constraints (plan `:43-45`). README status cross-check: the base
-README is already closed `[x]` at phase-e `:105-109` (commit `45f75b3`), with a residual
-"re-check `tui`/`install-systemd`/`up --detach` lines after Plan 2" note (`:108-109`).
+Note on §H: no literal "§H" heading exists in this repo — a grep for `§H` over `docs/`
+and `.superpowers/`, excluding this document and the other Task-8 artifacts
+(report/review-package), returns only reference mentions: plan `:111`, plan `:313`,
+phase-e `:9`, phase-e `:92`,
+`docs/superpowers/plans/2026-10-07-zen-router-phase-c-tui.md:337`, and brief `:13`.
+Its concrete fence list is phase-e Part 2c "Plan 3 cutover fence (§H — thin plugin)"
+(phase-e `:92-101`) plus the plan's Global Constraints (plan `:43-45`). README status
+cross-check: the base README is already closed `[x]` at phase-e `:105-109`
+(commit `45f75b3`), with a residual "re-check `tui`/`install-systemd`/`up --detach`
+lines after Plan 2" note (`:108-109`).
 
 ## Rollback
 
-**No automated rollback documented** — a repo-wide grep for `rollback` across `docs/` and
-`.superpowers/` returns zero hits at write time. If the cutover fails, **restore
+**No automated rollback documented** — a grep for `rollback` across `docs/` and
+`.superpowers/` returns zero hits outside this document and the other Task-8 artifacts
+(report/review-package) at write time, and zero hits in the plugin repo. If the cutover fails, **restore
 `profiles/web/package.json` pin to `a416790` manually**: set the `dsh-opencode-zen` entry
 in `~/.dsh/profiles/web/package.json` back to
 `"github:kyomufs/dsh-opencode-zen#a416790a1487717bd4532ab9905788013e8fbaea"`, then re-run
