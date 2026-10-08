@@ -1,9 +1,17 @@
 package tui
 
-// Dashboard section rendering (plan Task 5, spec §7 screen). Every helper
-// here is pure: it formats model state into strings. No I/O, no clock
-// reads — time values arrive pre-stamped in m.now (set by Update when a
-// status result lands), so repeated View() calls are byte-identical.
+// Dashboard rendering (plan Task 5 + the approved panel-grid redesign):
+// the screen is a bordered panel grid — 2x2 at >=100 cols, stacked quotas
+// at 80-99, single column below 80 — with a full-width log panel below it
+// and a fixed footer (keys/help line, then the transient action line as
+// the very last line). Panel titles keep the exact literals the hardening
+// matrix asserts; the down daemon has no grid at all (its status block is
+// a full-width panel instead).
+//
+// Every helper here is pure: it formats model state into strings. No I/O,
+// no clock reads — time values arrive pre-stamped in m.now (set by Update
+// when a status result lands), and every widget height/width is decided in
+// layout() (also Update), so repeated View() calls are byte-identical.
 
 import (
 	"fmt"
@@ -26,54 +34,357 @@ import (
 // view renders that tail).
 const rotationHistory = 50
 
-// View assembles the dashboard screen. Pure render — it reads model state
-// only (file I/O for the log tail happens in fetch's command, see tui.go).
-// Line budget: layout() fits the frame to the terminal height (coreLineCount
-// measures every non-widget line here), so the help line stays on-screen —
-// the altscreen clips the bottom (TestViewFitsTerminalSize).
-func (m Model) View() tea.View {
-	var b strings.Builder
+// Breakpoints for the panel grid (panelgrid_test.go).
+const (
+	midBreakpoint  = 80  // below: single column; at/above: quotas stack, id/rot pair
+	wideBreakpoint = 100 // at/above: full 2x2
+)
 
-	b.WriteString(titleStyle.Render(headerTitle))
-	b.WriteByte('\n')
-	b.WriteString(headerPoll)
-	b.WriteByte('\n')
+// noIdentities explains an empty pool inside its panel (one budgeted line).
+const noIdentities = "no identities"
 
-	for _, line := range m.statusLines() {
-		b.WriteString(line)
-		b.WriteByte('\n')
+// Focusable panels in the tab order (tui.go tab / shift+tab): the focused
+// panel's border/title is highlighted with the accent (focus_help_confirm_test).
+const (
+	focusEgress = iota
+	focusKey
+	focusIdentity
+	focusRotation
+	focusLog
+)
+
+// focusablePanels is the cycle length tab/shift+tab walk.
+const focusablePanels = focusLog + 1
+
+// confirmPrompt is the first-press `s` line on an up daemon: the stop
+// fires on the second press, esc cancels (focus_help_confirm_test).
+const confirmPrompt = "stop the daemon? press s again to confirm, esc cancels"
+
+// panelStyle returns the border/title styles for focusable panel idx: the
+// focused panel gets the accent focus ring (theme.accent), every other
+// panel keeps its dim border. Titles stay bold accent either way.
+func (m Model) panelStyle(idx int) (border, title lipgloss.Style) {
+	title = m.th.panelTitle
+	if m.focus == idx {
+		return lipgloss.NewStyle().Foreground(m.th.accent), title
 	}
+	return m.th.dimText, title
+}
 
-	if m.err == nil && m.status != nil {
-		st := m.status
-		writeSection(&b, "quota (per egress)", m.egressTable.View())
-		writeSection(&b, "quota (per key)", m.keyTable.View())
-		writeSection(&b, fmt.Sprintf("identity pool (%d, active %d)",
-			len(st.State.Identities), st.State.Active), m.identityTable.View())
-		writeSection(&b, "rotation history (last 50)", m.rotationTable.View())
-	}
+// layoutMode is the panel-grid shape chosen from the measured width.
+type layoutMode int
 
-	b.WriteString(sectionStyle.Render("log tail"))
-	b.WriteByte('\n')
+const (
+	modeSingle layoutMode = iota // <80 cols (and the unmeasured Phase A frame)
+	modeMid                      // 80-99: quotas stacked, identity/rotation paired
+	modeWide                     // >=100: full 2x2
+)
+
+func modeOf(width int) layoutMode {
 	switch {
-	case m.logErr != nil:
-		fmt.Fprintf(&b, "log tail error: %v\n", m.logErr)
-	case len(m.logLines) == 0:
-		b.WriteString("no log output yet\n")
+	case width >= wideBreakpoint:
+		return modeWide
+	case width >= midBreakpoint:
+		return modeMid
 	default:
-		b.WriteString(m.logVP.View())
-		b.WriteByte('\n')
+		return modeSingle
 	}
+}
 
-	b.WriteString(m.help.View(m.keys))
+// viewWidth is the panel width View and layout share: the construction
+// default before the first tea.WindowSizeMsg (m.width == 0), never below
+// minLayoutWidth afterwards. The degenerate sizes ({0,0}/{1,1}) clamp here
+// too — cosmetic only, the fit contract covers typical sizes.
+func (m Model) viewWidth() int {
+	if m.width <= 0 {
+		return defaultWidth
+	}
+	if m.width < minLayoutWidth {
+		return minLayoutWidth
+	}
+	return m.width
+}
+
+// gridMode is the layout of the four quota panels: the unmeasured frame
+// (m.width == 0) stays single-column full-width like the pre-redesign
+// default, so Phase A (hardening matrix, no WindowSizeMsg) renders every
+// row at full interior width with the default column widths.
+func (m Model) gridMode() layoutMode {
+	if m.width <= 0 {
+		return modeSingle
+	}
+	return modeOf(m.viewWidth())
+}
+
+// panelWidths returns the four panel widths for the mode (a 1-cell gutter
+// separates side-by-side panels; stacked panels take the full width).
+func panelWidths(mode layoutMode, w int) (egW, keyW, idW, rotW int) {
+	half := (w - 1) / 2
+	right := w - 1 - half
+	switch mode {
+	case modeWide:
+		return half, right, half, right
+	case modeMid:
+		return w, w, half, right
+	default:
+		return w, w, w, w
+	}
+}
+
+// View assembles the dashboard screen. Pure render — model state only
+// (widget content was pushed in Update). Line budget: layout() decides
+// every widget height (coreLineCount measures the non-widget lines here),
+// so the help line stays on-screen — the altscreen clips the bottom
+// (TestViewFitsTerminalSize).
+func (m Model) View() tea.View {
+	vw := m.viewWidth()
+
+	lines := []string{m.th.header.Render(headerTitle), headerPoll}
+	if m.showHelp {
+		// `?` overlay: the dashboard is replaced by the full key list.
+		lines = append(lines, renderPanel("keyboard shortcuts", vw,
+			helpOverlayRows(), lipgloss.NewStyle().Foreground(m.th.accent),
+			m.th.header)...)
+	} else {
+		if m.err != nil {
+			// Daemon down: no grid at all — the status block becomes a
+			// full-width bordered panel (hardening's absent markers).
+			lines = append(lines, renderPanel("daemon status", vw, m.statusLines(),
+				m.th.dimText, m.th.panelTitle)...)
+		} else {
+			lines = append(lines, m.statusLines()...)
+			if m.gridPresent() {
+				lines = append(lines, m.gridLines()...)
+			}
+		}
+		lines = append(lines, m.logPanelLines()...)
+		lines = append(lines, m.help.View(m.keys))
+	}
+	if al := m.actionLine(); al != "" {
+		lines = append(lines, al) // transient action line: frame's last line
+	}
 
 	var v tea.View
-	v.SetContent(b.String())
+	v.SetContent(strings.Join(lines, "\n"))
 	v.AltScreen = true
 	return v
 }
 
-// statusLines renders the block between the header and the first section —
+// helpOverlayRows lists every binding rendered by the `?` overlay — kept
+// next to defaultKeyMap (compact help line) and the tab handling in tui.go.
+// The %-10s column keeps the two-column layout even for "shift+tab".
+func helpOverlayRows() []string {
+	bindings := [][2]string{
+		{"q", "quit"},
+		{"r", "rotate now"},
+		{"d", "direct egress"},
+		{"w", "warp egress"},
+		{"s", "start/stop daemon"},
+		{"tab", "next panel"},
+		{"shift+tab", "previous panel"},
+		{"?", "close help"},
+	}
+	out := make([]string, len(bindings))
+	for i, kv := range bindings {
+		out[i] = fmt.Sprintf("%-10s %s", kv[0], kv[1])
+	}
+	return out
+}
+
+// gridPresent reports whether the four quota panels render (poll answered
+// without error). Before the first status there is no grid; on error the
+// down panel replaces it.
+func (m Model) gridPresent() bool {
+	return m.err == nil && m.status != nil
+}
+
+// gridLines renders the four quota panels in the mode's shape: paired
+// panels are joined with a one-cell gutter on one line, stacked panels
+// follow each other.
+func (m Model) gridLines() []string {
+	st := m.status
+	vw := m.viewWidth()
+	mode := m.gridMode()
+	egW, keyW, idW, rotW := panelWidths(mode, vw)
+
+	egB, egT := m.panelStyle(focusEgress)
+	egP := renderPanel("quota (per egress)", egW, tableLines(m.egressTable), egB, egT)
+	keyB, keyT := m.panelStyle(focusKey)
+	keyP := renderPanel("quota (per key)", keyW, tableLines(m.keyTable), keyB, keyT)
+
+	idBody := tableLines(m.identityTable)
+	if len(m.identityTable.Rows()) == 0 {
+		idBody = append(idBody, m.th.dimText.Render(noIdentities))
+	}
+	idB, idT := m.panelStyle(focusIdentity)
+	idP := renderPanel(fmt.Sprintf("identity pool (%d, active %d)",
+		len(st.State.Identities), st.State.Active), idW, idBody, idB, idT)
+
+	rotB, rotT := m.panelStyle(focusRotation)
+	rotP := renderPanel("rotation history (last 50)", rotW,
+		tableLines(m.rotationTable), rotB, rotT)
+
+	var out []string
+	switch mode {
+	case modeWide:
+		out = append(out, joinRow(egP, keyP, egW)...)
+		out = append(out, joinRow(idP, rotP, idW)...)
+	case modeMid:
+		out = append(out, egP...)
+		out = append(out, keyP...)
+		out = append(out, joinRow(idP, rotP, idW)...)
+	default:
+		out = append(out, egP...)
+		out = append(out, keyP...)
+		out = append(out, idP...)
+		out = append(out, rotP...)
+	}
+	return out
+}
+
+// logPanelLines renders the full-width log panel: the viewport body when
+// a tail is visible, one notice line otherwise.
+func (m Model) logPanelLines() []string {
+	var body []string
+	switch {
+	case m.logErr != nil:
+		body = []string{fmt.Sprintf("log tail error: %v", m.logErr)}
+	case len(m.logLines) == 0:
+		body = []string{"no log output yet"}
+	default:
+		body = splitBody(m.logVP.View())
+	}
+	logB, logT := m.panelStyle(focusLog)
+	return renderPanel("log tail", m.viewWidth(), body, logB, logT)
+}
+
+// tableLines splits a table render into body lines (table.View may end
+// with or without a trailing newline depending on rows).
+func tableLines(t table.Model) []string { return splitBody(t.View()) }
+
+// splitBody splits any widget render (table or viewport) into body lines.
+func splitBody(rendered string) []string {
+	raw := strings.TrimRight(rendered, "\n")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "\n")
+}
+
+// joinRow places two panels side by side with a one-cell gutter: both
+// start on the same line (titles share it), and whichever side ends
+// earlier is padded with blanks so the borders stay aligned.
+func joinRow(left, right []string, leftWidth int) []string {
+	n := len(left)
+	if len(right) > n {
+		n = len(right)
+	}
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		l := strings.Repeat(" ", leftWidth)
+		if i < len(left) {
+			l = left[i]
+		}
+		r := ""
+		if i < len(right) {
+			r = right[i]
+		}
+		out[i] = l + " " + r
+	}
+	return out
+}
+
+// renderPanel builds one bordered box: a rounded top border embedding the
+// title, the body clipped/padded to the interior, and a rounded bottom.
+// The widgets themselves do not truncate (viewport returns raw lines),
+// so clipping happens here — every rendered panel line is exactly width
+// cells wide.
+func renderPanel(title string, width int, body []string, border, tstyle lipgloss.Style) []string {
+	if width < 8 {
+		width = 8
+	}
+	interior := width - 2
+	if cells(title) > width-4 {
+		title = clipLine(title, width-4)
+	}
+	top := border.Render("╭─") + tstyle.Render(title) +
+		border.Render(strings.Repeat("─", width-3-cells(title))+"╮")
+
+	lines := make([]string, 0, len(body)+2)
+	lines = append(lines, top)
+	for _, ln := range body {
+		// Wrapped status lines carry embedded newlines: one element can
+		// span several rendered panel lines (coreLineCount budgets them
+		// via linesOf, so the count always matches).
+		for _, part := range strings.Split(ln, "\n") {
+			c := clipLine(part, interior)
+			lines = append(lines, border.Render("│")+padCells(c, interior)+border.Render("│"))
+		}
+	}
+	lines = append(lines, border.Render("╰"+strings.Repeat("─", width-2)+"╯"))
+	return lines
+}
+
+// cells counts the display cells of a styled line — ANSI escape runs cost
+// zero cells (clipLine/padCells rely on this).
+func cells(s string) int {
+	n := 0
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		if rs[i] == '\x1b' {
+			for i++; i < len(rs) && rs[i] != 'm'; i++ {
+			}
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// clipLine bounds one styled line to at most w cells (ANSI-aware), marking
+// a cut with a unicode ellipsis. Lines already within the budget come back
+// byte-identical — the fitted table rows therefore never grow an ellipsis.
+func clipLine(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if cells(s) <= w {
+		return s
+	}
+	var b strings.Builder
+	n := 0
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		if rs[i] == '\x1b' { // copy the escape run untouched (free cells)
+			b.WriteRune(rs[i])
+			for i++; i < len(rs); i++ {
+				b.WriteRune(rs[i])
+				if rs[i] == 'm' {
+					break
+				}
+			}
+			continue
+		}
+		if n == w-1 { // reserve the last cell for the ellipsis
+			break
+		}
+		b.WriteRune(rs[i])
+		n++
+	}
+	b.WriteRune('…')
+	return b.String()
+}
+
+// padCells appends spaces until the line spans w cells (no-op when the
+// line is already at budget — clipLine guarantees <= w).
+func padCells(s string, w int) string {
+	if pad := w - cells(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+// statusLines renders the block between the header and the first panel —
 // one entry per line (wrapped entries may span several rendered lines).
 // View and coreLineCount share it so the layout budget can never drift
 // from what is actually rendered.
@@ -81,17 +392,21 @@ func (m Model) statusLines() []string {
 	var lines []string
 	switch {
 	case m.err != nil:
+		// Inside the full-width down panel: wrap at the panel interior so
+		// renderPanel never has to clip a status line (hardening markers
+		// must stay whole).
+		interior := m.viewWidth() - 2
 		lines = []string{
-			fmt.Sprintf("daemon: down (%v)", m.err),
-			m.wrap(startOffer),
+			m.wrapAt(fmt.Sprintf("daemon: down (%v)", m.err), interior),
+			m.wrapAt(startOffer, interior),
 		}
 	case m.status == nil:
-		lines = []string{"daemon: waiting for the first status poll..."}
+		lines = []string{m.wrap("daemon: waiting for the first status poll...")}
 	default:
 		st := m.status
 		lines = []string{
-			fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
-				orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds)),
+			m.wrap(fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
+				orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds))),
 			m.wrap(fmt.Sprintf("mode: %s | egress: %s | ip: %s",
 				orDash(st.Mode), orDash(st.Current), orDash(st.EgressIP))),
 			m.wrap(fmt.Sprintf("last rotate: %s | rotating: %t | registering: %t",
@@ -104,18 +419,25 @@ func (m Model) statusLines() []string {
 			m.wrap(latencyLine(st, "ttfb", false)),
 			m.wrap(latencyLine(st, "stream", true)))
 	}
-	// Task 6: the action line in the status/error area — the spinner while
-	// a request is in flight, otherwise the last request error. A poll
-	// result (statusMsg) never clears it; only the next action start does.
+	return lines
+}
+
+// actionLine is the transient footer line — the spinner while a request
+// is in flight, the last request error otherwise. A poll result never
+// clears an error; only the next action start does. It renders as the
+// very last line of the frame (below the keys line) and disappears when
+// idle.
+func (m Model) actionLine() string {
 	switch {
 	case m.pending:
-		lines = append(lines, m.wrap(fmt.Sprintf("%s %s in flight",
-			m.spinner.View(), m.actionLabel)))
+		return m.wrap(fmt.Sprintf("%s %s in flight", m.spinner.View(), m.actionLabel))
+	case m.confirmStop:
+		return m.wrap(confirmPrompt)
 	case m.actionErr != nil:
-		lines = append(lines, m.wrap(fmt.Sprintf("%s failed: %s",
-			m.actionLabel, sanitizeActionErr(m.actionErr))))
+		return m.wrap(fmt.Sprintf("%s failed: %s",
+			m.actionLabel, sanitizeActionErr(m.actionErr)))
 	}
-	return lines
+	return ""
 }
 
 // actionErrMaxRunes bounds the rendered action-error content: control-API
@@ -150,40 +472,28 @@ func sanitizeActionErr(err error) string {
 	return string(runes)
 }
 
-// writeSection appends one titled table section. table.View() ends without
-// a newline when rows are visible and with one when it is header-only, so
-// the body is trimmed and re-terminated: exactly table.Height()+header lines
-// either way — the budget layout() reserved.
-func writeSection(b *strings.Builder, title, body string) {
-	b.WriteString(sectionStyle.Render(title))
-	b.WriteByte('\n')
-	b.WriteString(strings.TrimRight(body, "\n"))
-	b.WriteByte('\n')
-}
-
 // logViewportVisible reports whether the log tail renders as a viewport
 // (its body height is budgeted by layout) rather than one notice line.
 func (m Model) logViewportVisible() bool {
 	return m.logErr == nil && len(m.logLines) > 0
 }
 
-// coreLineCount is the number of non-widget lines layout() must reserve
-// before handing the remaining height to the tables and the log viewport:
-// header, status block, section titles, log title/notice, help line. It
-// shares statusLines() with View so the two cannot diverge.
+// coreLineCount is the number of lines layout() must reserve that are NOT
+// panel bodies: header (2), the status block (bordered only in the down
+// case — those borders are counted as chrome by layout), the footer help
+// line and the transient action line. Panel chrome (grid/log/down borders)
+// lives in layout's frameTotal; titles are embedded in the top borders and
+// therefore part of the panels. It shares statusLines/actionLine with
+// View so the budget cannot drift from what is rendered.
 func (m Model) coreLineCount() int {
 	n := 2 // header title + poll line
 	for _, line := range m.statusLines() {
 		n += linesOf(line)
 	}
-	if m.err == nil && m.status != nil {
-		n += 4 // section titles (quota egress/key, identity pool, rotation)
-	}
-	n++ // "log tail" section title
-	if !m.logViewportVisible() {
-		n++ // notice/error line replaces the viewport body
-	}
 	n += linesOf(m.help.View(m.keys))
+	if al := m.actionLine(); al != "" {
+		n += linesOf(al)
+	}
 	return n
 }
 
@@ -194,76 +504,229 @@ func linesOf(s string) int {
 }
 
 // wrap bounds one status line to the window width once a tea.WindowSizeMsg
-// has arrived (m.width == 0 = not yet measured: render unwrapped).
+// has arrived (m.width == 0 = not yet measured: render unwrapped). Widths
+// below the layout floor clamp up so no line can wrap into a pathological
+// stack of 1-cell rows.
 func (m Model) wrap(s string) string {
 	if m.width <= 0 {
 		return s
 	}
-	return lipgloss.NewStyle().Width(m.width).Render(s)
-}
-
-// layout resizes every widget from the last tea.WindowSizeMsg and fits the
-// frame to the terminal height. Budgeting (spec §7): the fixed lines are
-// measured from what View will actually render (coreLineCount), the log
-// tail viewport is reserved first (a fifth of the screen, trimmed under
-// pressure), and the four tables absorb the remainder — collapsing to
-// header-only rows when space is scarce. Invariant (checked by
-// TestViewFitsTerminalSize): at typical sizes the frame never exceeds the
-// terminal height, so the help line stays on-screen (the altscreen clips
-// the bottom of the frame).
-func (m *Model) layout() {
 	w := m.width
 	if w < minLayoutWidth {
 		w = minLayoutWidth
 	}
+	return lipgloss.NewStyle().Width(w).Render(s)
+}
+
+// wrapAt bounds a line to an explicit width (the down status panel wraps
+// at its interior; callers pass viewWidth()-2, never below the floor).
+func (m Model) wrapAt(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	return lipgloss.NewStyle().Width(w).Render(s)
+}
+
+// layout sizes every widget from the last tea.WindowSizeMsg. The panel
+// grid invariants (panelgrid_test.go):
+//
+//   - content hug: each table gets exactly its rows (+ header), leftover
+//     height goes back to the deepest panel (rotation), then the log —
+//     never split evenly (the old layout's "blank void" bug);
+//   - frame fit: core + chrome + body lines <= terminal height at every
+//     breakpoint; the shrink order is log -> rotation -> identity -> keys
+//     -> egress, floors be damned only at degenerate sizes.
+//
+// Heights land here (Update), View stays a pure render.
+func (m *Model) layout() {
+	vw := m.viewWidth()
 	h := m.height
 	if h < minLayoutHeight {
 		h = minLayoutHeight
 	}
+	mode := m.gridMode()
+	grid := m.gridPresent()
 
-	const numTables = 4       // egress, key, identity, rotation
-	const minTableH = 1       // header-only row: the floor under pressure
-	core := m.coreLineCount() // headers, status, titles, log title/notice, help
+	// Widths first: column fitting reads the panel width the mode gives
+	// each table, and every later count sees the fitted rows.
+	if grid {
+		egW, keyW, idW, rotW := panelWidths(mode, vw)
+		m.egressTable.SetWidth(vw)
+		m.egressTable.SetColumns(fitColumns(m.egressCols, egW-2))
+		m.keyTable.SetWidth(vw)
+		m.keyTable.SetColumns(fitColumns(m.keyCols, keyW-2))
+		m.identityTable.SetWidth(vw)
+		m.identityTable.SetColumns(fitColumns(m.idCols, idW-2))
+		m.rotationTable.SetWidth(vw)
+		m.rotationTable.SetColumns(fitColumns(m.rotCols, rotW-2))
+	}
+	m.logVP.SetWidth(vw)
+	m.help.SetWidth(vw)
 
-	logH := 0
-	if m.logViewportVisible() {
-		logH = clamp(h/5, 2, 12)
-		if need := h - core - logH - minTableH*numTables; need < 0 {
-			logH += need // shrink the tail before touching the tables
-			if logH < 1 {
-				logH = 1 // keep one log line; below this the frame overflows anyway
+	logVisible := m.logViewportVisible()
+	logSet := 0
+	if logVisible {
+		logSet = clamp(h/5, 2, 12)
+	}
+
+	core := m.coreLineCount()
+	nEg, nKey := len(m.egressTable.Rows()), len(m.keyTable.Rows())
+	nID, nRot := len(m.identityTable.Rows()), len(m.rotationTable.Rows())
+
+	// Content-hug targets: one line per rendered table line (header row
+	// included); identity grows one notice line when the pool is empty.
+	egT, keyT, idT := 1+nEg, 1+nKey, 1+nID
+	rotFloor := 1
+	if nRot > 0 {
+		rotFloor = 2 // header + the newest row stays visible
+	}
+	rotT := 1 + nRot
+	if rotT < rotFloor {
+		rotT = rotFloor
+	}
+
+	logBody := func() int {
+		if !logVisible {
+			return 1 // the notice/error line replaces the viewport body
+		}
+		return min(logSet, len(m.logLines))
+	}
+
+	// frameTotal mirrors View() line-for-line for the current heights.
+	frameTotal := func() int {
+		total := core + 2 + logBody() // log panel borders + body
+		if !grid {
+			if m.err != nil {
+				total += 2 // down status panel borders (its lines are in core)
+			}
+			return total
+		}
+		egBody, keyBody := min(egT, nEg+1), min(keyT, nKey+1)
+		idBody, rotBody := min(idT, nID+1), min(rotT, nRot+1)
+		if nID == 0 {
+			idBody++ // the "no identities" notice under the header-only table
+		}
+		switch mode {
+		case modeWide:
+			total += 6 + max(egBody, keyBody) + max(idBody, rotBody)
+		case modeMid:
+			total += 8 + egBody + keyBody + max(idBody, rotBody)
+		default:
+			total += 10 + egBody + keyBody + idBody + rotBody
+		}
+		return total
+	}
+
+	total := frameTotal()
+	if grid {
+	shrink:
+		for total > h {
+			switch {
+			case logVisible && logSet > 3:
+				logSet--
+			case rotT > rotFloor:
+				rotT--
+			case idT > 1:
+				idT--
+			case keyT > 1:
+				keyT--
+			case egT > 1:
+				egT--
+			case logVisible && logSet > 1:
+				logSet--
+			case rotT > 1:
+				rotT--
+			default:
+				break shrink // degenerate size: accept the overflow
+			}
+			total = frameTotal()
+		}
+	} else {
+		for total > h && logVisible && logSet > 1 {
+			logSet--
+			total = frameTotal()
+		}
+	}
+
+	// Leftover height flows back to the deepest panel (rotation history,
+	// capped at its content), then the log (never beyond its lines) —
+	// panels stay content-hugged.
+	if spare := h - total; spare > 0 {
+		if grid {
+			if g := min(spare, 1+nRot-rotT); g > 0 {
+				rotT += g
+				spare -= g
+			}
+		}
+		if spare > 0 && logVisible {
+			if g := min(spare, len(m.logLines)-logSet); g > 0 {
+				logSet += g
 			}
 		}
 	}
 
-	avail := h - core - logH - minTableH*numTables // rows beyond each table's header line
-	if avail < 0 {
-		avail = 0
+	if grid {
+		m.egressTable.SetHeight(egT)
+		m.keyTable.SetHeight(keyT)
+		m.identityTable.SetHeight(idT)
+		m.rotationTable.SetHeight(rotT)
+		m.rotationTable.GotoBottom() // newest rotation stays visible
 	}
-	base := avail / numTables
-	rem := avail % numTables
-	var heights [numTables]int
-	for i := range heights {
-		heights[i] = minTableH + base
-		if i < rem {
-			heights[i]++
+	m.logVP.SetHeight(logSet)
+	m.logVP.GotoBottom() // tail stays pinned to the newest line
+}
+
+// fitColumns scales a table's column widths so its padded rows
+// (sum(width) + 2 cells per column) fit the panel interior. Shrinks only,
+// and never below 1 cell per column — the pristine definitions live on
+// the Model (m.egressCols, ...), so a shrink-then-grow resize restores
+// the full content instead of compounding the shrink.
+func fitColumns(base []table.Column, interior int) []table.Column {
+	n := len(base)
+	if n == 0 || interior <= 0 {
+		return base
+	}
+	total := 0
+	for _, c := range base {
+		total += c.Width
+	}
+	target := interior - 2*n
+	if target < n {
+		target = n
+	}
+	if total <= target {
+		return base
+	}
+	out := make([]table.Column, n)
+	copy(out, base)
+	sum := 0
+	for i := range out {
+		w := out[i].Width * target / total // proportional shrink, floored at 1
+		if w < 1 {
+			w = 1
+		}
+		out[i].Width = w
+		sum += w
+	}
+	for sum != target { // rounding drift lands on the widest column
+		widest := 0
+		for i := range out {
+			if out[i].Width > out[widest].Width {
+				widest = i
+			}
+		}
+		if sum < target {
+			out[widest].Width++
+			sum++
+		} else {
+			if out[widest].Width <= 1 {
+				break
+			}
+			out[widest].Width--
+			sum--
 		}
 	}
-
-	m.egressTable.SetWidth(w)
-	m.egressTable.SetHeight(heights[0])
-	m.keyTable.SetWidth(w)
-	m.keyTable.SetHeight(heights[1])
-	m.identityTable.SetWidth(w)
-	m.identityTable.SetHeight(heights[2])
-	m.rotationTable.SetWidth(w)
-	m.rotationTable.SetHeight(heights[3])
-	m.rotationTable.GotoBottom() // newest rotation stays visible
-
-	m.logVP.SetWidth(w)
-	m.logVP.SetHeight(logH)
-	m.logVP.GotoBottom() // tail stays pinned to the newest line
-	m.help.SetWidth(w)
+	return out
 }
 
 // applyStatus rebuilds every table from one status snapshot: rows are

@@ -178,15 +178,24 @@ func TestUseKeysForceDirectAndWarp(t *testing.T) {
 }
 
 // TestStopWhenDaemonUp: `s` with the daemon up stops it through the seam
-// (the spawn half of `s` is covered by TestSpawnWhenDaemonDownViaSpawner).
+// — two-step: the first press arms the confirmation (no command, no seam
+// call), the second press fires the stop (the spawn half of `s` is
+// covered by TestSpawnWhenDaemonDownViaSpawner, which stays single-press).
 func TestStopWhenDaemonUp(t *testing.T) {
 	af := newActionFake(fakeResult{status: upStatus()})
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
 	m, cmd := actionKey(t, m, "s")
+	if cmd != nil {
+		t.Fatal("first `s` must only arm the confirmation, not fire the stop")
+	}
+	if af.stopCalls != 0 {
+		t.Fatalf("Stop calls after the first press = %d, want 0", af.stopCalls)
+	}
+	m, cmd = actionKey(t, m, "s")
 	if cmd == nil {
-		t.Fatal("`s` must return the stop command when the daemon is up")
+		t.Fatal("second `s` must return the stop command when the daemon is up")
 	}
 	m, _ = update(t, m, runActionBatch(t, cmd))
 	if af.stopCalls != 1 {
@@ -524,10 +533,15 @@ func TestFailedPollRoutesSpawnAfterUp(t *testing.T) {
 	m := New(af, WithSpawner(sp.spawn))
 	m, _ = update(t, m, runCmd(t, m.Init())) // first poll: up
 
-	// An up daemon: `s` stops it, never spawns.
+	// An up daemon: `s` arms the confirmation first, the second press
+	// stops it, never spawns.
 	m, cmd := actionKey(t, m, "s")
+	if cmd != nil {
+		t.Fatal("first `s` on an up daemon must only arm the confirmation")
+	}
+	m, cmd = actionKey(t, m, "s")
 	if cmd == nil {
-		t.Fatal("`s` on an up daemon must return the stop command")
+		t.Fatal("second `s` on an up daemon must return the stop command")
 	}
 	m, _ = update(t, m, runActionBatch(t, cmd))
 	if af.stopCalls != 1 || sp.calls != 0 {

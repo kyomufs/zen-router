@@ -533,6 +533,11 @@ func applyHardeningAction(t *testing.T, m Model, ac hcAction) Model {
 			key = "s"
 		}
 		next, cmd := actionKey(t, m, key)
+		if cmd == nil && key == "s" {
+			// Two-step stop: on an up daemon the first `s` only arms the
+			// confirmation; the down/spawn path fires on the first press.
+			next, cmd = actionKey(t, next, key)
+		}
 		if cmd == nil {
 			t.Fatalf("%s: %s must queue the request", ac.name, key)
 		}

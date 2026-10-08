@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -258,8 +259,10 @@ func TestViewWindowSizeAdaptsLayout(t *testing.T) {
 		t.Fatalf("rotation row lost after resize:\n%s", content)
 	}
 	for _, line := range strings.Split(content, "\n") {
-		if strings.Contains(line, "rotation-") && len(line) > 60 {
-			t.Errorf("rotation line width %d > window width 60: %q", len(line), line)
+		// Display cells, not bytes: the panel redesign wraps rows in
+		// 3-byte box-drawing borders (utf8 — same metric as panelgrid).
+		if n := utf8.RuneCountInString(line); strings.Contains(line, "rotation-") && n > 60 {
+			t.Errorf("rotation line width %d cells > window width 60: %q", n, line)
 		}
 	}
 }

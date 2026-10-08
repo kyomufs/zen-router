@@ -29,7 +29,6 @@ import (
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"zen-router/internal/cli"
 )
@@ -185,6 +184,15 @@ type Model struct {
 	actionErr   error
 	spinner     spinner.Model
 
+	// Interaction state (approved redesign): focus is the highlighted
+	// panel index in the tab order (view.go focusablePanels, 0 = the
+	// egress quota panel, also the boot default); showHelp swaps the
+	// dashboard for the `?` keyboard overlay; confirmStop arms the two-step
+	// stop (`s` on an up daemon — the second press fires, esc cancels).
+	focus       int
+	showHelp    bool
+	confirmStop bool
+
 	// now stamps each status result; the reset countdowns are computed
 	// from it in Update so View stays clock-free and deterministic.
 	now time.Time
@@ -197,11 +205,25 @@ type Model struct {
 	keys keyMap
 	help help.Model
 
+	// th is the immutable style set built once in New() from the terminal
+	// background; View renders through it and never detects anything.
+	th theme
+
 	egressTable   table.Model
 	keyTable      table.Model
 	identityTable table.Model
 	rotationTable table.Model
 	logVP         viewport.Model
+
+	// egressCols/keyCols/idCols/rotCols are the PRISTINE column
+	// definitions (the same slices handed to table.WithColumns). Fitted
+	// columns are sticky — table.Columns() returns whatever was last set —
+	// so layout always refits from these bases: shrink-then-grow restores
+	// the full content instead of compounding the shrink.
+	egressCols []table.Column
+	keyCols    []table.Column
+	idCols     []table.Column
+	rotCols    []table.Column
 
 	logLines []string
 	logErr   error
@@ -212,50 +234,63 @@ type Model struct {
 // actions (*cli.ControlClient in production), the spec §7 r/d/w/s keys are
 // enabled through that discovered ActionSource; otherwise they stay no-ops.
 func New(src StatusSource, opts ...Option) Model {
+	// Pristine column definitions: shared with the tables below and kept
+	// for layout's fitColumns (see Model.egressCols).
+	egressCols := []table.Column{
+		{Title: "Egress", Width: 8},
+		{Title: "OK", Width: 7},
+		{Title: "429", Width: 6},
+		{Title: "Resets in", Width: 12},
+	}
+	keyCols := []table.Column{
+		{Title: "Key", Width: 10},
+		{Title: "OK", Width: 7},
+		{Title: "429", Width: 6},
+		{Title: "Resets in", Width: 12},
+	}
+	idCols := []table.Column{
+		{Title: "#", Width: 3},
+		{Title: "Active", Width: 7},
+		{Title: "Device ID", Width: 20},
+		{Title: "IPv4", Width: 16},
+		{Title: "Registered", Width: 17},
+	}
+	rotCols := []table.Column{
+		{Title: "At", Width: 16},
+		{Title: "From", Width: 8},
+		{Title: "To", Width: 8},
+		{Title: "Reason", Width: 40},
+	}
+
 	m := Model{
 		src:     src,
 		act:     discoverActions(src),
 		keys:    defaultKeyMap(),
 		help:    help.New(),
+		th:      newTheme(detectBackground()),
 		spinner: spinner.New(), // Line frames; advanced only while pending
+
+		egressCols: egressCols,
+		keyCols:    keyCols,
+		idCols:     idCols,
+		rotCols:    rotCols,
 		egressTable: table.New(
-			table.WithColumns([]table.Column{
-				{Title: "Egress", Width: 8},
-				{Title: "OK", Width: 7},
-				{Title: "429", Width: 6},
-				{Title: "Resets in", Width: 12},
-			}),
+			table.WithColumns(egressCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultTableH),
 		),
 		keyTable: table.New(
-			table.WithColumns([]table.Column{
-				{Title: "Key", Width: 10},
-				{Title: "OK", Width: 7},
-				{Title: "429", Width: 6},
-				{Title: "Resets in", Width: 12},
-			}),
+			table.WithColumns(keyCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultTableH),
 		),
 		identityTable: table.New(
-			table.WithColumns([]table.Column{
-				{Title: "#", Width: 3},
-				{Title: "Active", Width: 7},
-				{Title: "Device ID", Width: 20},
-				{Title: "IPv4", Width: 16},
-				{Title: "Registered", Width: 17},
-			}),
+			table.WithColumns(idCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultTableH),
 		),
 		rotationTable: table.New(
-			table.WithColumns([]table.Column{
-				{Title: "At", Width: 16},
-				{Title: "From", Width: 8},
-				{Title: "To", Width: 8},
-				{Title: "Reason", Width: 40},
-			}),
+			table.WithColumns(rotCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultRotationsH),
 		),
@@ -360,6 +395,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.status != nil {
 			m.applyStatus(msg.status)
 		}
+		// Row counts feed the panel heights (the grid hugs its content),
+		// so every poll result re-budgets; width > 0 keeps Phase A at the
+		// construction defaults.
+		m.relayout()
 		return m, m.tick()
 	case pollMsg:
 		return m, m.fetch()
@@ -387,35 +426,65 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "tab":
+			m.focus = (m.focus + 1) % focusablePanels
+			m.confirmStop = false
+			return m, nil
+		case "shift+tab":
+			m.focus = (m.focus + focusablePanels - 1) % focusablePanels
+			m.confirmStop = false
+			return m, nil
+		case "?":
+			m.showHelp = !m.showHelp
+			m.confirmStop = false
+			return m, nil
+		case "esc":
+			m.confirmStop = false
+			return m, nil
 		case "r":
+			m.confirmStop = false
 			return m.startAction(m.act != nil, "rotate", func(ctx context.Context) error {
 				_, err := m.act.Rotate(ctx)
 				return err
 			})
 		case "d":
+			m.confirmStop = false
 			return m.startAction(m.act != nil, "use direct", func(ctx context.Context) error {
 				_, err := m.act.Use(ctx, "direct")
 				return err
 			})
 		case "w":
+			m.confirmStop = false
 			return m.startAction(m.act != nil, "use warp", func(ctx context.Context) error {
 				_, err := m.act.Use(ctx, "warp")
 				return err
 			})
 		case "s":
 			// Spec §7: s = start/stop. Daemon down → spawn `up --detach`
-			// through the Spawner seam; daemon up → stop through the
-			// control client; first poll not answered → up/down unknown,
-			// the key does nothing.
+			// through the Spawner seam on the FIRST press (starting is
+			// not destructive); daemon up → stop through the control
+			// client, but only after a two-step confirmation — the first
+			// press arms confirmStop (prompt, no command), the second
+			// fires, esc cancels. First poll not answered → up/down
+			// unknown, the key does nothing.
+			if m.pending {
+				return m, nil // in-flight: strictly ignored, no state change
+			}
 			switch {
 			case m.err != nil:
+				m.confirmStop = false
 				return m.startAction(m.spawn != nil, "start daemon", func(ctx context.Context) error {
 					return m.spawn(ctx)
 				})
-			case m.status != nil:
-				return m.startAction(m.act != nil, "stop daemon", func(ctx context.Context) error {
-					return m.act.Stop(ctx)
-				})
+			case m.status != nil && m.act != nil:
+				if m.confirmStop {
+					m.confirmStop = false
+					return m.startAction(true, "stop daemon", func(ctx context.Context) error {
+						return m.act.Stop(ctx)
+					})
+				}
+				m.confirmStop = true
+				return m, nil
 			default:
 				return m, nil
 			}
@@ -423,12 +492,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-
-// titleStyle emphasizes the header line (lipgloss v2; pure rendering).
-var titleStyle = lipgloss.NewStyle().Bold(true)
-
-// sectionStyle emphasizes the dashboard section titles.
-var sectionStyle = lipgloss.NewStyle().Bold(true)
 
 // fmtUptime renders the daemon uptime the way the header line shows it.
 func fmtUptime(sec int64) string {
