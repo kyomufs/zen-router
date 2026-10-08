@@ -166,6 +166,10 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 - [x] `go mod tidy` diff reviewed (bubbletea v2 from Plan 2 only — no other additions).
       — DONE: `go mod tidy` → `git diff go.mod go.sum` EMPTY; go.mod carries
       `charm.land/bubbletea/v2 v2.0.10` (Plan 2 T4 addition, with lipgloss v2 + bubbles v2).
-- [ ] `git status` clean; ledger updated; plan workspace deleted (per SDD skill) once all
+- [x] `git status` clean; ledger updated; plan workspace deleted (per SDD skill) once all
       plans are closed.
+      — DONE 2026-10-08: tree clean at a1262a8 (pushed, = origin/main); ledger-plan1
+      :100 / ledger-plan2 :66 / ledger-plan3 :3 all CLOSED; `.superpowers/sdd/` empty
+      (workspaces archived: plan2 → /tmp/zen-sdd-archived/plan2, plan3 → Trash);
+      Part 2b/2c evidence recorded in both ledgers this session.
 - [ ] Goal: mark complete only when the WHOLE objective (all plans + live phases) is done.
