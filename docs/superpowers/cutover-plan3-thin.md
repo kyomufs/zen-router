@@ -207,3 +207,23 @@ binary (Steps 4+ are prerequisites, not mutations of the plugin).
   `opencode.ai` call, no DSH restart, no daemon/unit touch. Only read-only
   grep/sed/stat/pgrep plus the loopback test suite were run.
 - Final gate: plugin suite `npm test` at `9890e55` → **64 passed, 0 failed, exit 0**.
+
+## Execution record — Phase E (2026-10-08, отмашка active)
+
+- **Step 1 DONE**: `dsh plugin --profile web add "github:kyomufs/dsh-opencode-zen#9890e557734e780f406232c6d85ec2e2427c1c96"`
+  — `package.json:13` = new SHA, `a416790` hits = 0, installed node_modules = v0.16.0
+  (thin, `main: lib/index.js`).
+- **Step 2 DONE**: `dsh --profile web --dump-config` → rc=0, **stderr 0 bytes**.
+- **Step 3 PENDING**: DSH restart is user-managed — pid 5463 (started 12:51:22, i.e.
+  before the pin move) was still running at last check.
+- **Step 4 DONE (via phase-e Part 2b, as this doc anticipated)**: binary rebuilt
+  2026-10-08 14:55:01 (atomic stop → install → start), live unit is the
+  `zen-router install-systemd` output (pid 31217), `zen-router help` lists `tui`,
+  `install-systemd [--remove]`, `up --detach`.
+- **Step 5 PARTIAL (daemon side live-checked)**: `GET /v1/models` → 200 both bare and
+  with `Authorization: Bearer zen-test-key`; error envelope live →
+  `400 {"error":{"code":"InvalidRequestError","message":"…","type":"InvalidRequestError"}}`
+  (the exact `error.type` shape the thin-plugin parser keys on); session/sticky
+  derivation covered by `zen.DeriveRequestIDs` parity + `session_test.go`. The
+  opencode.ai chat round-trip through the thin plugin (stream + non-stream) awaits
+  step 3.

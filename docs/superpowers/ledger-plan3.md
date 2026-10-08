@@ -64,3 +64,11 @@ Workspace `.superpowers/sdd/plan3/` archived to Trash after close (reports/revie
 - Full recount of T7 ref-sweep (~289 replacements; ~54-ref sample, 0 errors).
 - RED-at-base chronology and per-fix "ok-lost NONE" historical claims.
 - Long-run flake rate; host-pin checks depend on nix-store dsh-llm (not re-read independently).
+
+## Phase E Part 2c execution (2026-10-08, отмашка active)
+
+- Step 1 DONE: pin moved `a416790` → `9890e557734e780f406232c6d85ec2e2427c1c96` via `dsh plugin --profile web add`; package.json:13 = new SHA, `a416790` hits = 0, node_modules version 0.16.0 (thin, main lib/index.js).
+- Step 2 DONE: `dsh --profile web --dump-config` rc=0, stderr 0 bytes (1613-line dump, plugin present).
+- Step 3 OPEN: DSH restart — user-managed (signal given 2026-10-08).
+- Step 4-5 OPEN: live opencode.ai stream + non-stream through thin plugin, wire checks (Bearer, stickyId, error.type) — after restart.
+- Step 6 DONE: rebuilt binary mtime 14:55:01 == running daemon (pid 31217, same path), phase-e.md:112 ticked.

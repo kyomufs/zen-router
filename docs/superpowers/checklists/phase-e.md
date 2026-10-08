@@ -81,35 +81,62 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ### 2a. Plan 1 deferred-minors batch (from earlier ledger)
 
-- [ ] T7 two tests + `max_completion_tokens:null` (now tracked as DM-1/DM-3).
-- [ ] T2 ClampEffort tie-break (DM-4).
-- [ ] T10 Active-remap (DM-5).
-- [ ] T5 bare-429 (DM-6), errors.go wording (done in T14), snippet UTF-8 (done in T14).
+- [x] T7 two tests + `max_completion_tokens:null` — closed as DM-1/DM-3 (0c44866).
+- [x] T2 ClampEffort tie-break — closed as DM-4 (0c44866).
+- [x] T10 Active-remap — closed as DM-5 (ade6f88).
+- [x] T5 bare-429 — closed as DM-6 (b6f53be); errors.go wording (done in T14), snippet UTF-8 (done in T14).
 
 ### 2b. Build + install + daemon (Plan 1 + Plan 2 surface)
 
-- [ ] Rebuild `~/.local/bin/zen-router` (go install — forbidden while live unit runs).
-- [ ] `zen-router install-systemd` (Plan 2 Task 8) — **overwrites the live hand-written
-      unit** `~/.config/systemd/user/zen-router.service`.
-- [ ] `systemctl --user daemon-reload && systemctl --user enable --now zen-router` — may
-      restart the running daemon.
-- [ ] Verify: `zen-router help` lists `tui`, `install-systemd [--remove]`, `up --detach`.
-- [ ] Live smoke: `GET /_zenctl/status` (expect mode/egress/quota), `GET /v1/models`,
+- [x] Rebuild `~/.local/bin/zen-router` (go install — forbidden while live unit runs).
+      — DONE 2026-10-08: atomic stop→install→start, mtime 14:55, unit restarted.
+- [x] `zen-router install-systemd` (Plan 2 Task 8) — **overwrites the live hand-written
+      unit** `~/.config/systemd/user/zen-router.service`. — DONE: handwritten unit
+      backed up to /tmp/zen-router.service.handwritten.bak, new unit installed
+      (`ExecStart=~/.local/bin/zen-router up`, Restart=on-failure/5s, default.target).
+- [x] `systemctl --user daemon-reload && systemctl --user enable --now zen-router` — may
+      restart the running daemon. — DONE: unit active, WantedBy=default.target enabled.
+- [x] Verify: `zen-router help` lists `tui`, `install-systemd [--remove]`, `up --detach`.
+      — DONE: all three present in help output.
+- [x] Live smoke: `GET /_zenctl/status` (expect mode/egress/quota), `GET /v1/models`,
       TUI opens and polls, `r/d/w/s` actions work against the live daemon.
-- [ ] Live egress-IP echo (Plan 2 Task 2) through the active transport.
-- [ ] Log tee: `$XDG_STATE_HOME/zen-router/zen.log` receives daemon output; TUI tails it.
-- [ ] Journal: `journalctl --user -u zen-router` shows daemon logs (journald default kept).
+      — DONE: status 200 (mode/egress/state.egress quotas + egress_ip; no literal
+      `quota` key — quota lives in state.egress/per-key tables, surfaced by the TUI
+      "quota (per egress/per key)" widgets); models 200; TUI under `script` pty
+      renders the live dashboard (recipe: `stty rows/cols` + `TERM=xterm-256color`
+      inside the pty — bare pty defaults to 0x0 → empty frame, inherited
+      `TERM=dumb` skips alt-screen). Keys: r → "rotate in flight" + daemon journal
+      attempt (register blocked: api.cloudflareclient.com unreachable from this
+      host, cf_http:000 7s timeout — env fact, direct path healthy); w → control
+      API busy during warp switch attempt (serialized handler; status polls time
+      out while register is in flight); s → stop branch (journal "stopped",
+      TUI "down (…not running)" + hint) and spawn branch ("start daemon in
+      flight" → new pid, dashboard back to "up"); d → direct confirmed; q → clean
+      exit rc=0. Daemon reconciled to systemd unit + current=direct after runs.
+- [x] Live egress-IP echo (Plan 2 Task 2) through the active transport.
+      — DONE: `egress_ip: 176.212.216.125` via ACTIVE transport (ipify), flag
+      `~/.config/zen-router/config.json {"egressIPEcho": true}`.
+- [x] Log tee: `$XDG_STATE_HOME/zen-router/zen.log` receives daemon output; TUI tails it.
+      — DONE: zen.log grows on start/stop lines; TUI log-tail widget shows them live.
+- [x] Journal: `journalctl --user -u zen-router` shows daemon logs (journald default kept).
+      — DONE: unit logs + control lines visible (stop/start/rotation entries).
 
 ### 2c. Plan 3 cutover fence (§H — thin plugin)
 
-- [ ] Install rebuilt thin plugin into `~/.dsh/profiles/web` (currently pinned `a416790`
+- [x] Install rebuilt thin plugin into `~/.dsh/profiles/web` (currently pinned `a416790`
       transport-proxy variant); move the pin off `a416790`.
-- [ ] `dsh --profile web --dump-config` — no stderr warnings.
+      — DONE 2026-10-08: `dsh plugin --profile web add github:kyomufs/dsh-opencode-zen#9890e557734e780f406232c6d85ec2e2427c1c96`,
+      package.json:13 has new SHA, `a416790` hits = 0, installed node_modules
+      reports version 0.16.0 (thin, main lib/index.js).
+- [x] `dsh --profile web --dump-config` — no stderr warnings.
+      — DONE: rc=0, stderr 0 bytes (1613-line dump), plugin name present in output.
 - [ ] DSH restart (HMR not sufficient for profile install).
 - [ ] Live opencode.ai calls through the daemon via the thin plugin (stream + non-stream).
 - [ ] Wire check: `Authorization: Bearer`, stickyId, error envelope reads
       `error.type` (new OpenAI shape confirmed compatible with thin-plugin parser).
-- [ ] Rebuilt `~/.local/bin/zen-router` matching the daemon the plugin talks to.
+- [x] Rebuilt `~/.local/bin/zen-router` matching the daemon the plugin talks to.
+      — DONE: binary mtime 2026-10-08 14:55:01, live daemon pid 31217 runs
+      `/home/kyomufs/.local/bin/zen-router up` (same path, started 15:24:37).
 
 ### 2d. README (Phase E per spec §13)
 
@@ -132,9 +159,13 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 
 ## Part 3 — final gate run (after Parts 1-2, at HEAD)
 
-- [ ] `gofmt -l .` empty; `go build ./...`; `go vet ./...`;
+- [x] `gofmt -l .` empty; `go build ./...`; `go vet ./...`;
       `timeout 180 go test -count=1 -short ./...` all green.
-- [ ] `go mod tidy` diff reviewed (bubbletea v2 from Plan 2 only — no other additions).
+      — DONE 2026-10-08: gofmt 0 files, build/vet OK, 12 packages ok / 0 FAIL
+      (re-run once more at finale after docs commits).
+- [x] `go mod tidy` diff reviewed (bubbletea v2 from Plan 2 only — no other additions).
+      — DONE: `go mod tidy` → `git diff go.mod go.sum` EMPTY; go.mod carries
+      `charm.land/bubbletea/v2 v2.0.10` (Plan 2 T4 addition, with lipgloss v2 + bubbles v2).
 - [ ] `git status` clean; ledger updated; plan workspace deleted (per SDD skill) once all
       plans are closed.
 - [ ] Goal: mark complete only when the WHOLE objective (all plans + live phases) is done.
