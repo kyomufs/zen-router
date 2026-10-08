@@ -29,10 +29,21 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
 - [x] **DM-5** (closed ade6f88) T10 Active-remap: null-slot → remap `Active` (state.go:138-146 filters
       but does not remap; only hand-edited/corrupt JSON can trigger; clamped on read
       state.go:203-210).
-- [ ] **DM-6** T5 bare-429 → KindClient: keep (accepted T12, errors.go:225-227) — revisit
-      only if a real bare-429 corpus appears; no action expected.
-- [ ] **DM-7** T5 daily-regex not gated on `status==429` (ledger:51(3)) — low-risk
-      port-fidelity divergence, recorded; decide keep-vs-gate with a corpus check.
+- [x] **DM-6** (closed b6f53be, mark in this batch) T5 bare-429 → KindClient: KEEP (accepted T12,
+      errors.go:235-239) — corpus check: zero bare-429-without-type instances anywhere (smoke.cjs
+      `'429-catchall'` carries `InvalidRequestError`; gateway always types 429s per spec §4), so
+      "no action expected" holds; end-to-end bare 429 → KindClient → errorClass InvalidRequestError
+      → thin-plugin RATE_LIMIT row → host backoff matches golden lib/index.js:815. Revisit only if
+      a real bare-429 corpus appears.
+- [x] **DM-7** (closed b6f53be, mark in this batch) T5 daily-regex GATED on `status==429`
+      (ledger:51(3)) — corpus check found zero non-429 + quota-class instances (errors_test.go,
+      smoke.cjs, spec §4 are all 429), golden gates the same match (a416790 lib/index.js:1579
+      guards the raw test at :1583); gated at BOTH sniff sites: zen.classify (errors.go:197) and
+      proxy.wrapBody (proxy.go:185 — found during this corpus sweep; proxy feeds router.OnResult
+      where the DailyLimit branch precedes 2xx success, so ungated it let a 200 SSE stream quoting
+      a class name within the first 8 KiB mark the daily window and spawn rotation). Typed
+      kindByErrorType path deliberately stays ungated (explicit error.type = strong evidence,
+      spec §4 type-over-status). RED→GREEN both sites, no existing pin changed.
 
 ### From T14 re-review (6)
 
