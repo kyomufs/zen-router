@@ -24,7 +24,10 @@ import (
 const Upstream = "https://opencode.ai"
 
 // DAILY_LIMIT_RE mirrors the plugin's own daily-quota detector so the proxy
-// rotates on exactly the same gateway message the plugin keys off.
+// rotates on exactly the same gateway message the plugin keys off. Sniffing
+// is gated on a 429 like golden (lib/index.js:1579 guards the match at
+// :1583): router.OnResult treats DailyLimit as quota exhaustion even on a
+// 2xx stream, and a success body may legitimately quote a class name (DM-7).
 var DAILY_LIMIT_RE = regexp.MustCompile(`FreeUsageLimitError|GoUsageLimitError|BlackUsageLimitError`)
 
 // peekLimit bounds how much of a response body is buffered for quota sniffing.
@@ -179,7 +182,7 @@ func (s *Server) wrapBody(req *http.Request, egress Egress, resp *http.Response)
 		s.cfg.OnResult(Result{
 			Egress:     egress,
 			Status:     resp.StatusCode,
-			DailyLimit: DAILY_LIMIT_RE.MatchString(pb.peeked()),
+			DailyLimit: resp.StatusCode == 429 && DAILY_LIMIT_RE.MatchString(pb.peeked()),
 			RetryAfter: resp.Header.Get("retry-after"),
 			Peek:       strings.TrimSpace(pb.peeked()),
 			LatencyMS:  time.Since(started).Milliseconds(),

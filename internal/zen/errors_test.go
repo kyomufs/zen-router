@@ -51,7 +51,7 @@ func TestClassifyDailyLimit(t *testing.T) {
 	t.Run("raw-text relayed body", func(t *testing.T) {
 		// Provider-relayed bodies keep gateway class names in free text;
 		// the plugin matches DAILY_LIMIT_RE against the raw body
-		// (lib/index.js:1405), so this must win over the relay marker.
+		// (lib/index.js:1583), so this must win over the relay marker.
 		body := []byte(`Error from provider (OpenAI): {"error":{"message":"FreeUsageLimitError: daily usage limit exceeded","type":"rate_limit_exceeded"}}`)
 		got := Classify(429, body, "")
 		if got == nil {
@@ -85,6 +85,47 @@ func TestClassifyDailyLimit(t *testing.T) {
 		}
 		if want := 9 * time.Hour; got.RetryAfter != want {
 			t.Errorf("RetryAfter = %v, want exactly %v (15:00 UTC → next midnight)", got.RetryAfter, want)
+		}
+	})
+}
+
+// TestClassifyDailyRegexGatedOn429 pins the DM-7 corpus decision: the
+// free-text quota regex may produce KindDailyLimit only behind a 429 —
+// the plugin gates the same match on status (a416790 lib/index.js:1579
+// returns before the regex at :1583). A non-429 body that merely quotes
+// a class name must fall through to the typed/status precedence instead
+// of marking the daily window exhausted.
+func TestClassifyDailyRegexGatedOn429(t *testing.T) {
+	t.Run("500 prose quoting a quota class", func(t *testing.T) {
+		got := Classify(500, []byte("upstream said FreeUsageLimitError while failing"), "")
+		if got == nil {
+			t.Fatal("Classify returned nil, want *UpstreamError")
+		}
+		if got.Kind != KindServer {
+			t.Errorf("Kind = %v, want KindServer (free-text regex must not fire without a 429)", got.Kind)
+		}
+	})
+
+	t.Run("403 prose quoting a quota class", func(t *testing.T) {
+		got := Classify(403, []byte("blocked: GoUsageLimitError mentioned in body"), "")
+		if got == nil {
+			t.Fatal("Classify returned nil, want *UpstreamError")
+		}
+		if got.Kind != KindClient {
+			t.Errorf("Kind = %v, want KindClient (generic 403 stays a client catch-all)", got.Kind)
+		}
+	})
+
+	t.Run("typed quota envelope still classifies without a 429", func(t *testing.T) {
+		// The kindByErrorType path stays status-ungated on purpose: an
+		// explicit error.type is the gateway's own verdict (spec §4
+		// type-over-status, same principle as the ModelError trap).
+		got := Classify(503, errEnvelope("FreeUsageLimitError", "daily usage limit exceeded"), "")
+		if got == nil {
+			t.Fatal("Classify returned nil, want *UpstreamError")
+		}
+		if got.Kind != KindDailyLimit {
+			t.Errorf("Kind = %v, want KindDailyLimit (typed path ungated)", got.Kind)
 		}
 	})
 }

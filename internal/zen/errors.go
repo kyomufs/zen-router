@@ -1,8 +1,9 @@
 // Upstream error classification: ported from dsh-opencode-zen lib/index.js
-// v0.15.1 (DAILY_LIMIT_RE at line 405, gatewayError/httpFailure at lines
-// 700-770, parseRetryAfter, DAILY_LIMIT_RE raw-body match at line 1405)
-// onto the Kind taxonomy of spec §4 of the gateway design ("Error
-// envelopes", design doc lines 139-150).
+// v0.15.1 (DAILY_LIMIT_RE at line 404, gatewayError at 792, httpFailure at
+// 804, parseRetryAfter at 857, DAILY_LIMIT_RE raw-body match at line 1583
+// behind the plugin's status !== 429 guard at line 1579) onto the Kind
+// taxonomy of spec §4 of the gateway design ("Error envelopes", design doc
+// lines 139-150).
 package zen
 
 import (
@@ -78,9 +79,11 @@ func (k Kind) String() string {
 	}
 }
 
-// dailyLimitRe mirrors the plugin's DAILY_LIMIT_RE (lib/index.js:405)
+// dailyLimitRe mirrors the plugin's DAILY_LIMIT_RE (lib/index.js:404)
 // verbatim. It runs against the RAW body text: relayed provider bodies keep
-// the gateway class names inside free text (lib/index.js:1405 tests raw).
+// the gateway class names inside free text (lib/index.js:1583 tests raw).
+// Like the plugin, classify only trusts this text behind a 429 — golden
+// guards the same match with `status !== 429` at lib/index.js:1579 (DM-7).
 var dailyLimitRe = regexp.MustCompile(`FreeUsageLimitError|GoUsageLimitError|BlackUsageLimitError`)
 
 // relayMarker is the spec §4 relay prefix ("Error from provider (Name): ").
@@ -151,8 +154,11 @@ func (e *UpstreamError) IsRetryable() bool {
 // needed and tests stay trivial. body is the raw response body.
 //
 // Precedence (ported from the plugin):
-//  1. daily-limit regex on the RAW body text first — relayed provider
-//     bodies carry the gateway class names in free text (index.js:1405);
+//  1. daily-limit regex on the RAW body text first, but only behind a 429
+//     (the plugin gates the same match the same way: index.js:1579 guards
+//     the raw test at :1583) — relayed provider bodies carry the gateway
+//     class names in free text, yet a non-429 body quoting a class name is
+//     not a quota signal (DM-7);
 //  2. parsed error.type — gateway envelope
 //     {"type":"error","error":{"type","message"}}, tolerated OpenAI-style
 //     {"error":{...}} and bare {"message":...}, also parsed from inside a
@@ -188,7 +194,11 @@ func classify(now time.Time, status int, body []byte, retryAfterHeader string) *
 
 	var kind Kind
 	switch {
-	case dailyLimitRe.Match(body):
+	case status == 429 && dailyLimitRe.Match(body):
+		// DM-7: free text counts only with a 429 corroboration (golden
+		// guards the same regex at index.js:1579). The kindByErrorType
+		// path below stays ungated — an explicit error.type is stronger
+		// evidence than free text (spec §4 type-over-status).
 		kind = KindDailyLimit
 	default:
 		if k, known := kindByErrorType[typ]; known {
