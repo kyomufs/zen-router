@@ -22,13 +22,12 @@ Solves three problems the previous JS-only plugin could not:
 | A | Gateway shim (OpenAI surface, Zen wire port, watchdogs, error classification) | **done** |
 | B | Staged rotation (key pool, identity pool, router stage machine) | **done** |
 | C | TUI dashboard + systemd installer | **done** |
-| D | Thin DSH plugin (entry point only) | **done** — rewritten in `dsh-opencode-zen` repo, not installed yet |
-| E | README, deferred-minor cleanup, live verification | in progress — `docs/superpowers/checklists/phase-e.md` |
+| D | Thin DSH plugin (entry point only) | **done** — rewritten in `dsh-opencode-zen` repo, installed as v0.16.0 |
+| E | README, deferred-minor cleanup, live verification | **done** — `docs/superpowers/checklists/phase-e.md` (all boxes ticked, 2026-10-08) |
 
-The **installed** `dsh-opencode-zen` plugin (v0.15.1, transport-proxy variant) is
-**not** touched until the user's explicit go-ahead (see
-`docs/superpowers/specs/…-gateway-design.md` §12); the rebuilt thin v0.16.0 waits
-for the Phase E cutover (`docs/superpowers/cutover-plan3-thin.md`).
+The installed `dsh-opencode-zen` plugin is now the thin **v0.16.0** (pin `9890e55`),
+cut over on 2026-10-08 with a user-managed DSH restart (record in
+`docs/superpowers/cutover-plan3-thin.md`); rolling back re-pins `a416790`.
 
 ## Build and test
 
@@ -116,4 +115,5 @@ docs/superpowers/      spec, plans, ledger, checklists
 ## Safety
 
 Live-gateway calls, plugin installation, DSH restarts, and systemd unit installs
-are gated on explicit user approval — see `docs/superpowers/checklists/phase-e.md`.
+were gated on explicit user approval and executed on 2026-10-08 — see
+`docs/superpowers/checklists/phase-e.md`.
