@@ -214,16 +214,18 @@ binary (Steps 4+ are prerequisites, not mutations of the plugin).
   — `package.json:13` = new SHA, `a416790` hits = 0, installed node_modules = v0.16.0
   (thin, `main: lib/index.js`).
 - **Step 2 DONE**: `dsh --profile web --dump-config` → rc=0, **stderr 0 bytes**.
-- **Step 3 PENDING**: DSH restart is user-managed — pid 5463 (started 12:51:22, i.e.
-  before the pin move) was still running at last check.
+- **Step 3 DONE**: user-restarted DSH 2026-10-08 15:54:24 (pid 35271 replaced 5463
+  started 12:51:22 — after the pin move); profile process now runs plugin v0.16.0.
 - **Step 4 DONE (via phase-e Part 2b, as this doc anticipated)**: binary rebuilt
   2026-10-08 14:55:01 (atomic stop → install → start), live unit is the
   `zen-router install-systemd` output (pid 31217), `zen-router help` lists `tui`,
   `install-systemd [--remove]`, `up --detach`.
-- **Step 5 PARTIAL (daemon side live-checked)**: `GET /v1/models` → 200 both bare and
-  with `Authorization: Bearer zen-test-key`; error envelope live →
-  `400 {"error":{"code":"InvalidRequestError","message":"…","type":"InvalidRequestError"}}`
-  (the exact `error.type` shape the thin-plugin parser keys on); session/sticky
-  derivation covered by `zen.DeriveRequestIDs` parity + `session_test.go`. The
-  opencode.ai chat round-trip through the thin plugin (stream + non-stream) awaits
-  step 3.
+- **Step 5 DONE (stream live post-restart + non-stream live + daemon-side wire)**:
+  `GET /v1/models` → 200 both bare and with `Authorization: Bearer zen-test-key`;
+  error envelope live → `400 {"error":{"code":"InvalidRequestError","message":"…","type":"InvalidRequestError"}}`;
+  STREAM — this session's post-restart chat calls move gateway TTFB direct
+  4→11 / quota `direct.ok` 5→12 (lastOkAt updating 16:10→16:15) through the
+  adapter's only transport; NON-STREAM — live `stream:false` POST →
+  `200 chat.completion` "pong" (5.0s) through the daemon (the thin adapter
+  itself is stream-only by plan-3 design); sticky/session derivation via
+  `zen.DeriveRequestIDs` parity + `session_test.go` (daemon-side, spec:109).

@@ -69,6 +69,7 @@ Workspace `.superpowers/sdd/plan3/` archived to Trash after close (reports/revie
 
 - Step 1 DONE: pin moved `a416790` → `9890e557734e780f406232c6d85ec2e2427c1c96` via `dsh plugin --profile web add`; package.json:13 = new SHA, `a416790` hits = 0, node_modules version 0.16.0 (thin, main lib/index.js).
 - Step 2 DONE: `dsh --profile web --dump-config` rc=0, stderr 0 bytes (1613-line dump, plugin present).
-- Step 3 OPEN: DSH restart — user-managed (signal given 2026-10-08).
-- Step 4-5 OPEN: live opencode.ai stream + non-stream through thin plugin, wire checks (Bearer, stickyId, error.type) — after restart.
+- Step 3 DONE: DSH restarted by user 2026-10-08 15:54:24, pid 35271 (replaced 5463, started 12:51:22 pre-pin) — profile runs plugin v0.16.0 from the pinned node_modules.
+- Step 4 DONE: live STREAM — post-restart chat of the operating session flows adapter → daemon → opencode.ai (gateway TTFB direct 4→11, quota direct.ok 5→12, lastOkAt 16:10→16:15; adapter transport = loopback-only, lib/index.js:10/345, `stream:true` forced :333); live NON-STREAM — `stream:false` POST → `200 chat.completion` "pong" 5.0s through the daemon (adapter has no non-stream lane by plan-3 design — ruled in phase-e evidence).
+- Step 5 DONE (wire): auth header conditional on OPENCODE_ZEN_API_KEY (absent in DSH 35271 → omitted by design; daemon accepts Bearer → live 200); attribution impl null (no dsh-llm peer in profile; golden a416790 had 0 attribution code → parity); stickyId = daemon-side `zen.DeriveRequestIDs` (session.go:113 parity + tests, spec:109); error envelope live `400 {"error":{"type":"InvalidRequestError",…}}` matches golden lib/index.js:1044-1047 the parser keys on.
 - Step 6 DONE: rebuilt binary mtime 14:55:01 == running daemon (pid 31217, same path), phase-e.md:112 ticked.

@@ -130,10 +130,38 @@ keep gates green (`gofmt -l .`, `go build ./...`, `go vet ./...`,
       reports version 0.16.0 (thin, main lib/index.js).
 - [x] `dsh --profile web --dump-config` — no stderr warnings.
       — DONE: rc=0, stderr 0 bytes (1613-line dump), plugin name present in output.
-- [ ] DSH restart (HMR not sufficient for profile install).
-- [ ] Live opencode.ai calls through the daemon via the thin plugin (stream + non-stream).
-- [ ] Wire check: `Authorization: Bearer`, stickyId, error envelope reads
+- [x] DSH restart (HMR not sufficient for profile install).
+      — DONE 2026-10-08 15:54:24: new pid 35271 (replaced 5463 started 12:51:22,
+      i.e. before the pin move); this process loaded plugin v0.16.0 from the
+      pinned node_modules (9890e55). Verified `ps -o pid,lstart`.
+- [x] Live opencode.ai calls through the daemon via the thin plugin (stream + non-stream).
+      — DONE 2026-10-08: STREAM — post-restart chat calls of this session flow
+      plugin → 127.0.0.1:8787 → opencode.ai (the adapter's only transport,
+      lib/index.js:10/345; `stream:true` forced :333); evidence: gateway TTFB
+      direct count 4→11 and quota `direct.ok` 5→12 with lastOkAt updating
+      (16:10→16:15) during this session's generations, every 2xx → ok++
+      (internal/router/router.go:280, internal/quota/state.go:318). NON-STREAM —
+      live `POST /v1/chat/completions` with `stream:false` →
+      `200 chat.completion {"content":"pong"}` 5.0s through the daemon.
+      Ruling: thin plugin has NO non-stream lane by design (single POST,
+      stream:true — plan-3 ruling; host always streams) — non-stream exercised
+      through the daemon layer directly.
+- [x] Wire check: `Authorization: Bearer`, stickyId, error envelope reads
       `error.type` (new OpenAI shape confirmed compatible with thin-plugin parser).
+      — DONE 2026-10-08: (a) auth header built only when OPENCODE_ZEN_API_KEY set
+      (lib/index.js:343-344); env absent in DSH 35271 (environ count 0) → live wire
+      omits it by design (key optional per plan-3); daemon accepts Bearer → live
+      `GET /v1/models` 200 with `Bearer zen-test-key`. Attribution: dsh-llm peer
+      absent in profile (attributionHeaders grep hits only the plugin itself) →
+      impl null → live header set = content-type only; golden a416790 had zero
+      attribution code (grep count 0) → wire parity. (b) stickyId: adapter sends no
+      session/workspace headers and derives nothing; derivation is server-side —
+      daemon `zen.DeriveRequestIDs` (internal/zen/session.go:113, mirrors golden
+      `deriveRequestIDs`, session_test.go) → upstream opencode hash-selects the
+      same sticky per spec:109; live completion returns stable `id`. (c) error
+      type: live daemon envelope `400 {"error":{message,type:"InvalidRequestError",code}}`
+      matches golden shape (lib/index.js:1044-1047) the thin parser keys on;
+      mapping pinned by the 64-test suite.
 - [x] Rebuilt `~/.local/bin/zen-router` matching the daemon the plugin talks to.
       — DONE: binary mtime 2026-10-08 14:55:01, live daemon pid 31217 runs
       `/home/kyomufs/.local/bin/zen-router up` (same path, started 15:24:37).
