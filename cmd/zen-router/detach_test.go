@@ -354,7 +354,7 @@ func waitStatus(t *testing.T, listen string, timeout time.Duration) *cli.Status 
 		if err != nil {
 			last = err
 		} else {
-			last = fmt.Errorf("status up=false (listen=%q, mode=%q)", st.Listen, st.Mode)
+			last = fmt.Errorf("status up=false (listen=%q, pid=%d)", st.Listen, st.Pid)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

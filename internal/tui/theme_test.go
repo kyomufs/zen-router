@@ -39,7 +39,6 @@ func TestNewThemeAdaptsToBackground(t *testing.T) {
 	}{
 		{"accent", dark.accent, light.accent},
 		{"direct", dark.direct, light.direct},
-		{"warp", dark.warp, light.warp},
 		{"ok", dark.ok, light.ok},
 		{"warn", dark.warn, light.warn},
 		{"err", dark.err, light.err},

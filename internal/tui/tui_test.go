@@ -67,8 +67,6 @@ func upStatus() *cli.Status {
 		Listen:        "127.0.0.1:8787",
 		Pid:           4242,
 		UptimeSeconds: 7,
-		Mode:          "direct",
-		Current:       "direct",
 	}
 }
 

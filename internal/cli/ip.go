@@ -106,16 +106,15 @@ func (e *httpEchoer) EgressIP(ctx context.Context) (string, error) {
 
 // EgressIPTracker holds the last observed egress IP and schedules debounced
 // refreshes. It starts STALE (never observed) and becomes stale again after
-// every effective change of the active egress — rotation (identity switch,
-// direct fallback, manual mode switch via Router.Use — Router.OnRotated →
-// Refresh) — or a failed attempt: in this daemon the egress IP follows the
-// active transport, so a clean value only changes when that transport does.
+// every effective change of the active egress — or a failed attempt: in this
+// daemon the egress IP follows the active transport, so a clean value only
+// changes when that transport does.
 //
 // Refresh also bumps a staleness GENERATION counter: maybeStart snapshots it
 // into the spawned attempt, and run clears the stale flag only when the
-// generation is unchanged — a rotation landing WHILE an attempt is in flight
-// cannot be lost to the in-flight result (it carries the pre-rotation IP);
-// staleness survives the commit and forces a follow-up attempt.
+// generation is unchanged — a transport change landing WHILE an attempt is in
+// flight cannot be lost to the in-flight result (it carries the pre-change
+// IP); staleness survives the commit and forces a follow-up attempt.
 //
 // Debounce rule (both triggers funnel into maybeStart):
 //   - at most ONE echo in flight (inFlight gate);
@@ -165,11 +164,11 @@ func (t *EgressIPTracker) IP() string {
 	return t.ip
 }
 
-// Refresh is the egress-changed trigger (Router.OnRotated): it marks the
-// value stale, bumps the staleness generation (so any attempt already in
-// flight cannot clear the flag with a pre-change result), and starts an echo
-// immediately when the debounce window allows — otherwise the next status
-// read picks it up once the window elapses.
+// Refresh marks the value stale, bumps the staleness generation (so any
+// attempt already in flight cannot clear the flag with a pre-change result),
+// and starts an echo immediately when the debounce window allows — otherwise
+// the next status read picks it up once the window elapses. Callers: daemon
+// startup and any explicit egress-changed notification.
 func (t *EgressIPTracker) Refresh() {
 	if t == nil {
 		return

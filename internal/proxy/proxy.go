@@ -14,10 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-
-	"zen-router/internal/warp"
 )
 
 // Upstream is the real zen gateway the proxy forwards to.
@@ -39,7 +36,6 @@ type Egress string
 
 const (
 	EgressDirect Egress = "direct"
-	EgressWarp   Egress = "warp"
 )
 
 // peekBody tees the first peekLimit bytes so the proxy can sniff the gateway's
@@ -260,67 +256,3 @@ func defaultTransport(dialer *net.Dialer) *http.Transport {
 
 // DirectTransport routes through the normal system path (FlClash TUN).
 func DirectTransport() http.RoundTripper { return defaultTransport(nil) }
-
-// WarpTransport builds a transport that pins every connection to the WireGuard
-// device via SO_BINDTODEVICE, so only this process's traffic enters the tunnel.
-// DNS is resolved through DoH (resolver) so the WARP peer sees a real address
-// rather than FlClash's fake-IP mapping.
-func WarpTransport(device string, resolver *warp.Resolver) (http.RoundTripper, error) {
-	if device == "" {
-		return nil, fmt.Errorf("warp transport requires a device name")
-	}
-	// Resolve via DoH, then dial the concrete IP. TLS still validates the
-	// original hostname because net/http sets ServerName from the URL host.
-	var resolve func(host string) (string, error)
-	if resolver != nil {
-		resolve = func(host string) (string, error) {
-			if ip := net.ParseIP(host); ip != nil {
-				return host, nil
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			ips, err := resolver.LookupIP(ctx, host)
-			if err != nil {
-				return "", err
-			}
-			return ips[0].String(), nil
-		}
-	} else {
-		resolve = func(host string) (string, error) {
-			if ip := net.ParseIP(host); ip != nil {
-				return host, nil
-			}
-			ips, err := net.LookupIP(host)
-			if err != nil {
-				return "", err
-			}
-			return ips[0].String(), nil
-		}
-	}
-
-	dialer := &net.Dialer{Timeout: 20 * time.Second, KeepAlive: 30 * time.Second}
-	dialer.Control = func(network, address string, c syscall.RawConn) error {
-		var opErr error
-		if err := c.Control(func(fd uintptr) {
-			opErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-				syscall.SO_BINDTODEVICE, device)
-		}); err != nil {
-			return err
-		}
-		return opErr
-	}
-
-	tr := defaultTransport(dialer)
-	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		ip, err := resolve(host)
-		if err != nil {
-			return nil, fmt.Errorf("doh resolve %s: %w", host, err)
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-	}
-	return tr, nil
-}

@@ -4,7 +4,7 @@ package tui
 // RED first):
 //
 //   - tab / shift+tab cycle the focused panel (egress quota -> key quota ->
-//     identity pool -> rotation history -> log tail -> wrap). The focused
+//     log tail -> wrap). The focused
 //     panel is highlighted, so every step changes the frame and a full
 //     cycle of focusPanels steps restores it byte-identical;
 //   - ? toggles a full-screen keyboard overlay: while open the dashboard
@@ -24,8 +24,8 @@ import (
 )
 
 // focusPanels: number of focusable panels in the tab order (egress quota,
-// key quota, identity pool, rotation history, log tail).
-const focusPanels = 5
+// key quota, log tail).
+const focusPanels = 3
 
 func tabMsg() tea.KeyPressMsg {
 	return tea.KeyPressMsg{Code: tea.KeyTab}
@@ -120,9 +120,6 @@ func TestHelpOverlayToggles(t *testing.T) {
 	// Every binding is listed.
 	for _, want := range []string{
 		"quit",
-		"rotate now",
-		"direct egress",
-		"warp egress",
 		"start/stop daemon",
 		"next panel",
 		"previous panel",

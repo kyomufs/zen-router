@@ -74,12 +74,14 @@ const (
 	// Display markers: values planted at RENDERED paths. Their presence
 	// proves the fixture actually flows into the view, keeping the
 	// absence checks non-vacuous — they are deliberately not secret-shaped.
-	hcSpareMarker  = "spare-hardening-marker"
+	// The error bodies stay short and hyphen-free on purpose: the matrix
+	// asserts markers by substring, and the 80-column wrap breaks words at
+	// hyphens, which would split a long marker across two rendered lines.
 	hcLogMarker    = "hardening log marker line"
 	hcLogErrMarker = "hardening log read refused"
-	hcErr409Body   = "errbody-hardening-409"
-	hcStopErrBody  = "stopbody-hardening-rejected"
-	hcSpawnErrBody = "spawnbody-hardening-rejected"
+	hcErr409Body   = "err409"
+	hcStopErrBody  = "stop409"
+	hcSpawnErrBody = "spawn409"
 )
 
 // hcSecretCanaries lists every secret value planted anywhere in the
@@ -92,39 +94,29 @@ var hcSecretCanaries = []string{
 	hcRawStateKey,
 }
 
-// hcActionMarkers are the four mutually exclusive action-line states; each
+// hcActionMarkers are the three mutually exclusive action-line states; each
 // matrix cell must render exactly the one its action case expects (or none)
 // so the states cannot bleed into one another.
-var hcActionMarkers = []string{"in flight", "rotate failed", "start daemon failed", "stop daemon failed"}
+var hcActionMarkers = []string{"in flight", "start daemon failed", "stop daemon failed"}
 
 // --- fixtures ----------------------------------------------------------------
 
 // hardeningStatusJSON builds one of the three status fixtures through the
-// exact JSON contract the control API serves. Every fixture carries the
-// credential canaries (warp block; identities where they exist) and, for
-// the full-fat variants, a raw state key beside the fingerprinted one.
+// exact JSON contract the control API serves. Every fixture still carries
+// the legacy credential canaries (warp block, identities) even though the
+// direct-only control API never sends them — the decode layer must keep
+// dropping those fields, so the canaries can never reach the view — and,
+// for the full-fat variant, a raw state key beside the fingerprinted one.
 func hardeningStatusJSON(t *testing.T, kind string) string {
 	t.Helper()
 	spentEgress := time.Now().Add(2 * time.Hour).UnixMilli()
 	spentKey := time.Now().Add(90 * time.Minute).UnixMilli()
 
-	var rots strings.Builder
-	for i := 1; i <= 60; i++ {
-		if i > 1 {
-			rots.WriteByte(',')
-		}
-		fmt.Fprintf(&rots,
-			`{"at":%d,"from":"direct","to":"warp","reason":"rotation-%02d"}`,
-			1759700000000+int64(i)*1000, i)
-	}
-
-	// per-kind values: full and spare differ only in the spare-error line
-	// and the rotating/registering flags; degenerate empties every table.
-	rotating, registering := "false", "false"
-	spareErr := `""`
-	latTTFB := `{"direct": {"last_ms": 12, "avg_ms": 14, "count": 3}, "warp": {"last_ms": 30, "avg_ms": 31, "count": 4}}`
-	latStream := `{"direct": {"last_ms": 50, "avg_ms": 55, "count": 2}, "warp": {"last_ms": 60, "avg_ms": 61, "count": 5}}`
-	egress := fmt.Sprintf(`{"direct": {"ok": 11, "daily429": 2, "spentUntil": %d}, "warp": {"ok": 7, "daily429": 0}}`, spentEgress)
+	// per-kind values: degenerate empties every table; full keeps one row
+	// per table (direct egress only — the warp lane is gone).
+	latTTFB := `{"direct": {"last_ms": 12, "avg_ms": 14, "count": 3}}`
+	latStream := `{"direct": {"last_ms": 50, "avg_ms": 55, "count": 2}}`
+	egress := fmt.Sprintf(`{"direct": {"ok": 11, "daily429": 2, "spentUntil": %d}}`, spentEgress)
 	keys := fmt.Sprintf(`{"deadbeef": {"ok": 5, "daily429": 1, "spentUntil": %d}, %q: {"ok": 2, "daily429": 0}}`,
 		spentKey, hcRawStateKey)
 	identities := fmt.Sprintf(`[
@@ -133,19 +125,13 @@ func hardeningStatusJSON(t *testing.T, kind string) string {
     ]`,
 		hcIdent0Token, hcIdent0Lic, hcIdent0Priv,
 		hcIdent1Token, hcIdent1Lic, hcIdent1Priv)
-	active := 1
-	rotsJSON := rots.String()
 
 	switch kind {
 	case "full":
-	case "spare":
-		rotating, registering = "true", "true"
-		spareErr = fmt.Sprintf("%q", "spare registration rejected: "+hcSpareMarker)
 	case "degenerate":
 		latTTFB, latStream = `{}`, `{}`
-		egress, keys, rotsJSON = `{}`, `{}`, ""
+		egress, keys = `{}`, `{}`
 		identities = `[]`
-		active = 0
 	default:
 		t.Fatalf("unknown hardening status kind %q", kind)
 	}
@@ -156,34 +142,32 @@ func hardeningStatusJSON(t *testing.T, kind string) string {
 
 	return fmt.Sprintf(`{
   "mode": "auto",
-  "current": "warp",
+  "current": "direct",
   "up": true,
   "listen": "127.0.0.1:8787",
   "pid": 4242,
   "uptime_seconds": 7,
   "last_rotate": "2026-10-06T12:00:00Z",
-  "rotating": %s,
-  "registering": %s,
-  "lastSpareError": %s,
+  "rotating": false,
+  "registering": false,
+  "lastSpareError": "",
   "egress_ip": "198.51.100.9",
   "latency_ttfb_ms": %s,
   "latency_stream_ms": %s,
   "state": {
     "version": 2,
     "mode": "auto",
-    "current": "warp",
+    "current": "direct",
     "updatedAt": 1759700000000,
     "egress": %s,
     "keys": %s,
     "warp": %s,
     "identities": %s,
-    "active": %d,
-    "rotations": [%s]
+    "active": 1
   }
 }`,
-		rotating, registering, spareErr,
 		latTTFB, latStream,
-		egress, keys, warpIdentity, identities, active, rotsJSON)
+		egress, keys, warpIdentity, identities)
 }
 
 // --- matrix dimensions -------------------------------------------------------
@@ -191,7 +175,7 @@ func hardeningStatusJSON(t *testing.T, kind string) string {
 // hcDaemon is one screen state of the status/poll dimension.
 type hcDaemon struct {
 	name    string
-	kind    string // "wait" | "full" | "spare" | "degenerate" | "down"
+	kind    string // "wait" | "full" | "degenerate" | "down"
 	pollErr error
 
 	// want markers that must render at every terminal size; wantWide row
@@ -203,13 +187,17 @@ type hcDaemon struct {
 }
 
 func hcDaemons() []hcDaemon {
-	upAbsent := []string{"daemon: down", "daemon: waiting"}
-	upTitles := []string{
-		"quota (per egress)", "quota (per key)",
-		"identity pool (2, active 1)", "rotation history (last 50)",
+	upAbsent := []string{
+		"daemon: down", "daemon: waiting",
+		// rows removed by the direct-only excision — every up cell must
+		// keep asserting they never come back:
+		"mode:", "egress: ", "last rotate", "rotating:", "registering:",
+		"spare registration", "identity pool", "rotation history",
 	}
+	upTitles := []string{"quota (per egress)", "quota (per key)"}
 	downAbsent := []string{
-		"daemon: up", "quota (per egress)", "identity pool", "rotation history",
+		"daemon: up", "quota (per egress)",
+		"mode:", "last rotate", "identity pool", "rotation history",
 	}
 	return []hcDaemon{
 		{
@@ -221,27 +209,11 @@ func hcDaemons() []hcDaemon {
 			name: "up-full", kind: "full",
 			want: append([]string{
 				"daemon: up | listen: 127.0.0.1:8787 | pid: 4242 | uptime: 7s",
-				"mode: auto | egress: warp | ip: 198.51.100.9",
-				"last rotate: 2026-10-06T12:00:00Z | rotating: false | registering: false",
-				"latency ttfb: direct 12/14ms (n=3), warp 30/31ms (n=4)",
-				"latency stream: direct 50/55ms (n=2), warp 60/61ms (n=5)",
+				"ip: 198.51.100.9",
+				"latency ttfb: direct 12/14ms (n=3)",
+				"latency stream: direct 50/55ms (n=2)",
 			}, upTitles...),
-			wantWide: []string{"deadbeef", "dev-hardening-a", "dev-hardening-b", "rotation-60"},
-			// rotation-01..10 fall out of the newest-50 window (existing
-			// cap test owns that assertion; the fixture still proves the
-			// full-vs-empty axis via rotation-60 above).
-			wantAbsent: upAbsent,
-		},
-		{
-			name: "up-spare", kind: "spare",
-			want: append([]string{
-				"daemon: up | listen: 127.0.0.1:8787 | pid: 4242 | uptime: 7s",
-				"rotating: true | registering: true",
-				"spare registration error: ",
-				hcSpareMarker,
-				"latency ttfb: direct 12/14ms (n=3), warp 30/31ms (n=4)",
-			}, upTitles...),
-			wantWide:   []string{"deadbeef", "dev-hardening-a", "rotation-60"},
+			wantWide:   []string{"deadbeef"},
 			wantAbsent: upAbsent,
 		},
 		{
@@ -249,11 +221,10 @@ func hcDaemons() []hcDaemon {
 			want: []string{
 				"daemon: up | listen: 127.0.0.1:8787 | pid: 4242 | uptime: 7s",
 				"quota (per egress)", "quota (per key)",
-				"identity pool (0, active 0)", "rotation history (last 50)",
 				"latency ttfb: no samples", "latency stream: no samples",
 			},
 			// empty fixtures: every table is header-only, no row content.
-			wantAbsent: append(upAbsent, "deadbeef", "rotation-60", "dev-hardening-a"),
+			wantAbsent: append(upAbsent, "deadbeef"),
 		},
 		{
 			name: "down-not-running", kind: "down", pollErr: errDaemonDown,
@@ -302,20 +273,20 @@ func hcLogs() []hcLog {
 	}
 }
 
-// hcAction is the action dimension: none, in-flight spinner, a 409 rotate
-// error carrying the ESC canary, and the s-key spawn/stop error (its label
-// depends on daemon polarity — down spawns, up stops).
+// hcAction is the action dimension: none, in-flight spinner, and the
+// s-key spawn/stop error (its label depends on daemon polarity — down
+// spawns, up stops). The stop error carries the 409 body plus the ESC
+// canary, so the sanitizer's escape discipline stays asserted.
 type hcAction struct {
 	name string
-	kind string // "none" | "pending" | "err-rotate" | "err-spawn-stop"
+	kind string // "none" | "pending" | "err-spawn-stop"
 }
 
 func hcActions() []hcAction {
 	return []hcAction{
 		{name: "none", kind: "none"},
 		{name: "pending", kind: "pending"},
-		{name: "err-rotate-409", kind: "err-rotate"},
-		{name: "err-spawn-stop", kind: "err-spawn-stop"},
+		{name: "err-spawn-stop-409", kind: "err-spawn-stop"},
 	}
 }
 
@@ -445,14 +416,15 @@ func hcActionWants(dc hcDaemon, ac hcAction) []string {
 	case "none":
 		return nil
 	case "pending":
-		return []string{"rotate in flight"}
-	case "err-rotate":
-		return []string{"rotate failed: ", hcErr409Body, hcActionESCText}
+		if dc.kind == "down" {
+			return []string{"start daemon in flight"}
+		}
+		return []string{"stop daemon in flight"}
 	case "err-spawn-stop":
 		if dc.kind == "down" {
 			return []string{"start daemon failed: ", hcSpawnErrBody}
 		}
-		return []string{"stop daemon failed: ", hcStopErrBody}
+		return []string{"stop daemon failed: ", hcErr409Body, hcStopErrBody, hcActionESCText}
 	default:
 		return nil
 	}
@@ -496,7 +468,7 @@ func assertCell(t *testing.T, phase string, content string, dc hcDaemon, lc hcLo
 				phase, marker, dc.name, ac.name)
 		}
 	}
-	if ac.kind == "err-rotate" && strings.Contains(content, hcActionESC) {
+	if strings.Contains(joined, hcActionESCText) && strings.Contains(content, hcActionESC) {
 		t.Errorf("[%s] data-borne escape survived sanitizeActionErr: %q", phase, hcActionESC)
 	}
 
@@ -513,33 +485,27 @@ func assertCell(t *testing.T, phase string, content string, dc hcDaemon, lc hcLo
 	}
 }
 
-// applyHardeningAction drives one action case into the model. The pending
-// case deliberately discards the command so the request stays in flight
-// (spinner armed, completion never delivered).
+// applyHardeningAction drives one action case into the model. Both live
+// cases go through the two-step `s`: the pending case deliberately
+// discards the command so the request stays in flight (spinner armed,
+// completion never delivered), the error case runs it to completion.
 func applyHardeningAction(t *testing.T, m Model, ac hcAction) Model {
 	t.Helper()
 	switch ac.kind {
 	case "none":
 		return m
-	case "pending":
-		next, cmd := actionKey(t, m, "r")
+	case "pending", "err-spawn-stop":
+		next, cmd := actionKey(t, m, "s")
 		if cmd == nil {
-			t.Fatal("pending: r must queue the rotate request")
-		}
-		return next
-	case "err-rotate", "err-spawn-stop":
-		key := "r"
-		if ac.kind == "err-spawn-stop" {
-			key = "s"
-		}
-		next, cmd := actionKey(t, m, key)
-		if cmd == nil && key == "s" {
 			// Two-step stop: on an up daemon the first `s` only arms the
 			// confirmation; the down/spawn path fires on the first press.
-			next, cmd = actionKey(t, next, key)
+			next, cmd = actionKey(t, next, "s")
 		}
 		if cmd == nil {
-			t.Fatalf("%s: %s must queue the request", ac.name, key)
+			t.Fatalf("%s: s must queue the request", ac.name)
+		}
+		if ac.kind == "pending" {
+			return next
 		}
 		done := runActionBatch(t, cmd)
 		after, _ := update(t, next, done)
@@ -559,8 +525,9 @@ func applyHardeningAction(t *testing.T, m Model, ac hcAction) Model {
 // Documented skips (both structural, not omissions):
 //   - wait × log seam: log data arrives only inside a statusMsg; a model
 //     that never polled has an empty tail by construction;
-//   - wait × err-spawn-stop: `s` is a documented no-op before the first
-//     poll (tui.go key switch — up/down unknown).
+//   - wait × any action: `s` is a documented no-op before the first
+//     poll (tui.go key switch — up/down unknown), so no command can
+//     ever be queued on a pre-poll model.
 func TestHardeningMatrix(t *testing.T) {
 	for _, dc := range hcDaemons() {
 		for _, lc := range hcLogs() {
@@ -568,7 +535,7 @@ func TestHardeningMatrix(t *testing.T) {
 				continue
 			}
 			for _, ac := range hcActions() {
-				if dc.kind == "wait" && ac.kind == "err-spawn-stop" {
+				if dc.kind == "wait" && ac.kind != "none" {
 					continue
 				}
 				t.Run(dc.name+"/"+lc.name+"/"+ac.name, func(t *testing.T) {
@@ -584,8 +551,8 @@ func runHardeningCell(t *testing.T, dc hcDaemon, lc hcLog, ac hcAction) {
 
 	src := &actionFake{
 		fakeSource: newFake(hcPollResult(t, dc)),
-		rotateErr:  errors.New("HTTP 409 conflict: " + hcErr409Body + " " + hcActionESC),
-		stopErr:    errors.New(hcStopErrBody),
+		stopErr: errors.New("HTTP 409 conflict: " +
+			hcErr409Body + " " + hcStopErrBody + " " + hcActionESC),
 	}
 	opts := []Option{
 		WithSpawner(func(context.Context) error { return errors.New(hcSpawnErrBody) }),
@@ -628,7 +595,8 @@ func TestRecoveringDownToUpKeepsStateComposed(t *testing.T) {
 			fakeResult{err: errDaemonDown},
 			fakeResult{status: up}, // last repeats: recovery sticks
 		),
-		rotateErr: errors.New("HTTP 409 conflict: " + hcErr409Body + " " + hcActionESC),
+		stopErr: errors.New("HTTP 409 conflict: " +
+			hcErr409Body + " " + hcStopErrBody + " " + hcActionESC),
 	}
 	m := New(src,
 		WithSpawner(func(context.Context) error { return errors.New(hcSpawnErrBody) }),
@@ -648,12 +616,19 @@ func TestRecoveringDownToUpKeepsStateComposed(t *testing.T) {
 	assertOnlyStylingEscapes(t, "recovery/up", c)
 	assertNoSecretCanaries(t, "recovery/up", c)
 
-	// Step 2: rotate fails with 409 (ESC canary sanitized).
-	m, cmd := actionKey(t, m, "r")
+	// Step 2: stop fails with 409 (ESC canary sanitized) — two-step `s`.
+	m, cmd := actionKey(t, m, "s")
+	if cmd != nil {
+		t.Fatal("[recovery/action-409] first `s` must arm the confirmation, not fire the stop")
+	}
+	m, cmd = actionKey(t, m, "s")
+	if cmd == nil {
+		t.Fatal("[recovery/action-409] second `s` must queue the stop request")
+	}
 	done := runActionBatch(t, cmd)
 	m, _ = update(t, m, done)
 	c = assertStableView(t, "recovery/action-409", m)
-	for _, want := range []string{"daemon: up", "rotate failed: ", hcErr409Body, hcActionESCText} {
+	for _, want := range []string{"daemon: up", "stop daemon failed: ", hcErr409Body, hcStopErrBody, hcActionESCText} {
 		if !strings.Contains(c, want) {
 			t.Errorf("[recovery/action-409] marker %q missing", want)
 		}
@@ -669,7 +644,7 @@ func TestRecoveringDownToUpKeepsStateComposed(t *testing.T) {
 	m, fetchCmd := update(t, m, pollMsg(time.Now()))
 	m, _ = update(t, m, runCmd(t, fetchCmd))
 	c = assertStableView(t, "recovery/down", m)
-	for _, want := range []string{"daemon: down (", startOffer, "rotate failed: ", hcLogMarker, "quit"} {
+	for _, want := range []string{"daemon: down (", startOffer, "stop daemon failed: ", hcLogMarker, "quit"} {
 		if !strings.Contains(c, want) {
 			t.Errorf("[recovery/down] marker %q missing", want)
 		}
@@ -690,8 +665,8 @@ func TestRecoveringDownToUpKeepsStateComposed(t *testing.T) {
 	c = assertStableView(t, "recovery/recovered", m)
 	for _, want := range []string{
 		"daemon: up | listen: 127.0.0.1:8787",
-		"quota (per egress)", "identity pool (2, active 1)",
-		"rotate failed: ", hcErr409Body, "quit",
+		"quota (per egress)", "quota (per key)",
+		"stop daemon failed: ", hcErr409Body, "quit",
 	} {
 		if !strings.Contains(c, want) {
 			t.Errorf("[recovery/recovered] marker %q missing", want)

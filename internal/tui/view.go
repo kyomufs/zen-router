@@ -1,8 +1,8 @@
 package tui
 
 // Dashboard rendering (plan Task 5 + the approved panel-grid redesign):
-// the screen is a bordered panel grid — 2x2 at >=100 cols, stacked quotas
-// at 80-99, single column below 80 — with a full-width log panel below it
+// the screen is a bordered panel grid — the two quota panels side by side
+// at >=100 cols, stacked below — with a full-width log panel below it
 // and a fixed footer (keys/help line, then the transient action line as
 // the very last line). Panel titles keep the exact literals the hardening
 // matrix asserts; the down daemon has no grid at all (its status block is
@@ -28,28 +28,17 @@ import (
 	"zen-router/internal/cli"
 )
 
-// rotationHistory is how many rotation rows the history table keeps
-// (plan Task 5: an accepted extra beyond spec — data in state.Rotations;
-// the quota store keeps the last 50 rotations, quota.RecordRotation — the
-// view renders that tail).
-const rotationHistory = 50
-
 // Breakpoints for the panel grid (panelgrid_test.go).
 const (
-	midBreakpoint  = 80  // below: single column; at/above: quotas stack, id/rot pair
-	wideBreakpoint = 100 // at/above: full 2x2
+	midBreakpoint  = 80  // below: single column; at/above: quota panels stack
+	wideBreakpoint = 100 // at/above: quota panels side by side
 )
-
-// noIdentities explains an empty pool inside its panel (one budgeted line).
-const noIdentities = "no identities"
 
 // Focusable panels in the tab order (tui.go tab / shift+tab): the focused
 // panel's border/title is highlighted with the accent (focus_help_confirm_test).
 const (
 	focusEgress = iota
 	focusKey
-	focusIdentity
-	focusRotation
 	focusLog
 )
 
@@ -76,8 +65,8 @@ type layoutMode int
 
 const (
 	modeSingle layoutMode = iota // <80 cols (and the unmeasured Phase A frame)
-	modeMid                      // 80-99: quotas stacked, identity/rotation paired
-	modeWide                     // >=100: full 2x2
+	modeMid                      // 80-99: quota panels stacked
+	modeWide                     // >=100: quota panels side by side
 )
 
 func modeOf(width int) layoutMode {
@@ -105,7 +94,7 @@ func (m Model) viewWidth() int {
 	return m.width
 }
 
-// gridMode is the layout of the four quota panels: the unmeasured frame
+// gridMode is the layout of the two quota panels: the unmeasured frame
 // (m.width == 0) stays single-column full-width like the pre-redesign
 // default, so Phase A (hardening matrix, no WindowSizeMsg) renders every
 // row at full interior width with the default column widths.
@@ -116,19 +105,15 @@ func (m Model) gridMode() layoutMode {
 	return modeOf(m.viewWidth())
 }
 
-// panelWidths returns the four panel widths for the mode (a 1-cell gutter
+// panelWidths returns the two panel widths for the mode (a 1-cell gutter
 // separates side-by-side panels; stacked panels take the full width).
-func panelWidths(mode layoutMode, w int) (egW, keyW, idW, rotW int) {
+func panelWidths(mode layoutMode, w int) (egW, keyW int) {
 	half := (w - 1) / 2
 	right := w - 1 - half
-	switch mode {
-	case modeWide:
-		return half, right, half, right
-	case modeMid:
-		return w, w, half, right
-	default:
-		return w, w, w, w
+	if mode == modeWide {
+		return half, right
 	}
+	return w, w
 }
 
 // View assembles the dashboard screen. Pure render — model state only
@@ -176,9 +161,6 @@ func (m Model) View() tea.View {
 func helpOverlayRows() []string {
 	bindings := [][2]string{
 		{"q", "quit"},
-		{"r", "rotate now"},
-		{"d", "direct egress"},
-		{"w", "warp egress"},
 		{"s", "start/stop daemon"},
 		{"tab", "next panel"},
 		{"shift+tab", "previous panel"},
@@ -191,55 +173,31 @@ func helpOverlayRows() []string {
 	return out
 }
 
-// gridPresent reports whether the four quota panels render (poll answered
+// gridPresent reports whether the quota panels render (poll answered
 // without error). Before the first status there is no grid; on error the
 // down panel replaces it.
 func (m Model) gridPresent() bool {
 	return m.err == nil && m.status != nil
 }
 
-// gridLines renders the four quota panels in the mode's shape: paired
+// gridLines renders the two quota panels in the mode's shape: paired
 // panels are joined with a one-cell gutter on one line, stacked panels
 // follow each other.
 func (m Model) gridLines() []string {
-	st := m.status
 	vw := m.viewWidth()
 	mode := m.gridMode()
-	egW, keyW, idW, rotW := panelWidths(mode, vw)
+	egW, keyW := panelWidths(mode, vw)
 
 	egB, egT := m.panelStyle(focusEgress)
 	egP := renderPanel("quota (per egress)", egW, tableLines(m.egressTable), egB, egT)
 	keyB, keyT := m.panelStyle(focusKey)
 	keyP := renderPanel("quota (per key)", keyW, tableLines(m.keyTable), keyB, keyT)
 
-	idBody := tableLines(m.identityTable)
-	if len(m.identityTable.Rows()) == 0 {
-		idBody = append(idBody, m.th.dimText.Render(noIdentities))
+	if mode == modeWide {
+		return joinRow(egP, keyP, egW)
 	}
-	idB, idT := m.panelStyle(focusIdentity)
-	idP := renderPanel(fmt.Sprintf("identity pool (%d, active %d)",
-		len(st.State.Identities), st.State.Active), idW, idBody, idB, idT)
-
-	rotB, rotT := m.panelStyle(focusRotation)
-	rotP := renderPanel("rotation history (last 50)", rotW,
-		tableLines(m.rotationTable), rotB, rotT)
-
-	var out []string
-	switch mode {
-	case modeWide:
-		out = append(out, joinRow(egP, keyP, egW)...)
-		out = append(out, joinRow(idP, rotP, idW)...)
-	case modeMid:
-		out = append(out, egP...)
-		out = append(out, keyP...)
-		out = append(out, joinRow(idP, rotP, idW)...)
-	default:
-		out = append(out, egP...)
-		out = append(out, keyP...)
-		out = append(out, idP...)
-		out = append(out, rotP...)
-	}
-	return out
+	out := append([]string{}, egP...)
+	return append(out, keyP...)
 }
 
 // logPanelLines renders the full-width log panel: the viewport body when
@@ -407,17 +365,10 @@ func (m Model) statusLines() []string {
 		lines = []string{
 			m.wrap(fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
 				orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds))),
-			m.wrap(fmt.Sprintf("mode: %s | egress: %s | ip: %s",
-				orDash(st.Mode), orDash(st.Current), orDash(st.EgressIP))),
-			m.wrap(fmt.Sprintf("last rotate: %s | rotating: %t | registering: %t",
-				orDash(st.LastRotate), st.Rotating, st.Registering)),
-		}
-		if st.LastSpareError != "" {
-			lines = append(lines, m.wrap("spare registration error: "+st.LastSpareError))
-		}
-		lines = append(lines,
+			m.wrap(fmt.Sprintf("ip: %s", orDash(st.EgressIP))),
 			m.wrap(latencyLine(st, "ttfb", false)),
-			m.wrap(latencyLine(st, "stream", true)))
+			m.wrap(latencyLine(st, "stream", true)),
+		}
 	}
 	return lines
 }
@@ -442,7 +393,7 @@ func (m Model) actionLine() string {
 
 // actionErrMaxRunes bounds the rendered action-error content: control-API
 // errors echo response bodies verbatim (409/502 replies, HTML error
-// pages), so the line is truncated like LastSpareError's 300-byte cap
+// pages), so the line is truncated to keep the dashboard single-line
 // (review F5).
 const actionErrMaxRunes = 200
 
@@ -531,11 +482,11 @@ func (m Model) wrapAt(s string, w int) string {
 // grid invariants (panelgrid_test.go):
 //
 //   - content hug: each table gets exactly its rows (+ header), leftover
-//     height goes back to the deepest panel (rotation), then the log —
-//     never split evenly (the old layout's "blank void" bug);
+//     height goes back to the quota tables (capped at content) and then
+//     the log — never split evenly (the old layout's "blank void" bug);
 //   - frame fit: core + chrome + body lines <= terminal height at every
-//     breakpoint; the shrink order is log -> rotation -> identity -> keys
-//     -> egress, floors be damned only at degenerate sizes.
+//     breakpoint; the shrink order is log -> keys -> egress, floors be
+//     damned only at degenerate sizes.
 //
 // Heights land here (Update), View stays a pure render.
 func (m *Model) layout() {
@@ -550,15 +501,11 @@ func (m *Model) layout() {
 	// Widths first: column fitting reads the panel width the mode gives
 	// each table, and every later count sees the fitted rows.
 	if grid {
-		egW, keyW, idW, rotW := panelWidths(mode, vw)
+		egW, keyW := panelWidths(mode, vw)
 		m.egressTable.SetWidth(vw)
 		m.egressTable.SetColumns(fitColumns(m.egressCols, egW-2))
 		m.keyTable.SetWidth(vw)
 		m.keyTable.SetColumns(fitColumns(m.keyCols, keyW-2))
-		m.identityTable.SetWidth(vw)
-		m.identityTable.SetColumns(fitColumns(m.idCols, idW-2))
-		m.rotationTable.SetWidth(vw)
-		m.rotationTable.SetColumns(fitColumns(m.rotCols, rotW-2))
 	}
 	m.logVP.SetWidth(vw)
 	m.help.SetWidth(vw)
@@ -571,19 +518,10 @@ func (m *Model) layout() {
 
 	core := m.coreLineCount()
 	nEg, nKey := len(m.egressTable.Rows()), len(m.keyTable.Rows())
-	nID, nRot := len(m.identityTable.Rows()), len(m.rotationTable.Rows())
 
 	// Content-hug targets: one line per rendered table line (header row
-	// included); identity grows one notice line when the pool is empty.
-	egT, keyT, idT := 1+nEg, 1+nKey, 1+nID
-	rotFloor := 1
-	if nRot > 0 {
-		rotFloor = 2 // header + the newest row stays visible
-	}
-	rotT := 1 + nRot
-	if rotT < rotFloor {
-		rotT = rotFloor
-	}
+	// included).
+	egT, keyT := 1+nEg, 1+nKey
 
 	logBody := func() int {
 		if !logVisible {
@@ -602,17 +540,11 @@ func (m *Model) layout() {
 			return total
 		}
 		egBody, keyBody := min(egT, nEg+1), min(keyT, nKey+1)
-		idBody, rotBody := min(idT, nID+1), min(rotT, nRot+1)
-		if nID == 0 {
-			idBody++ // the "no identities" notice under the header-only table
-		}
 		switch mode {
 		case modeWide:
-			total += 6 + max(egBody, keyBody) + max(idBody, rotBody)
-		case modeMid:
-			total += 8 + egBody + keyBody + max(idBody, rotBody)
+			total += 2 + max(egBody, keyBody) // one paired row
 		default:
-			total += 10 + egBody + keyBody + idBody + rotBody
+			total += 4 + egBody + keyBody // two stacked rows
 		}
 		return total
 	}
@@ -624,18 +556,12 @@ func (m *Model) layout() {
 			switch {
 			case logVisible && logSet > 3:
 				logSet--
-			case rotT > rotFloor:
-				rotT--
-			case idT > 1:
-				idT--
 			case keyT > 1:
 				keyT--
 			case egT > 1:
 				egT--
 			case logVisible && logSet > 1:
 				logSet--
-			case rotT > 1:
-				rotT--
 			default:
 				break shrink // degenerate size: accept the overflow
 			}
@@ -648,13 +574,17 @@ func (m *Model) layout() {
 		}
 	}
 
-	// Leftover height flows back to the deepest panel (rotation history,
-	// capped at its content), then the log (never beyond its lines) —
-	// panels stay content-hugged.
+	// Leftover height flows back to the quota tables (capped at their
+	// content), then the log (never beyond its lines) — panels stay
+	// content-hugged.
 	if spare := h - total; spare > 0 {
 		if grid {
-			if g := min(spare, 1+nRot-rotT); g > 0 {
-				rotT += g
+			if g := min(spare, 1+nEg-egT); g > 0 {
+				egT += g
+				spare -= g
+			}
+			if g := min(spare, 1+nKey-keyT); g > 0 {
+				keyT += g
 				spare -= g
 			}
 		}
@@ -668,9 +598,6 @@ func (m *Model) layout() {
 	if grid {
 		m.egressTable.SetHeight(egT)
 		m.keyTable.SetHeight(keyT)
-		m.identityTable.SetHeight(idT)
-		m.rotationTable.SetHeight(rotT)
-		m.rotationTable.GotoBottom() // newest rotation stays visible
 	}
 	m.logVP.SetHeight(logSet)
 	m.logVP.GotoBottom() // tail stays pinned to the newest line
@@ -735,9 +662,6 @@ func fitColumns(base []table.Column, interior int) []table.Column {
 func (m *Model) applyStatus(st *cli.Status) {
 	m.egressTable.SetRows(egressRows(st, m.now))
 	m.keyTable.SetRows(keyRows(st, m.now))
-	m.identityTable.SetRows(identityRows(st))
-	m.rotationTable.SetRows(rotationRows(st))
-	m.rotationTable.GotoBottom()
 }
 
 // applyLog pushes the fetched tail into the viewport (still inside Update;
@@ -790,56 +714,8 @@ func keyRows(st *cli.Status, now time.Time) []table.Row {
 	return rows
 }
 
-// identityRows renders the identity pool from DISPLAY FIELDS ONLY: index,
-// active marker, DeviceID, AddressV4 and RegisteredAt. Credential fields
-// (Token, PrivateKey) are never read here — redaction is by construction,
-// not by filtering.
-func identityRows(st *cli.Status) []table.Row {
-	rows := make([]table.Row, 0, len(st.State.Identities))
-	for i, id := range st.State.Identities {
-		if id == nil {
-			continue
-		}
-		active := ""
-		if i == st.State.Active {
-			active = "*"
-		}
-		registered := "-"
-		if id.RegisteredAt > 0 {
-			registered = time.UnixMilli(id.RegisteredAt).Format("2006-01-02 15:04")
-		}
-		rows = append(rows, table.Row{
-			strconv.Itoa(i + 1),
-			active,
-			id.DeviceID,
-			orDash(id.AddressV4),
-			registered,
-		})
-	}
-	return rows
-}
-
-// rotationRows renders state.Rotations capped at the newest 50 rows.
-// Rotation rows carry display-safe strings only (at/from/to/reason).
-func rotationRows(st *cli.Status) []table.Row {
-	rots := st.State.Rotations
-	if len(rots) > rotationHistory {
-		rots = rots[len(rots)-rotationHistory:]
-	}
-	rows := make([]table.Row, 0, len(rots))
-	for _, r := range rots {
-		rows = append(rows, table.Row{
-			time.UnixMilli(r.At).Format("2006-01-02 15:04"),
-			r.From,
-			r.To,
-			r.Reason,
-		})
-	}
-	return rows
-}
-
 // latencyLine renders one latency window per egress as last/avg/sample
-// count, e.g. "latency ttfb: direct 12/14ms (n=3), warp 30/31ms (n=4)".
+// count, e.g. "latency ttfb: direct 12/14ms (n=3)".
 // The ttfb and stream windows stay separate lines — never a merged number.
 func latencyLine(st *cli.Status, kind string, stream bool) string {
 	lat := st.LatencyTTFB

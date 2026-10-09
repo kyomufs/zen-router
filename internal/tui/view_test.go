@@ -1,10 +1,11 @@
 package tui
 
 // Task 5 (Phase C): dashboard sections (spec §7 screen) — status header
-// (mode/egress/IP/latency), quota tables per egress AND per key with reset
-// countdowns, identity pool table with credential fields never rendered,
-// rotation history table (state.Rotations, last 50), log-tail viewport and
-// the help line, with layout adapting to tea.WindowSizeMsg.
+// (daemon/listen/pid/uptime, egress IP, direct latency), quota tables per
+// egress AND per key with reset countdowns, log-tail viewport and the help
+// line, with layout adapting to tea.WindowSizeMsg. Direct-only: no mode
+// row, no identity pool, no rotation history (those sections were excised
+// with WARP; quota.State carries only egress + keys).
 //
 // Hermeticity contract (same as tui_test.go): canned Status fixtures decoded
 // from JSON through the real cli.Status decode path, messages fed straight
@@ -37,25 +38,17 @@ func statusFromJSON(t *testing.T, raw string) *cli.Status {
 }
 
 // dashboardJSON builds the full-fat canned status: header fields, both
-// latency windows, spent egress + spent key (deterministic countdowns),
-// two identities — one carrying credential fields the view must never
-// render — and 60 rotation rows (the view must render only the last 50).
+// latency windows, spent egress + spent key (deterministic countdowns).
+// Identity/rotation blocks are deliberately absent (features excised);
+// legacy top-level warp-era fields stay as a decode-drop belt — the
+// direct-only cli.Status must ignore them.
 func dashboardJSON(t *testing.T) string {
 	t.Helper()
 	spentEgress := time.Now().Add(2 * time.Hour).UnixMilli()
 	spentKey := time.Now().Add(90 * time.Minute).UnixMilli()
-	var rots strings.Builder
-	for i := 1; i <= 60; i++ {
-		if i > 1 {
-			rots.WriteByte(',')
-		}
-		fmt.Fprintf(&rots,
-			`{"at":%d,"from":"direct","to":"warp","reason":"rotation-%02d"}`,
-			1759700000000+int64(i)*1000, i)
-	}
 	return fmt.Sprintf(`{
   "mode": "auto",
-  "current": "warp",
+  "current": "direct",
   "up": true,
   "listen": "127.0.0.1:8787",
   "pid": 4242,
@@ -65,28 +58,21 @@ func dashboardJSON(t *testing.T) string {
   "registering": false,
   "lastSpareError": "",
   "egress_ip": "198.51.100.9",
-  "latency_ttfb_ms": {"direct": {"last_ms": 12, "avg_ms": 14, "count": 3}, "warp": {"last_ms": 30, "avg_ms": 31, "count": 4}},
-  "latency_stream_ms": {"direct": {"last_ms": 50, "avg_ms": 55, "count": 2}, "warp": {"last_ms": 60, "avg_ms": 61, "count": 5}},
+  "latency_ttfb_ms": {"direct": {"last_ms": 12, "avg_ms": 14, "count": 3}},
+  "latency_stream_ms": {"direct": {"last_ms": 50, "avg_ms": 55, "count": 2}},
   "state": {
     "version": 2,
     "mode": "auto",
-    "current": "warp",
+    "current": "direct",
     "updatedAt": 1759700000000,
     "egress": {
-      "direct": {"ok": 11, "daily429": 2, "spentUntil": %d},
-      "warp": {"ok": 7, "daily429": 0}
+      "direct": {"ok": 11, "daily429": 2, "spentUntil": %d}
     },
     "keys": {
       "deadbeef": {"ok": 5, "daily429": 1, "spentUntil": %d}
-    },
-    "identities": [
-      {"deviceId": "dev-aaa", "publicKey": "pk-aaa", "addressV4": "10.0.0.2", "registeredAt": 1763193600000, "token": "SECRETTOKEN123", "privateKey": "SECRETPRIVATE456"},
-      {"deviceId": "dev-bbb", "publicKey": "pk-bbb", "addressV4": "10.0.0.3", "registeredAt": 1763193600000}
-    ],
-    "active": 1,
-    "rotations": [%s]
+    }
   }
-}`, spentEgress, spentKey, rots.String())
+}`, spentEgress, spentKey)
 }
 
 // dashboardModel polls once through the fake source and returns the model
@@ -125,9 +111,9 @@ func stripANSI(s string) string {
 	return b.String()
 }
 
-// TestViewStatusHeaderFields: the status header carries mode, current
-// egress, the observed egress IP and both latency windows (per egress,
-// last/avg/count — never a merged latency_ms number).
+// TestViewStatusHeaderFields: the status header carries daemon state and
+// the observed egress IP plus the direct latency windows (last/avg/count —
+// never a merged latency_ms number). Direct-only: no mode/current rows.
 func TestViewStatusHeaderFields(t *testing.T) {
 	m := dashboardModel(t)
 	content := m.View().Content
@@ -135,30 +121,15 @@ func TestViewStatusHeaderFields(t *testing.T) {
 	for _, want := range []string{
 		"zen-router control dashboard", // Task 4 header still present
 		"daemon: up",
-		"mode: auto",
-		"egress: warp",
 		"198.51.100.9",
 		"latency ttfb",
 		"direct 12/14ms",
-		"warp 30/31ms",
 		"latency stream",
 		"direct 50/55ms",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("view lacks %q:\n%s", want, content)
 		}
-	}
-}
-
-// TestViewSurfacesSpareRegistrationError: spec §14 — a failed spare
-// registration surfaces in the TUI (status.lastSpareError).
-func TestViewSurfacesSpareRegistrationError(t *testing.T) {
-	st := statusFromJSON(t, `{"up":true,"current":"direct","mode":"auto","lastSpareError":"register spare: HTTP 429"}`)
-	m := New(newFake(fakeResult{status: st}))
-	nm, _ := update(t, m, runCmd(t, m.Init()))
-	content := nm.View().Content
-	if !strings.Contains(content, "register spare: HTTP 429") {
-		t.Errorf("view does not surface lastSpareError:\n%s", content)
 	}
 }
 
@@ -174,7 +145,6 @@ func TestViewQuotaTablesWithResetCountdowns(t *testing.T) {
 		"quota (per key)",
 		"Resets in", // countdown column
 		"direct",
-		"warp",
 		"deadbeef", // fingerprinted key (display-only)
 		"1h59m",    // egress spent 2h from fixture time, minus Update's now
 		"1h29m",    // key spent 90m from fixture time, minus Update's now
@@ -185,62 +155,15 @@ func TestViewQuotaTablesWithResetCountdowns(t *testing.T) {
 	}
 }
 
-// TestViewIdentityPoolRedactsCredentials: the identity pool table renders
-// display-only fields; credential material (token/privateKey) must never
-// reach the screen even when the fixture carries it.
-func TestViewIdentityPoolRedactsCredentials(t *testing.T) {
-	m := dashboardModel(t)
-	content := m.View().Content
-
-	for _, want := range []string{
-		"identity pool",
-		"dev-aaa",
-		"dev-bbb",
-		"10.0.0.2",
-		time.UnixMilli(1763193600000).Format("2006-01-02"), // registered stamp
-	} {
-		if !strings.Contains(content, want) {
-			t.Errorf("identity pool view lacks %q:\n%s", want, content)
-		}
-	}
-	for _, secret := range []string{
-		"SECRETTOKEN123",
-		"SECRETPRIVATE456",
-		"privateKey",
-		"token",
-	} {
-		if strings.Contains(content, secret) {
-			t.Errorf("identity pool view leaks credential field %q:\n%s", secret, content)
-		}
-	}
-}
-
-// TestViewRotationHistoryLast50: rotation history table renders
-// state.Rotations capped at the last 50 rows (fixture carries 60).
-func TestViewRotationHistoryLast50(t *testing.T) {
-	m := dashboardModel(t)
-	content := m.View().Content
-
-	if !strings.Contains(content, "rotation history") {
-		t.Fatalf("view lacks the rotation history section:\n%s", content)
-	}
-	if !strings.Contains(content, "rotation-60") {
-		t.Errorf("view lacks the newest rotation row rotation-60")
-	}
-	if strings.Contains(content, "rotation-10") {
-		t.Errorf("view renders a rotation older than the last 50 (rotation-10)")
-	}
-	if n := strings.Count(content, "rotation-"); n != 50 {
-		t.Errorf("rendered rotation rows = %d, want exactly 50", n)
-	}
-}
-
-// TestViewHelpLine: the spec §7 key bindings render through bubbles help.
+// (The identity-pool and rotation-history tests that lived here were
+// deleted with the WARP excision — those panels no longer exist.)
+// TestViewHelpLine: the spec §7 key bindings render through bubbles help —
+// direct-only bindings (no rotate/direct/warp egress keys).
 func TestViewHelpLine(t *testing.T) {
 	m := dashboardModel(t)
 	content := m.View().Content
 
-	for _, want := range []string{"quit", "rotate", "direct", "warp", "start/stop"} {
+	for _, want := range []string{"quit", "start/stop"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("help line lacks %q:\n%s", want, content)
 		}
@@ -248,21 +171,21 @@ func TestViewHelpLine(t *testing.T) {
 }
 
 // TestViewWindowSizeAdaptsLayout: tea.WindowSizeMsg drives SetWidth on the
-// tables/viewport — after a 60-cell-wide window the rendered rotation row
-// is clipped to 60 cells (it is 70 wide at the default width).
+// tables/viewport — after a 60-cell-wide window every rendered line stays
+// within the window width and the quota rows survive the resize.
 func TestViewWindowSizeAdaptsLayout(t *testing.T) {
 	m := dashboardModel(t)
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 60, Height: 30})
 	content := stripANSI(m.View().Content)
 
-	if !strings.Contains(content, "rotation-60") {
-		t.Fatalf("rotation row lost after resize:\n%s", content)
+	if !strings.Contains(content, "deadbeef") {
+		t.Fatalf("key row lost after resize:\n%s", content)
 	}
 	for _, line := range strings.Split(content, "\n") {
 		// Display cells, not bytes: the panel redesign wraps rows in
 		// 3-byte box-drawing borders (utf8 — same metric as panelgrid).
-		if n := utf8.RuneCountInString(line); strings.Contains(line, "rotation-") && n > 60 {
-			t.Errorf("rotation line width %d cells > window width 60: %q", n, line)
+		if n := utf8.RuneCountInString(line); n > 60 {
+			t.Errorf("line width %d cells > window width 60: %q", n, line)
 		}
 	}
 }

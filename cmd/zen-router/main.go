@@ -1,11 +1,10 @@
 // Command zen-router runs a local reverse proxy in front of the OpenCode Zen
-// gateway, keeping a warm keep-alive pool (the latency fix) and rotating the
-// egress IP through Cloudflare WARP when the anonymous daily quota is spent.
+// gateway, keeping a warm keep-alive pool (the latency fix) and rotating
+// through the API key pool when the anonymous daily quota is spent.
 package main
 
 import (
 	"context"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -16,7 +15,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -29,10 +27,8 @@ import (
 	"zen-router/internal/router"
 	"zen-router/internal/systemd"
 	"zen-router/internal/tui"
-	"zen-router/internal/warp"
 
 	tea "charm.land/bubbletea/v2"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func main() {
@@ -49,18 +45,12 @@ func main() {
 		err = cmdUp(args)
 	case "status":
 		err = cmdStatus(args)
-	case "rotate":
-		err = cmdRotate(args)
-	case "use":
-		err = cmdUse(args)
 	case "stop":
 		err = cmdStop(args)
 	case "install-systemd":
 		err = cmdInstallSystemd(args)
 	case "tui":
 		err = cmdTui(args)
-	case "__wgcfg":
-		err = cmdWGConfig(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -75,14 +65,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `zen-router — local reverse proxy for OpenCode Zen with WARP IP rotation
+	fmt.Fprintf(os.Stderr, `zen-router — local reverse proxy for OpenCode Zen with key-pool quota rotation
 
 Usage:
   zen-router up      [--listen ADDR] [--detach]  start the proxy daemon (foreground; --detach forks it
                                                  into the background and returns once it is ready)
-  zen-router status  [--listen ADDR]     show egress, mode and quota counters
-  zen-router rotate  [--listen ADDR]     force an egress IP rotation now
-  zen-router use     <direct|warp>       force the active egress path
+  zen-router status  [--listen ADDR]     show egress and quota counters
   zen-router stop    [--listen ADDR]     gracefully stop the daemon
   zen-router install-systemd [--remove]  write $XDG_CONFIG_HOME/systemd/user/zen-router.service for this
                                          executable's foreground "up", then daemon-reload + enable --now;
@@ -326,10 +314,10 @@ func cmdUp(args []string) error {
 	}
 
 	// Full config: the gateway needs the upstream base URL and watchdog
-	// budgets; the rotator needs the key pool, identity-pool sizing,
-	// cooldown and address family. parseUp already resolved Listen through
-	// the same loader — config.json is a tiny read-only file, so reading it
-	// again here beats duplicating flag-parsing logic.
+	// budgets; the rotator needs the key pool and address family. parseUp
+	// already resolved Listen through the same loader — config.json is a
+	// tiny read-only file, so reading it again here beats duplicating
+	// flag-parsing logic.
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -344,43 +332,27 @@ func cmdUp(args []string) error {
 		return err
 	}
 	r, err := router.New(router.Options{
-		Store:            store,
-		Logger:           logger,
-		Pool:             keys.New(cfg.KeyPoolFile),
-		RotationCooldown: cfg.RotationCooldown,
-		Family:           cfg.Family,
-		PoolSize:         cfg.PoolSize,
-		PoolSpare:        cfg.PoolSpare,
+		Store:  store,
+		Logger: logger,
+		Pool:   keys.New(cfg.KeyPoolFile),
+		Family: cfg.Family,
 	})
 	if err != nil {
 		return err
 	}
 
 	// Egress IP observation (plan Task 2): the production echo re-reads the
-	// ACTIVE transport on every attempt (so it follows the active path) and
-	// is built ONLY when the user opted in via config.EgressIPEcho — the §12
-	// gate, default false: no live echo call exists without that explicit
-	// opt-in. Every effective active-egress change (rotation, its direct
-	// fallback, manual mode switch) marks the observation stale via
-	// OnRotated (debounced by egressIPMinInterval), status reads refresh it
-	// lazily.
+	// direct transport on every attempt and is built ONLY when the user
+	// opted in via config.EgressIPEcho — the §12 gate, default false: no
+	// live echo call exists without that explicit opt-in. Warmed once at
+	// startup; status reads refresh it lazily (debounced by
+	// egressIPMinInterval).
 	echoer := cli.NewEgressIPEchoer(cfg.EgressIPEcho, func() http.RoundTripper {
 		_, rt := r.Egress()
 		return rt
 	})
 	egressIP := cli.NewEgressIPTracker(echoer)
-	r.OnRotated = egressIP.Refresh
-
-	// Warm the WARP path up front if state says we were on it, so the first
-	// agent request does not pay the registration latency.
-	if r.Current() == proxy.EgressWarp {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		if err := r.Use(ctx, proxy.EgressWarp); err != nil {
-			logger.Printf("warn: could not restore warp egress: %v (falling back to direct)", err)
-			_ = r.Use(ctx, proxy.EgressDirect)
-		}
-		cancel()
-	}
+	egressIP.Refresh()
 
 	srv, err := proxy.New(proxy.Config{
 		Listen:   listen,
@@ -426,15 +398,14 @@ func cmdUp(args []string) error {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		httpSrv.Shutdown(shutCtx)
-		r.Stop()
 	}()
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listen, err)
 	}
-	logger.Printf("zen-router up on http://%s (OpenAI /v1 gateway + %scontrol + legacy proxy), egress=%s mode=%s",
-		listen, cli.ControlPrefix, r.Current(), store.Mode())
+	logger.Printf("zen-router up on http://%s (OpenAI /v1 gateway + %scontrol + legacy proxy), egress=%s",
+		listen, cli.ControlPrefix, r.Current())
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
@@ -461,22 +432,17 @@ func cmdStatus(args []string) error {
 		}
 		snap := store.Snapshot()
 		fmt.Printf("daemon: down (reporting persisted state)\n")
-		fmt.Printf("mode:   %s\n", snap.Mode)
-		fmt.Printf("last:   %s\n", snap.Current)
 		printEgress(snap)
 		return nil
 	}
 	fmt.Printf("daemon: up\n")
-	fmt.Printf("mode:   %s\n", st.Mode)
-	fmt.Printf("egress: %s\n", st.Current)
 	printEgress(st.State)
 	return nil
 }
 
 func printEgress(s quota.State) {
 	fmt.Printf("\negress counters (updated %s):\n", time.UnixMilli(s.UpdatedAt).UTC().Format(time.RFC3339))
-	for _, name := range []string{"direct", "warp"} {
-		b := s.Egress[name]
+	for name, b := range s.Egress {
 		if b == nil {
 			continue
 		}
@@ -486,46 +452,6 @@ func printEgress(s quota.State) {
 		}
 		fmt.Printf("  %-7s ok=%-6d daily429=%-5d%s\n", name, b.OK, b.Daily429, suffix)
 	}
-	if w := s.Warp; w != nil {
-		fmt.Printf("\nwarp device: %s (registered %s)\n", w.DeviceID,
-			time.UnixMilli(w.RegisteredAt).UTC().Format(time.RFC3339))
-	}
-}
-
-// cmdRotate forces an IP rotation through the running daemon.
-func cmdRotate(args []string) error {
-	listen, err := parseListen(args)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	to, err := cli.NewControlClient(listen).Rotate(ctx)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("rotated to egress: %s\n", to)
-	return nil
-}
-
-// cmdUse forces the active egress path.
-func cmdUse(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: zen-router use <direct|warp>")
-	}
-	mode := args[0]
-	listen, err := parseListen(args[1:])
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	cur, err := cli.NewControlClient(listen).Use(ctx, mode)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("active egress: %s\n", cur)
-	return nil
 }
 
 // cmdStop asks the daemon to shut down.
@@ -618,49 +544,4 @@ func tuiOptions(spawn tui.Spawner) []tui.Option {
 	}
 	opts = append(opts, tui.WithSpawner(spawn))
 	return opts
-}
-
-// cmdWGConfig is the privileged helper: it runs as root (via sudo) and applies
-// one WireGuard netlink configuration. It is internal — the daemon invokes it
-// through applyDeviceConfigPrivileged — and never appears in usage.
-func cmdWGConfig(args []string) error {
-	if len(args) != 7 {
-		return fmt.Errorf("__wgcfg expects 7 args, got %d", len(args))
-	}
-	name := args[0]
-	privRaw, err := base64.StdEncoding.DecodeString(args[1])
-	if err != nil || len(privRaw) != 32 {
-		return fmt.Errorf("bad private key: %v", err)
-	}
-	peerRaw, err := base64.StdEncoding.DecodeString(args[2])
-	if err != nil || len(peerRaw) != 32 {
-		return fmt.Errorf("bad peer key: %v", err)
-	}
-	ip := net.ParseIP(args[3])
-	if ip == nil {
-		return fmt.Errorf("bad endpoint ip %q", args[3])
-	}
-	port, err := strconv.Atoi(args[4])
-	if err != nil {
-		return fmt.Errorf("bad endpoint port: %v", err)
-	}
-	fwmark, err := strconv.Atoi(args[5])
-	if err != nil {
-		return fmt.Errorf("bad fwmark: %v", err)
-	}
-	keepalive, err := strconv.Atoi(args[6])
-	if err != nil {
-		return fmt.Errorf("bad keepalive: %v", err)
-	}
-	var privKey, peerKey wgtypes.Key
-	copy(privKey[:], privRaw)
-	copy(peerKey[:], peerRaw)
-	return warp.ApplyDeviceConfig(warp.DeviceParams{
-		Name:       name,
-		PrivateKey: privKey,
-		Peer:       peerKey,
-		Endpoint:   &net.UDPAddr{IP: ip, Port: port},
-		FWMark:     fwmark,
-		Keepalive:  keepalive,
-	})
 }

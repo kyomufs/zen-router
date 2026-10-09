@@ -1,16 +1,13 @@
 package cli
 
-// Task 1 (Phase C): control-API dashboard data — success counters fed by the
-// gateway's 2xx path, per-egress latency, rotation/spare-registration status,
-// listen/uptime header fields, and a credential-redacted identity view.
-// Hermetic: quota state in t.TempDir(), fake Zen upstream on httptest
-// (loopback only), privileged router seams (identity switch, spare
-// registration) faked — no live network, no tunnel, no daemon.
+// Control-API dashboard data: success counters fed by the gateway's 2xx
+// path, per-egress latency, listen/uptime header fields, and API-key
+// fingerprinting. Hermetic: quota state in t.TempDir(), fake Zen upstream on
+// httptest (loopback only), direct-only router — no live network, no tunnel,
+// no daemon.
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -18,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,15 +23,13 @@ import (
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
-	"zen-router/internal/zen"
 )
 
 // --- fixtures ---------------------------------------------------------------
 
-// newTestRouter builds the real staged router with its privileged operations
-// faked: quota state in t.TempDir(), no-op identity switch (no tunnel) and an
-// injected spare registrar (never the real Cloudflare registration).
-func newTestRouter(t *testing.T, reg func(context.Context) error, cooldown time.Duration) *router.Router {
+// newTestRouter builds the direct-only router: quota state in t.TempDir(),
+// key pool defaulting to the fallback key "public".
+func newTestRouter(t *testing.T) *router.Router {
 	t.Helper()
 	// Neutralize environment key overrides so the fallback key is exactly
 	// "public" and the assertions below are deterministic.
@@ -45,17 +39,9 @@ func newTestRouter(t *testing.T, reg func(context.Context) error, cooldown time.
 	if err != nil {
 		t.Fatalf("quota.Open: %v", err)
 	}
-	if reg == nil {
-		reg = func(context.Context) error { return nil }
-	}
 	rot, err := router.New(router.Options{
-		Store:            st,
-		Logger:           log.New(io.Discard, "", 0),
-		RotationCooldown: cooldown,
-		IdentitySwitch: func(*quota.WarpIdentity) (http.RoundTripper, error) {
-			return http.DefaultTransport, nil
-		},
-		SpareRegistrar: reg,
+		Store:  st,
+		Logger: log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
@@ -144,10 +130,10 @@ func truncate(b []byte) string {
 
 // TestGateway2xxRecordsSuccessCounters: a 2xx upstream attempt on the OpenAI
 // surface must feed BOTH success counters — per egress (quota.RecordSuccess)
-// and per API key (quota.RecordKeySuccess, previously zero production
-// callers) — and they must be visible in GET /_zenctl/status.
+// and per API key (quota.RecordKeySuccess) — and they must be visible in
+// GET /_zenctl/status.
 func TestGateway2xxRecordsSuccessCounters(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	up := newChatUpstream(t, 30*time.Millisecond)
 	h := gatewayStack(t, rot, up)
 
@@ -200,7 +186,7 @@ func TestGateway2xxRecordsSuccessCounters(t *testing.T) {
 // The TTFB bucket must stay untouched: different measurement window
 // (review F1).
 func TestProxyOnResultRecordsLatency(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	rot.OnResult(proxy.Result{
 		Egress:    proxy.EgressDirect,
 		Status:    http.StatusOK,
@@ -229,10 +215,10 @@ func TestProxyOnResultRecordsLatency(t *testing.T) {
 // --- TestStatusHeaderFields ------------------------------------------------
 
 // TestStatusHeaderFields: the dashboard header fields — resolved listen
-// address, daemon uptime, rotation/spare-registration activity — are served
-// by GET /_zenctl/status with sane fresh-daemon values.
+// address and daemon uptime — are served by GET /_zenctl/status with sane
+// fresh-daemon values.
 func TestStatusHeaderFields(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	h := newTestControl(rot).Handler(http.NewServeMux())
 
 	_, st := getStatus(t, h)
@@ -242,22 +228,10 @@ func TestStatusHeaderFields(t *testing.T) {
 	if st.UptimeSeconds < 4 || st.UptimeSeconds > 60 {
 		t.Errorf("status.uptime_seconds = %d, want in [4,60] (StartedAt is 5s ago)", st.UptimeSeconds)
 	}
-	if st.Rotating {
-		t.Error("status.rotating = true, want false (no rotation in flight)")
-	}
-	if st.Registering {
-		t.Error("status.registering = true, want false (no spare registration in flight)")
-	}
-	if st.LastSpareError != "" {
-		t.Errorf("status.lastSpareError = %q, want empty on a fresh daemon", st.LastSpareError)
-	}
-	if st.LastRotate != "" {
-		t.Errorf("status.last_rotate = %q, want empty (no rotation this run)", st.LastRotate)
-	}
 	if !st.Up {
 		t.Error("status.up = false, want true")
 	}
-	// Fresh daemon: both kinds × both egresses report a zeroed view.
+	// Fresh daemon: both latency windows report a zeroed direct view.
 	for _, m := range []struct {
 		name string
 		byEg map[string]router.EgressLatency
@@ -265,15 +239,13 @@ func TestStatusHeaderFields(t *testing.T) {
 		{"latency_ttfb_ms", st.LatencyTTFB},
 		{"latency_stream_ms", st.LatencyStream},
 	} {
-		for _, eg := range []string{"direct", "warp"} {
-			lat, ok := m.byEg[eg]
-			if !ok {
-				t.Errorf("status.%s missing %q entry: %#v", m.name, eg, m.byEg)
-				continue
-			}
-			if lat.Count != 0 || lat.LastMS != 0 || lat.AvgMS != 0 {
-				t.Errorf("status.%s[%q] = %+v, want zeros before any request", m.name, eg, lat)
-			}
+		lat, ok := m.byEg["direct"]
+		if !ok {
+			t.Errorf("status.%s missing \"direct\" entry: %#v", m.name, m.byEg)
+			continue
+		}
+		if lat.Count != 0 || lat.LastMS != 0 || lat.AvgMS != 0 {
+			t.Errorf("status.%s[\"direct\"] = %+v, want zeros before any request", m.name, lat)
 		}
 	}
 }
@@ -286,7 +258,7 @@ func TestStatusHeaderFields(t *testing.T) {
 // reports its own process (here: the test binary itself), and `pid` is an
 // additive JSON field.
 func TestStatusReportsPID(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	h := newTestControl(rot).Handler(http.NewServeMux())
 
 	raw, st := getStatus(t, h)
@@ -301,145 +273,6 @@ func TestStatusReportsPID(t *testing.T) {
 	}
 }
 
-// --- TestStatusSurfacesSpareRegistration -----------------------------------
-
-// TestStatusSurfacesSpareRegistration: a stage-2 identity switch schedules
-// the background spare registration (spec §6/§14). While it runs, status.
-// registering is true; its failure surfaces as status.lastSpareError and is
-// cleared by the next successful registration. The same switch stamps
-// status.last_rotate (RFC3339, parseable) without flipping rotating.
-func TestStatusSurfacesSpareRegistration(t *testing.T) {
-	regStarted := make(chan struct{})
-	release := make(chan struct{})
-	var calls atomic.Int32
-	reg := func(ctx context.Context) error {
-		if calls.Add(1) == 1 {
-			close(regStarted)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			return errors.New("registration exploded")
-		}
-		return nil
-	}
-	// 1ns cooldown: every identity step may schedule a fresh registration.
-	rot := newTestRouter(t, reg, time.Nanosecond)
-	// Two identities: the first switch consumes the active slot, the second
-	// drive (from warp) needs a distinct fresh spare to switch onto.
-	for _, dev := range []string{"dev1", "dev2"} {
-		rot.Store().AddIdentity(&quota.WarpIdentity{
-			DeviceID:     dev,
-			RegisteredAt: time.Now().UnixMilli(),
-		})
-	}
-	h := newTestControl(rot).Handler(http.NewServeMux())
-
-	// Stage 2 from direct: switch identity → schedule spare registration.
-	if _, ok := rot.NextAttempt(router.Report{
-		Kind: zen.KindDailyLimit, Egress: proxy.EgressDirect, Key: "k1", Step: 1,
-	}); !ok {
-		t.Fatal("NextAttempt(step 1): want an identity-switch attempt")
-	}
-	<-regStarted
-	_, st := getStatus(t, h)
-	if !st.Registering {
-		t.Error("status.registering = false, want true while spare registration is in flight")
-	}
-
-	close(release)
-	waitFor(t, "lastSpareError to surface", func() bool {
-		_, s := getStatus(t, h)
-		return s.LastSpareError == "registration exploded" && !s.Registering
-	})
-
-	_, st = getStatus(t, h)
-	if st.LastRotate == "" {
-		t.Fatal("status.last_rotate = empty, want a stamp from the identity switch")
-	}
-	if _, err := time.Parse(time.RFC3339, st.LastRotate); err != nil {
-		t.Errorf("status.last_rotate = %q, want RFC3339: %v", st.LastRotate, err)
-	}
-	if st.Rotating {
-		t.Error("status.rotating = true, want false (no rotation in flight)")
-	}
-
-	// Second switch (warp side, cooldown neutralized): a successful
-	// registration clears the stale error.
-	if _, ok := rot.NextAttempt(router.Report{
-		Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp, Key: "k1", Step: 1,
-	}); !ok {
-		t.Fatal("NextAttempt(step 1, warp): want an identity-switch attempt")
-	}
-	waitFor(t, "lastSpareError to clear after a successful registration", func() bool {
-		_, s := getStatus(t, h)
-		return s.LastSpareError == "" && !s.Registering
-	})
-}
-
-// waitFor polls cond until it holds or 5s elapse (the spare registration
-// runs on a background goroutine).
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
-}
-
-// --- TestStatusHidesIdentityCredentials ------------------------------------
-
-// TestStatusHidesIdentityCredentials: the status payload is the dashboard
-// view (spec §14: loopback control API) — it must carry NO WARP credentials.
-// Asserted through a JSON round-trip of the serialized payload: neither the
-// "token"/"privateKey" field names nor their values may appear; the identity
-// itself stays visible (deviceId) so the pool table still renders.
-func TestStatusHidesIdentityCredentials(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
-	rot.Store().AddIdentity(&quota.WarpIdentity{
-		DeviceID:     "dev-redact-1",
-		Token:        "SECRET-TOKEN-ABC123",
-		PrivateKey:   "SECRET-PRIVATE-KEY-XYZ789",
-		PublicKey:    "pub-1",
-		RegisteredAt: time.Now().UnixMilli(),
-	})
-	h := newTestControl(rot).Handler(http.NewServeMux())
-
-	raw, st := getStatus(t, h)
-
-	// Round-trip: decode the payload and re-walk the identity views.
-	decoded := map[string]any{}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("re-decode status payload: %v", err)
-	}
-	for _, id := range append(identityViews(t, decoded, "state", "identities"),
-		identityViews(t, decoded, "state", "warp")...) {
-		if _, ok := id["token"]; ok {
-			t.Errorf("identity in status payload has field \"token\": %#v", id)
-		}
-		if _, ok := id["privateKey"]; ok {
-			t.Errorf("identity in status payload has field \"privateKey\": %#v", id)
-		}
-	}
-	body := string(raw)
-	for _, secret := range []string{"SECRET-TOKEN-ABC123", "SECRET-PRIVATE-KEY-XYZ789"} {
-		if strings.Contains(body, secret) {
-			t.Errorf("status payload leaks credential value %q: %s", secret, truncate(raw))
-		}
-	}
-	if !strings.Contains(body, "dev-redact-1") {
-		t.Errorf("status payload must still carry the identity itself: %s", truncate(raw))
-	}
-	if len(st.State.Identities) == 0 || st.State.Identities[0].DeviceID != "dev-redact-1" {
-		t.Errorf("decoded identities = %#v, want dev-redact-1 present", st.State.Identities)
-	}
-}
-
 // --- TestGateway3xxNotRecorded ---------------------------------------------
 
 // TestGateway3xxNotRecorded: a pass-through 3xx (304 — http.Client does not
@@ -447,7 +280,7 @@ func TestStatusHidesIdentityCredentials(t *testing.T) {
 // counters nor the TTFB latency view: only 200..299 counts as success,
 // parity with router.OnResult (review F3).
 func TestGateway3xxNotRecorded(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 	}))
@@ -479,7 +312,7 @@ func TestGateway3xxNotRecorded(t *testing.T) {
 // state.json on disk keeps the raw key (control layer only).
 func TestStatusFingerprintsAPIKeys(t *testing.T) {
 	const rawKey = "sk-test-FULLVALUE-123"
-	rot := newTestRouter(t, nil, 0)
+	rot := newTestRouter(t)
 	rot.Store().RecordRequestSuccess("direct", rawKey)
 	h := newTestControl(rot).Handler(http.NewServeMux())
 
@@ -501,59 +334,5 @@ func TestStatusFingerprintsAPIKeys(t *testing.T) {
 	}
 	if ks.OK != 1 {
 		t.Errorf("state.keys[%q].ok = %d, want 1 — counters must survive redaction", fp, ks.OK)
-	}
-}
-
-// TestStatusExposesRotationHistory (Task 5) pins the TUI data source: the
-// status payload already carries state.rotations (quota store caps it at
-// the last 50), so cli.Status needs no extra field for the dashboard's
-// rotation table. Rotation rows are display-safe by construction
-// (at/from/to/reason — egress names and a fixed reason string).
-func TestStatusExposesRotationHistory(t *testing.T) {
-	rot := newTestRouter(t, nil, 0)
-	rot.Store().RecordRotation("warp", "direct", "manual rotate via CLI")
-	h := newTestControl(rot).Handler(http.NewServeMux())
-
-	raw, st := getStatus(t, h)
-	if !strings.Contains(string(raw), `"rotations"`) {
-		t.Fatalf("status payload lacks state.rotations: %s", truncate(raw))
-	}
-	if len(st.State.Rotations) != 1 {
-		t.Fatalf("state.rotations = %d rows, want 1: %#v", len(st.State.Rotations), st.State.Rotations)
-	}
-	r := st.State.Rotations[0]
-	if r.From != "warp" || r.To != "direct" || r.Reason != "manual rotate via CLI" {
-		t.Errorf("rotation row = %+v, want warp -> direct with the CLI reason", r)
-	}
-	if r.At == 0 {
-		t.Errorf("rotation row has no At stamp: %+v", r)
-	}
-}
-
-// identityViews extracts the identity objects under the given JSON path:
-// "state.identities" is an array, "state.warp" a single object.
-func identityViews(t *testing.T, root map[string]any, path ...string) []map[string]any {
-	t.Helper()
-	var cur any = root
-	for _, seg := range path {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil
-		}
-		cur = m[seg]
-	}
-	switch v := cur.(type) {
-	case map[string]any:
-		return []map[string]any{v}
-	case []any:
-		var out []map[string]any
-		for _, e := range v {
-			if m, ok := e.(map[string]any); ok {
-				out = append(out, m)
-			}
-		}
-		return out
-	default:
-		return nil
 	}
 }

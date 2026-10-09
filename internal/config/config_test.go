@@ -122,9 +122,6 @@ func TestConfigEnvOverridesFile(t *testing.T) {
 		if cfg.Upstream != "https://file.example" {
 			t.Errorf("Upstream = %q, want file value https://file.example", cfg.Upstream)
 		}
-		if cfg.PoolSize != 7 {
-			t.Errorf("PoolSize = %d, want file value 7", cfg.PoolSize)
-		}
 		if cfg.IdleTimeout != 60*time.Second {
 			t.Errorf("IdleTimeout = %s, want file value 60s", cfg.IdleTimeout)
 		}
@@ -165,8 +162,8 @@ func TestEnvOverridesWithoutConfigFile(t *testing.T) {
 	if cfg.Upstream != "https://env.example" {
 		t.Errorf("Upstream = %q, want ZEN_ROUTER_UPSTREAM value https://env.example", cfg.Upstream)
 	}
-	if cfg.PoolSize != 4 || cfg.IdleTimeout != 120*time.Second {
-		t.Errorf("non-overridden fields = pool %d / idle %s, want defaults 4 / 120s", cfg.PoolSize, cfg.IdleTimeout)
+	if cfg.IdleTimeout != 120*time.Second {
+		t.Errorf("non-overridden fields = idle %s, want default 120s", cfg.IdleTimeout)
 	}
 }
 
@@ -213,15 +210,6 @@ func TestLoadDefaults(t *testing.T) {
 		}
 		if d.KeyPoolFile != "" {
 			t.Errorf("default KeyPoolFile = %q, want empty", d.KeyPoolFile)
-		}
-		if d.PoolSize != 4 {
-			t.Errorf("default PoolSize = %d, want 4", d.PoolSize)
-		}
-		if d.PoolSpare != 1 {
-			t.Errorf("default PoolSpare = %d, want 1", d.PoolSpare)
-		}
-		if d.RotationCooldown != 30*time.Second {
-			t.Errorf("default RotationCooldown = %s, want 30s", d.RotationCooldown)
 		}
 		if d.FirstEventTimeout != 30*time.Second {
 			t.Errorf("default FirstEventTimeout = %s, want 30s", d.FirstEventTimeout)

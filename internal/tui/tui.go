@@ -11,11 +11,10 @@
 //
 // Lifecycle: the spec §7 1s poll chain and the daemon-down start offer
 // (Task 4), the dashboard sections — status header, quota tables per
-// egress and per key, identity pool, rotation history, log tail, help
-// line (Task 5, view.go) — and the spec §7 r/d/w/s actions (Task 6):
-// rotate / force direct|warp / stop requests through the ActionSource
-// seam discovered on the status source, daemon start through the
-// injected Spawner seam (production wiring: cmdTui passes detachUp).
+// egress and per key, log tail, help line (Task 5, view.go) — and the
+// daemon stop request through the ActionSource seam discovered on the
+// status source, daemon start through the injected Spawner seam
+// (production wiring: cmdTui passes detachUp).
 package tui
 
 import (
@@ -49,15 +48,12 @@ type LogSource interface {
 	Tail(maxLines int) ([]string, error)
 }
 
-// ActionSource is the action seam behind the spec §7 keys r/d/w/s
-// (rotate now, force direct|warp, stop): *cli.ControlClient satisfies it
-// in production. New discovers it on the injected StatusSource by type
-// assertion — the production client provides Status + actions from one
+// ActionSource is the action seam behind the `s` stop key: *cli.ControlClient
+// satisfies it in production. New discovers it on the injected StatusSource
+// by type assertion — the production client provides Status + stop from one
 // object, so cmdTui cannot wire them inconsistently, while the plain
-// StatusSource fakes of Tasks 4/5 keep every action key a silent no-op.
+// StatusSource fakes keep the action key a silent no-op.
 type ActionSource interface {
-	Rotate(ctx context.Context) (string, error)
-	Use(ctx context.Context, mode string) (string, error)
 	Stop(ctx context.Context) error
 }
 
@@ -101,10 +97,9 @@ const (
 
 	// defaultWidth/defaultLogHeight size the widgets before the first
 	// tea.WindowSizeMsg arrives, so the sections render even without one.
-	defaultWidth      = 80
-	defaultLogHeight  = 10
-	defaultTableH     = 6
-	defaultRotationsH = 51 // header + the last-50 rotation rows
+	defaultWidth     = 80
+	defaultLogHeight = 10
+	defaultTableH    = 6
 
 	// minLayoutWidth/minLayoutHeight clamp absurdly small terminals so the
 	// widget math in layout() can never go negative.
@@ -133,35 +128,29 @@ type statusMsg struct {
 	logErr  error
 }
 
-// keyMap is the spec §7 key set surfaced through bubbles help. r/d/w/s are
-// the Task 6 actions implemented in Update (startAction): bindings render
-// here, the handlers live in the key switch.
+// keyMap is the direct-only key set surfaced through bubbles help. `s` is
+// the Task 6 action implemented in Update (startAction): the binding renders
+// here, the handler lives in the key switch.
 type keyMap struct {
 	Quit   key.Binding
-	Rotate key.Binding
-	Direct key.Binding
-	Warp   key.Binding
 	Daemon key.Binding
 }
 
 func defaultKeyMap() keyMap {
 	return keyMap{
 		Quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
-		Rotate: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rotate now")),
-		Direct: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "direct egress")),
-		Warp:   key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "warp egress")),
 		Daemon: key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "start/stop daemon")),
 	}
 }
 
 // ShortHelp implements help.KeyMap for the single-line help footer.
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Quit, k.Rotate, k.Direct, k.Warp, k.Daemon}
+	return []key.Binding{k.Quit, k.Daemon}
 }
 
 // FullHelp implements help.KeyMap for the expanded help view.
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{{k.Quit, k.Rotate, k.Direct, k.Warp, k.Daemon}}
+	return [][]key.Binding{{k.Quit, k.Daemon}}
 }
 
 // Model is the dashboard state: the last status snapshot (nil before the
@@ -209,21 +198,17 @@ type Model struct {
 	// background; View renders through it and never detects anything.
 	th theme
 
-	egressTable   table.Model
-	keyTable      table.Model
-	identityTable table.Model
-	rotationTable table.Model
-	logVP         viewport.Model
+	egressTable table.Model
+	keyTable    table.Model
+	logVP       viewport.Model
 
-	// egressCols/keyCols/idCols/rotCols are the PRISTINE column
-	// definitions (the same slices handed to table.WithColumns). Fitted
-	// columns are sticky — table.Columns() returns whatever was last set —
-	// so layout always refits from these bases: shrink-then-grow restores
-	// the full content instead of compounding the shrink.
+	// egressCols/keyCols are the PRISTINE column definitions (the same
+	// slices handed to table.WithColumns). Fitted columns are sticky —
+	// table.Columns() returns whatever was last set — so layout always
+	// refits from these bases: shrink-then-grow restores the full content
+	// instead of compounding the shrink.
 	egressCols []table.Column
 	keyCols    []table.Column
-	idCols     []table.Column
-	rotCols    []table.Column
 
 	logLines []string
 	logErr   error
@@ -231,8 +216,9 @@ type Model struct {
 
 // New builds the model over the injected status source (and optional
 // extras such as WithLogTail). When the source also exposes the control
-// actions (*cli.ControlClient in production), the spec §7 r/d/w/s keys are
-// enabled through that discovered ActionSource; otherwise they stay no-ops.
+// actions (*cli.ControlClient in production), the daemon stop half of `s`
+// is enabled through that discovered ActionSource; otherwise it stays a
+// no-op.
 func New(src StatusSource, opts ...Option) Model {
 	// Pristine column definitions: shared with the tables below and kept
 	// for layout's fitColumns (see Model.egressCols).
@@ -248,20 +234,6 @@ func New(src StatusSource, opts ...Option) Model {
 		{Title: "429", Width: 6},
 		{Title: "Resets in", Width: 12},
 	}
-	idCols := []table.Column{
-		{Title: "#", Width: 3},
-		{Title: "Active", Width: 7},
-		{Title: "Device ID", Width: 20},
-		{Title: "IPv4", Width: 16},
-		{Title: "Registered", Width: 17},
-	}
-	rotCols := []table.Column{
-		{Title: "At", Width: 16},
-		{Title: "From", Width: 8},
-		{Title: "To", Width: 8},
-		{Title: "Reason", Width: 40},
-	}
-
 	m := Model{
 		src:     src,
 		act:     discoverActions(src),
@@ -272,8 +244,6 @@ func New(src StatusSource, opts ...Option) Model {
 
 		egressCols: egressCols,
 		keyCols:    keyCols,
-		idCols:     idCols,
-		rotCols:    rotCols,
 		egressTable: table.New(
 			table.WithColumns(egressCols),
 			table.WithWidth(defaultWidth),
@@ -283,16 +253,6 @@ func New(src StatusSource, opts ...Option) Model {
 			table.WithColumns(keyCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultTableH),
-		),
-		identityTable: table.New(
-			table.WithColumns(idCols),
-			table.WithWidth(defaultWidth),
-			table.WithHeight(defaultTableH),
-		),
-		rotationTable: table.New(
-			table.WithColumns(rotCols),
-			table.WithWidth(defaultWidth),
-			table.WithHeight(defaultRotationsH),
 		),
 		logVP: viewport.New(
 			viewport.WithWidth(defaultWidth),
@@ -441,24 +401,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.confirmStop = false
 			return m, nil
-		case "r":
-			m.confirmStop = false
-			return m.startAction(m.act != nil, "rotate", func(ctx context.Context) error {
-				_, err := m.act.Rotate(ctx)
-				return err
-			})
-		case "d":
-			m.confirmStop = false
-			return m.startAction(m.act != nil, "use direct", func(ctx context.Context) error {
-				_, err := m.act.Use(ctx, "direct")
-				return err
-			})
-		case "w":
-			m.confirmStop = false
-			return m.startAction(m.act != nil, "use warp", func(ctx context.Context) error {
-				_, err := m.act.Use(ctx, "warp")
-				return err
-			})
 		case "s":
 			// Spec §7: s = start/stop. Daemon down → spawn `up --detach`
 			// through the Spawner seam on the FIRST press (starting is

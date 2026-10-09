@@ -93,44 +93,6 @@ func (c *ControlClient) Status(ctx context.Context) (*Status, error) {
 	return &st, nil
 }
 
-// Rotate asks the daemon to force an IP rotation now.
-func (c *ControlClient) Rotate(ctx context.Context) (string, error) {
-	data, err := c.do(ctx, http.MethodPost, "rotate", nil)
-	if err != nil {
-		return "", err
-	}
-	var out struct {
-		RotatedTo string `json:"rotated_to"`
-		Error     string `json:"error"`
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return "", fmt.Errorf("decode rotate: %w", err)
-	}
-	if out.Error != "" {
-		return "", fmt.Errorf("%s", out.Error)
-	}
-	return out.RotatedTo, nil
-}
-
-// Use forces the daemon onto direct or warp egress.
-func (c *ControlClient) Use(ctx context.Context, mode string) (string, error) {
-	data, err := c.do(ctx, http.MethodPost, "use?mode="+mode, nil)
-	if err != nil {
-		return "", err
-	}
-	var out struct {
-		Current string `json:"current"`
-		Error   string `json:"error"`
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return "", fmt.Errorf("decode use: %w", err)
-	}
-	if out.Error != "" {
-		return "", fmt.Errorf("%s", out.Error)
-	}
-	return out.Current, nil
-}
-
 // Stop asks the daemon to shut down gracefully.
 func (c *ControlClient) Stop(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodPost, "stop", nil)

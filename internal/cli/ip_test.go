@@ -1,8 +1,8 @@
 package cli
 
 // Task 2 (Phase C): egress IP observation — GET /_zenctl/status gains
-// egress_ip, refreshed by a debounced echo seam: after each successful
-// rotation and lazily on status reads, at most ONE echo in flight, minimum
+// egress_ip, refreshed by a debounced echo seam: lazily on status reads and
+// by an explicit Refresh (startup hook), at most ONE echo in flight, minimum
 // egressIPMinInterval between attempts, failures keep the last value.
 // Hermetic: fake IPEchoer implementations only; the production echoer is
 // exercised against a loopback httptest server. NO live network, and the
@@ -24,10 +24,7 @@ import (
 	"time"
 
 	"zen-router/internal/config"
-	"zen-router/internal/proxy"
-	"zen-router/internal/quota"
 	"zen-router/internal/router"
-	"zen-router/internal/zen"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -86,13 +83,12 @@ func (f *fakeEchoer) set(ip string, err error) {
 }
 
 // newEchoControl assembles control + router + tracker the way main.go wires
-// them: OnRotated → tracker.Refresh, Control.IPTracker → the same tracker.
-// interval/now are the debounce seams (tests use the fake clock).
+// them: Control.IPTracker → the tracker. interval/now are the debounce seams
+// (tests use the fake clock).
 func newEchoControl(t *testing.T, echoer IPEchoer, interval time.Duration, now func() time.Time) (*router.Router, *EgressIPTracker, http.Handler) {
 	t.Helper()
-	rot := newTestRouter(t, nil, time.Nanosecond)
+	rot := newTestRouter(t)
 	tr := newEgressIPTracker(echoer, interval, now)
-	rot.OnRotated = tr.Refresh
 	ctrl := &Control{
 		Router:    rot,
 		Listen:    "127.0.0.1:8787",
@@ -103,20 +99,17 @@ func newEchoControl(t *testing.T, echoer IPEchoer, interval time.Duration, now f
 	return rot, tr, h
 }
 
-// driveIdentityRotation performs the hermetic rotation: a stage-2 fresh
-// identity switch (the only rotation path testable without live Cloudflare/
-// WARP). It must fire Router.OnRotated — the refresh hook this task wires.
-func driveIdentityRotation(t *testing.T, rot *router.Router) {
+// waitFor polls cond until it holds or 5s elapse.
+func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	rot.Store().AddIdentity(&quota.WarpIdentity{
-		DeviceID:     "dev-rot-1",
-		RegisteredAt: time.Now().UnixMilli(),
-	})
-	if _, ok := rot.NextAttempt(router.Report{
-		Kind: zen.KindDailyLimit, Egress: proxy.EgressDirect, Key: "k1", Step: 1,
-	}); !ok {
-		t.Fatal("NextAttempt(step 1): want an identity-switch rotation (the refresh-hook trigger)")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 // newFakeClock returns a readable clock seam: advance to move time forward.
@@ -250,17 +243,18 @@ func TestEgressIPOneInFlight(t *testing.T) {
 	}
 }
 
-// --- TestEgressIPRefreshAfterRotation --------------------------------------
+// --- TestEgressIPRefreshReEchoes ---------------------------------------------
 
-// TestEgressIPRefreshAfterRotation: after each SUCCESSFUL rotation the
-// refresh hook (Router.OnRotated → tracker.Refresh) must re-echo through the
-// active transport so status.egress_ip reflects the NEW egress IP. The fake
-// clock steps over the debounce window first; without the hook the value
-// would stay stale forever (status reads only refresh a dirty tracker).
-func TestEgressIPRefreshAfterRotation(t *testing.T) {
+// TestEgressIPRefreshReEchoes: Refresh (the startup hook main.go wires at
+// boot, and the path any egress change takes) marks the observation stale
+// and must re-echo through the active transport so status.egress_ip reflects
+// the NEW IP. The fake clock steps over the debounce window first; without
+// the hook the value would stay stale forever (status reads only refresh a
+// dirty tracker).
+func TestEgressIPRefreshReEchoes(t *testing.T) {
 	fake := newFakeEchoer("203.0.113.1")
 	now, advance := newFakeClock(time.Now())
-	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+	_, tr, h := newEchoControl(t, fake, egressIPMinInterval, now)
 
 	waitFor(t, "the initial echo", func() bool {
 		_, st := getStatus(t, h)
@@ -270,17 +264,18 @@ func TestEgressIPRefreshAfterRotation(t *testing.T) {
 		t.Fatalf("echo calls after initial echo = %d, want 1", fake.count())
 	}
 
-	// Step over the debounce window, then rotate to a fresh identity.
+	// Step over the debounce window, then mark the observation stale (the
+	// startup refresh hook main.go wires once at boot).
 	advance(egressIPMinInterval + time.Second)
 	fake.set("203.0.113.2", nil)
-	driveIdentityRotation(t, rot)
+	tr.Refresh()
 
-	waitFor(t, "status.egress_ip to refresh after the rotation", func() bool {
+	waitFor(t, "status.egress_ip to refresh after Refresh", func() bool {
 		_, st := getStatus(t, h)
 		return st.EgressIP == "203.0.113.2"
 	})
 	if fake.count() != 2 {
-		t.Errorf("echo calls = %d, want 2 (initial + post-rotation refresh)", fake.count())
+		t.Errorf("echo calls = %d, want 2 (initial + explicit refresh)", fake.count())
 	}
 }
 
@@ -293,18 +288,18 @@ func TestEgressIPRefreshAfterRotation(t *testing.T) {
 func TestEgressIPFailureKeepsLastValue(t *testing.T) {
 	fake := newFakeEchoer("203.0.113.1")
 	now, advance := newFakeClock(time.Now())
-	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+	_, tr, h := newEchoControl(t, fake, egressIPMinInterval, now)
 
 	waitFor(t, "the initial echo", func() bool {
 		_, st := getStatus(t, h)
 		return st.EgressIP == "203.0.113.1"
 	})
 
-	// Rotation marks the value stale; the post-rotation echo FAILS.
+	// Refresh marks the value stale; the follow-up echo FAILS.
 	advance(egressIPMinInterval + time.Second)
 	fake.set("", errors.New("echo endpoint down"))
-	driveIdentityRotation(t, rot)
-	waitFor(t, "the failed post-rotation attempt", func() bool {
+	tr.Refresh()
+	waitFor(t, "the failed post-refresh attempt", func() bool {
 		return fake.count() >= 2
 	})
 
@@ -393,97 +388,54 @@ func TestHTTPEchoerProduction(t *testing.T) {
 
 // --- Fix round 1 ------------------------------------------------------------
 //
-// Findings F1–F5 of review round 1: staleness generation, Use/fallback hook
+// Findings F1–F5 of review round 1: staleness generation, refresh-hook
 // coverage, interval-gate isolation, value trimming. All hermetic.
 
-// TestEgressIPRotationDuringInFlight (F1): a rotation landing WHILE an echo
+// TestEgressIPRefreshDuringInFlight (F1): a Refresh landing WHILE an echo
 // attempt is in flight must force a follow-up attempt — the in-flight result
-// carries the pre-rotation IP, so committing it may not clear staleness
+// carries the pre-change IP, so committing it may not clear staleness
 // (staleness generation counter: maybeStart snapshots gen, run clears the
 // stale flag only when gen is unchanged). Without the generation the test
-// times out waiting for the post-rotation value.
-func TestEgressIPRotationDuringInFlight(t *testing.T) {
+// times out waiting for the post-refresh value.
+func TestEgressIPRefreshDuringInFlight(t *testing.T) {
 	fake := &fakeEchoer{
 		ip:      "203.0.113.1",
 		started: make(chan struct{}, 1),
 		release: make(chan struct{}),
 	}
 	now, advance := newFakeClock(time.Now())
-	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
+	_, tr, h := newEchoControl(t, fake, egressIPMinInterval, now)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/_zenctl/status", nil))
 	}()
-	<-fake.started // attempt 1 in flight, blocked, will succeed with the PRE-rotation IP
+	<-fake.started // attempt 1 in flight, blocked, will succeed with the PRE-refresh IP
 
-	// Rotation lands mid-attempt: marks stale + bumps the generation, but
+	// Refresh lands mid-attempt: marks stale + bumps the generation, but
 	// cannot start a second echo (single-in-flight gate).
-	driveIdentityRotation(t, rot)
+	tr.Refresh()
 
 	close(fake.release)
 	<-done
-	waitFor(t, "the pre-rotation attempt to land", func() bool {
+	waitFor(t, "the pre-refresh attempt to land", func() bool {
 		_, st := getStatus(t, h)
 		return st.EgressIP == "203.0.113.1"
 	})
 
 	// The in-flight attempt must NOT have cleared staleness (its gen is
-	// older than the rotation's) → once the window elapses a SECOND attempt
-	// fires with the post-rotation IP.
+	// older than the refresh's) → once the window elapses a SECOND attempt
+	// fires with the post-refresh IP.
 	fake.set("203.0.113.2", nil)
 	advance(egressIPMinInterval + time.Second)
 	getStatus(t, h)
-	waitFor(t, "a follow-up attempt after the rotation", func() bool {
+	waitFor(t, "a follow-up attempt after the refresh", func() bool {
 		_, st := getStatus(t, h)
 		return st.EgressIP == "203.0.113.2"
 	})
 	if got := fake.count(); got < 2 {
-		t.Errorf("echo calls = %d, want >= 2 (the rotation during flight forced a second attempt)", got)
-	}
-}
-
-// TestEgressIPUseTriggersRefresh (F2): the manual /_zenctl/use mode switch
-// (Router.Use) changes the ACTIVE egress without any rotation — it must mark
-// the observation stale and re-echo, or status.egress_ip would keep showing
-// the previous path's IP forever. Hermetic: onto warp via the fake
-// IdentitySwitch, then Use(direct) needs no Cloudflare call.
-func TestEgressIPUseTriggersRefresh(t *testing.T) {
-	fake := newFakeEchoer("203.0.113.1")
-	now, advance := newFakeClock(time.Now())
-	rot, _, h := newEchoControl(t, fake, egressIPMinInterval, now)
-
-	waitFor(t, "the initial echo", func() bool {
-		_, st := getStatus(t, h)
-		return st.EgressIP == "203.0.113.1"
-	})
-
-	// Onto warp (rotation refresh — already covered), fresh value observed.
-	advance(egressIPMinInterval + time.Second)
-	fake.set("203.0.113.2", nil)
-	driveIdentityRotation(t, rot)
-	waitFor(t, "the post-rotation echo", func() bool {
-		_, st := getStatus(t, h)
-		return st.EgressIP == "203.0.113.2"
-	})
-
-	// Manual switch back to direct: NOT a rotation, but the active egress
-	// changed → the observed IP must refresh anyway.
-	advance(egressIPMinInterval + time.Second)
-	fake.set("203.0.113.3", nil)
-	if err := rot.Use(context.Background(), proxy.EgressDirect); err != nil {
-		t.Fatalf("Use(direct): %v", err)
-	}
-	if rot.Current() != proxy.EgressDirect {
-		t.Fatalf("Current() = %s after Use(direct), want direct", rot.Current())
-	}
-	waitFor(t, "status.egress_ip to refresh after the manual Use switch", func() bool {
-		_, st := getStatus(t, h)
-		return st.EgressIP == "203.0.113.3"
-	})
-	if got := fake.count(); got != 3 {
-		t.Errorf("echo calls = %d, want 3 (initial + rotation + Use)", got)
+		t.Errorf("echo calls = %d, want >= 2 (the refresh during flight forced a second attempt)", got)
 	}
 }
 

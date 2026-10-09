@@ -1,13 +1,12 @@
 package gateway
 
 // Task 12 end-to-end tests: the OpenAI gateway surface runs against a fake
-// Zen-gateway upstream (httptest, loopback only) and the real staged router
-// with its privileged operations stubbed (IdentitySwitch/SpareRegistrar no-op
-// fakes, quota state in t.TempDir()). Hermetic: no network beyond 127.0.0.1.
+// Zen-gateway upstream (httptest, loopback only) and the real direct-only
+// router (quota state in t.TempDir()). Hermetic: no network beyond
+// 127.0.0.1.
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -49,25 +48,8 @@ func writePoolFile(t *testing.T, ks []string) string {
 	return path
 }
 
-// labelRT tags outgoing requests with the egress label so the fake upstream
-// can observe WHICH transport an attempt rode (direct vs the identity-switch
-// transport) without reaching into the handler.
-type labelRT struct {
-	label string
-	base  http.RoundTripper
-}
-
-func (l *labelRT) RoundTrip(r *http.Request) (*http.Response, error) {
-	r2 := r.Clone(r.Context())
-	r2.Header = r.Header.Clone()
-	r2.Header.Set("X-Test-Egress-Label", l.label)
-	return l.base.RoundTrip(r2)
-}
-
-// newTestRotator builds the real staged router: 2-key pool, quota state in
-// t.TempDir(), no-op identity switch (marker transport) and no-op spare
-// registrar. TWO unspent identities are seeded so the stage-2 switch has a
-// genuine choice of identities to move between (hot spare ≠ active).
+// newTestRotator builds the real direct-only router: 2-key pool, quota
+// state in t.TempDir().
 func newTestRotator(t *testing.T) *router.Router {
 	t.Helper()
 	// Neutralize environment key overrides: the pool file is the only source.
@@ -81,16 +63,10 @@ func newTestRotator(t *testing.T) *router.Router {
 	rot, err := router.New(router.Options{
 		Store: st,
 		Pool:  keys.New(writePoolFile(t, []string{"k1", "k2"})),
-		IdentitySwitch: func(id *quota.WarpIdentity) (http.RoundTripper, error) {
-			return &labelRT{label: "warp", base: http.DefaultTransport}, nil
-		},
-		SpareRegistrar: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	st.AddIdentity(&quota.WarpIdentity{DeviceID: "dev1"})
-	st.AddIdentity(&quota.WarpIdentity{DeviceID: "dev2"})
 	return rot
 }
 
@@ -527,17 +503,17 @@ func TestGatewayMounts(t *testing.T) {
 	}
 }
 
-// --- TestDailyLimitRotationSequence ----------------------------------------
+// --- TestDailyLimitKeyStepSequence -----------------------------------------
 
-// TestDailyLimitRotationSequence: the upstream 429s the first two attempts
-// with FreeUsageLimitError; D1 re-issues on the next key (stage 1) then on a
-// fresh identity transport (stage 2) and succeeds on the third call with a
-// different key and the warp-labeled transport. Both counters (egress and
-// key) are recorded; the client stream completes normally. ≤3 upstream calls.
-func TestDailyLimitRotationSequence(t *testing.T) {
+// TestDailyLimitKeyStepSequence: the upstream 429s the first attempt with
+// FreeUsageLimitError; D1 re-issues on the next pool key (stage 1, same
+// direct lane) and succeeds on the second call with the other key. The
+// direct egress and the spent key are recorded; the client stream completes
+// normally. ≤3 upstream calls (D1 budget), here 2 — one key stage only.
+func TestDailyLimitKeyStepSequence(t *testing.T) {
 	rot := newTestRotator(t)
 	up := newFakeUpstream(t, func(call int, w http.ResponseWriter, _ *http.Request) {
-		if call <= 2 {
+		if call == 1 {
 			writeDaily429(w)
 			return
 		}
@@ -556,47 +532,28 @@ func TestDailyLimitRotationSequence(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
 	reqs := up.requests()
-	if len(reqs) != 3 {
-		t.Fatalf("upstream requests = %d, want exactly 3", len(reqs))
+	if len(reqs) != 2 {
+		t.Fatalf("upstream requests = %d, want exactly 2", len(reqs))
 	}
 
-	// Attempt 1: key k1 on direct; attempt 2: key k2 (stage 1, same egress);
-	// attempt 3: stage-2 identity switch — same spent key (k2), warp transport.
-	wantKeys := []string{"Bearer k1", "Bearer k2", "Bearer k2"}
-	wantLabels := []string{"", "", "warp"}
+	// Attempt 1: key k1 on direct; attempt 2: key k2 (stage 1, same lane).
+	wantKeys := []string{"Bearer k1", "Bearer k2"}
 	for i := range reqs {
 		if auth := reqs[i].Header.Get("Authorization"); auth != wantKeys[i] {
 			t.Errorf("attempt %d Authorization = %q, want %q", i+1, auth, wantKeys[i])
-		}
-		if label := reqs[i].Header.Get("X-Test-Egress-Label"); label != wantLabels[i] {
-			t.Errorf("attempt %d egress label = %q, want %q", i+1, label, wantLabels[i])
 		}
 		if p := reqs[i].Path; p != "/zen/v1/chat/completions" {
 			t.Errorf("attempt %d path = %s, want /zen/v1/chat/completions", i+1, p)
 		}
 	}
 
-	// Both counters recorded: egress direct saw the first two rejections,
-	// each key saw exactly one.
+	// Counters: egress direct saw the one rejection, k1 saw it too.
 	snap := rot.Store().Snapshot()
-	if eg := snap.Egress["direct"]; eg == nil || eg.Daily429 != 2 {
-		t.Errorf("egress direct = %+v, want Daily429=2", eg)
+	if eg := snap.Egress["direct"]; eg == nil || eg.Daily429 != 1 {
+		t.Errorf("egress direct = %+v, want Daily429=1", eg)
 	}
 	if ks := snap.Keys["k1"]; ks == nil || ks.Daily429 != 1 {
 		t.Errorf("key k1 = %+v, want Daily429=1", ks)
-	}
-	if ks := snap.Keys["k2"]; ks == nil || ks.Daily429 != 1 {
-		t.Errorf("key k2 = %+v, want Daily429=1", ks)
-	}
-
-	// The stage-2 switch had TWO seeded identities to choose between, and
-	// the activation was persisted as a direct→warp rotation.
-	if ids := rot.Store().Identities(); len(ids) != 2 {
-		t.Errorf("seeded identities = %d, want 2", len(ids))
-	}
-	if rots := snap.Rotations; len(rots) == 0 ||
-		rots[0].From != string(proxy.EgressDirect) || rots[0].To != string(proxy.EgressWarp) {
-		t.Errorf("rotations = %+v, want a direct→warp identity switch recorded", snap.Rotations)
 	}
 
 	// The client still got a normal stream.
@@ -609,9 +566,10 @@ func TestDailyLimitRotationSequence(t *testing.T) {
 // --- TestBudgetExhaustedSurfaces429 ----------------------------------------
 
 // TestBudgetExhaustedSurfaces429: the upstream is out of daily quota for
-// every attempt. Exactly 3 attempts are executed (D1 budget), then the
-// client receives exactly one 429 carrying the classified envelope, a
-// Retry-After synthesized to the next UTC midnight, and metadata (429-only).
+// every attempt. The stage machine executes the first attempt plus ONE key
+// re-issue (2 requests, within the D1 cap of 3), then the client receives
+// exactly one 429 carrying the classified envelope, a Retry-After
+// synthesized to the next UTC midnight, and metadata (429-only).
 func TestBudgetExhaustedSurfaces429(t *testing.T) {
 	rot := newTestRotator(t)
 	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
@@ -631,8 +589,8 @@ func TestBudgetExhaustedSurfaces429(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
-	if n := len(up.requests()); n != 3 {
-		t.Errorf("upstream requests = %d, want exactly 3 (no infinite loop)", n)
+	if n := len(up.requests()); n != 2 {
+		t.Errorf("upstream requests = %d, want exactly 2 (first attempt + one key re-issue, no infinite loop)", n)
 	}
 
 	env := requireOpenAIError(t, rec, "FreeUsageLimitError")

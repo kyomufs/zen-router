@@ -27,7 +27,6 @@ type theme struct {
 	// Palette (Catppuccin Mocha / Latte).
 	accent color.Color // mauve — focus ring, header
 	direct color.Color // green — direct-egress badge
-	warp   color.Color // pink — warp-egress badge
 	ok     color.Color // green — quota within limits
 	warn   color.Color // yellow — 429 seen today
 	err    color.Color // red — key/egress exhausted
@@ -53,7 +52,6 @@ func newTheme(isDark bool) theme {
 		isDark: isDark,
 		accent: pick("#8839ef", "#cba6f7"), // mauve
 		direct: pick("#40a02b", "#a6e3a1"), // green
-		warp:   pick("#ea76cb", "#f5c2e7"), // pink
 		ok:     pick("#40a02b", "#a6e3a1"), // green
 		warn:   pick("#df8e1d", "#f9e2af"), // yellow
 		err:    pick("#d20f39", "#f38ba8"), // red

@@ -21,11 +21,9 @@ import (
 const UnitName = "zen-router.service"
 
 // serviceEnvironment is the Environment= line of the unit. systemd user
-// managers start with a minimal PATH that lacks both directories this daemon
-// actually execs from on NixOS (spec §14:352-353): internal/warp/tunnel.go
-// runs `sudo ip …`, where `sudo` is the setuid wrapper under
-// /run/wrappers/bin and `ip` is /run/current-system/sw/bin/ip. /usr/bin and
-// /bin keep the unit usable off NixOS.
+// managers start with a minimal PATH that lacks the standard directories
+// this daemon's environment may exec helper tools from on NixOS
+// (/usr/bin, /bin keep the unit usable off NixOS).
 const serviceEnvironment = "Environment=PATH=/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/bin"
 
 // Render returns the unit file content for an absolute binary path (spec §8):
@@ -34,7 +32,7 @@ const serviceEnvironment = "Environment=PATH=/run/wrappers/bin:/run/current-syst
 func Render(binary string) string {
 	var b strings.Builder
 	b.WriteString("[Unit]\n")
-	b.WriteString("Description=zen-router local gateway for OpenCode Zen with WARP IP rotation\n")
+	b.WriteString("Description=zen-router local gateway for OpenCode Zen with key-pool quota rotation\n")
 	b.WriteString("\n[Service]\n")
 	fmt.Fprintf(&b, "ExecStart=%s up\n", binary)
 	b.WriteString("Restart=on-failure\n")

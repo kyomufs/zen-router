@@ -1,22 +1,22 @@
 package tui
 
 // Panel grid contract (approved redesign step 2): the dashboard renders as
-// a bordered panel grid — 2x2 at >=100 cols (quota·egress | quota·keys /
-// identity pool | rotation history), stacked quotas at 80-99 cols, single
-// column below 80 (status -> quotas -> identity -> rotation -> log) — with
-// the LOG panel full-width below the grid and a fixed footer (keys line,
-// then the transient action line as the very last line).
+// a bordered panel grid — the two quota panels side by side at >=100 cols,
+// stacked quotas at 80-99 cols, single column below 80 (status -> quotas)
+// — with the LOG panel full-width below the grid and a fixed footer (keys
+// line, then the transient action line as the very last line).
 //
 // Two invariants are pinned here beyond shape:
 //
-//   - content hug: quota/identity panels size to their rows, never to the
-//     terminal (the old view split leftover height evenly across all four
+//   - content hug: quota panels size to their rows, never to the
+//     terminal (the old view split leftover height evenly across all
 //     tables — the "blank void" bug);
 //   - frame fit + line width at every breakpoint.
 //
 // Panel titles keep the exact literals the hardening matrix asserts
-// ("quota (per egress)", "identity pool (2, active 1)", ...) — they now
-// live embedded in the rounded top border of their panel.
+// ("quota (per egress)", "quota (per key)", ...) — they now
+// live embedded in the rounded top border of their panel. The identity
+// pool / rotation history panels no longer exist (WARP excision).
 
 import (
 	"strings"
@@ -26,9 +26,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// smallJSON: minimal populated dashboard — 2 egress rows, 1 key row, 1
-// identity, 2 rotations, 1 log line — to measure hug against known row
-// counts instead of guessing from the 60-rotation fixture.
+// smallJSON: minimal populated dashboard — 1 egress row, 2 key rows, 1
+// log line — to measure hug against known row counts instead of guessing
+// from the full-fat fixture.
 func smallJSON(t *testing.T) string {
 	t.Helper()
 	return `{
@@ -40,22 +40,14 @@ func smallJSON(t *testing.T) string {
   "uptime_seconds": 7,
   "state": {
     "version": 2,
-    "mode": "auto",
-    "current": "direct",
     "updatedAt": 1759700000000,
     "egress": {
-      "direct": {"ok": 3, "daily429": 0},
-      "warp": {"ok": 1, "daily429": 1}
+      "direct": {"ok": 3, "daily429": 0}
     },
-    "keys": {"deadbeef": {"ok": 2, "daily429": 0}},
-    "identities": [
-      {"deviceId": "dev-one", "publicKey": "pk-one", "addressV4": "10.0.0.9", "registeredAt": 1763193600000}
-    ],
-    "active": 1,
-    "rotations": [
-      {"at": 1759700001000, "from": "direct", "to": "warp", "reason": "rotation-01"},
-      {"at": 1759700002000, "from": "warp", "to": "direct", "reason": "rotation-02"}
-    ]
+    "keys": {
+      "deadbeef": {"ok": 2, "daily429": 0},
+      "cafebabe": {"ok": 1, "daily429": 1}
+    }
   }
 }`
 }
@@ -90,8 +82,6 @@ func TestPanelsRenderWithBorders(t *testing.T) {
 	for _, title := range []string{
 		"quota (per egress)",
 		"quota (per key)",
-		"identity pool",
-		"rotation history",
 		"log tail",
 	} {
 		idx := lineOf(content, title)
@@ -106,58 +96,48 @@ func TestPanelsRenderWithBorders(t *testing.T) {
 	}
 }
 
-// TestWideBreakpointIsTwoByTwo: >=100 cols puts the two quota panels side
-// by side on row 1 and identity/rotation side by side on row 2 — titles of
-// a row share one output line.
-func TestWideBreakpointIsTwoByTwo(t *testing.T) {
+// TestWideBreakpointPairsQuotas: >=100 cols puts the two quota panels side
+// by side (titles share one output line) with the log panel below.
+func TestWideBreakpointPairsQuotas(t *testing.T) {
 	m := dashboardModel(t)
 	nm, _ := update(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
 	content := nm.View().Content
 
 	eg, keys := lineOf(content, "quota (per egress)"), lineOf(content, "quota (per key)")
-	id, rot := lineOf(content, "identity pool"), lineOf(content, "rotation history")
-	if eg < 0 || keys < 0 || id < 0 || rot < 0 {
-		t.Fatalf("missing panel titles (eg=%d keys=%d id=%d rot=%d):\n%s", eg, keys, id, rot, content)
+	logIdx := lineOf(content, "log tail")
+	if eg < 0 || keys < 0 || logIdx < 0 {
+		t.Fatalf("missing panel titles (eg=%d keys=%d log=%d):\n%s", eg, keys, logIdx, content)
 	}
 	if eg != keys {
-		t.Errorf("row 1 not side-by-side: egress line %d != keys line %d", eg, keys)
+		t.Errorf("quotas not side-by-side: egress line %d != keys line %d", eg, keys)
 	}
-	if id != rot {
-		t.Errorf("row 2 not side-by-side: identity line %d != rotation line %d", id, rot)
-	}
-	if !(eg < id) {
-		t.Errorf("row 1 (line %d) must be above row 2 (line %d)", eg, id)
+	if logIdx <= eg {
+		t.Errorf("log panel (line %d) must sit below the quota row (line %d)", logIdx, eg)
 	}
 }
 
 // TestMidBreakpointStacksQuotas: 80-99 cols stacks the quota panels
-// vertically (full width each) but keeps identity/rotation paired.
+// vertically (full width each); the log panel stays below both.
 func TestMidBreakpointStacksQuotas(t *testing.T) {
 	m := dashboardModel(t)
 	nm, _ := update(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
 	content := nm.View().Content
 
 	eg, keys := lineOf(content, "quota (per egress)"), lineOf(content, "quota (per key)")
-	id, rot := lineOf(content, "identity pool"), lineOf(content, "rotation history")
-	if eg < 0 || keys < 0 || id < 0 || rot < 0 {
-		t.Fatalf("missing panel titles (eg=%d keys=%d id=%d rot=%d):\n%s", eg, keys, id, rot, content)
+	logIdx := lineOf(content, "log tail")
+	if eg < 0 || keys < 0 || logIdx < 0 {
+		t.Fatalf("missing panel titles (eg=%d keys=%d log=%d):\n%s", eg, keys, logIdx, content)
 	}
 	if eg == keys {
 		t.Errorf("quotas must stack at 90 cols, both titles on line %d", eg)
 	}
-	if !(eg < keys) {
-		t.Errorf("egress panel (line %d) must be above keys panel (line %d)", eg, keys)
-	}
-	if id != rot {
-		t.Errorf("identity/rotation must stay side-by-side at 90 cols: %d != %d", id, rot)
-	}
-	if keys > id {
-		t.Errorf("quotas (line %d) must be above identity row (line %d)", keys, id)
+	if !(eg < keys && keys < logIdx) {
+		t.Errorf("stacked order broken: egress %d, keys %d, log %d", eg, keys, logIdx)
 	}
 }
 
 // TestNarrowBreakpointIsSingleColumn: <80 cols unrolls everything into one
-// column in the approved order — status, quotas, identity, rotation, log.
+// column in the approved order — status, quotas, log.
 func TestNarrowBreakpointIsSingleColumn(t *testing.T) {
 	m := dashboardModel(t)
 	nm, _ := update(t, m, tea.WindowSizeMsg{Width: 70, Height: 40})
@@ -167,8 +147,6 @@ func TestNarrowBreakpointIsSingleColumn(t *testing.T) {
 		"daemon: up",
 		"quota (per egress)",
 		"quota (per key)",
-		"identity pool",
-		"rotation history",
 		"log tail",
 	}
 	prev, prevName := -1, "(start)"
@@ -185,32 +163,42 @@ func TestNarrowBreakpointIsSingleColumn(t *testing.T) {
 	}
 }
 
-// TestQuotaPanelsHugContent: the blank-void regression guard. With 2
-// egress rows the distance from the egress panel title to the identity row
-// title is the egress panel itself (title + table header + 2 rows + bottom
-// border + slack) — NOT a fraction of the terminal height. The old layout
-// split leftover height evenly, blowing this bound at 120x40.
+// TestQuotaPanelsHugContent: the blank-void regression guard. The distance
+// from the egress panel title to the next landmark (keys title when
+// stacked, log title when paired) is bounded by the panel content itself
+// (title + table header + data rows + borders + slack) — NOT a fraction of
+// the terminal height. The old layout split leftover height evenly,
+// blowing this bound at 120x40.
 func TestQuotaPanelsHugContent(t *testing.T) {
+	const maxGap = 8 // title + header rows + rows + borders + slack
+
+	// Wide: the quota row hugs (1 egress row / 2 key rows side by side),
+	// so the log panel follows within maxGap lines.
 	m := smallModel(t)
 	nm, _ := update(t, m, tea.WindowSizeMsg{Width: 120, Height: 40})
 	content := nm.View().Content
-	lines := strings.Split(content, "\n")
-
-	const maxGap = 8 // title + header row + 2 data rows + border + slack
-	eg, id := lineOf(content, "quota (per egress)"), lineOf(content, "identity pool")
-	if eg < 0 || id < 0 {
-		t.Fatalf("missing titles (eg=%d id=%d):\n%s", eg, id, content)
+	eg, logIdx := lineOf(content, "quota (per egress)"), lineOf(content, "log tail")
+	if eg < 0 || logIdx < 0 {
+		t.Fatalf("missing titles (eg=%d log=%d):\n%s", eg, logIdx, content)
 	}
-	if gap := id - eg; gap > maxGap || gap < 1 {
-		t.Errorf("egress panel spans %d lines, want 1..%d (content hug violated):\n%s",
-			gap, maxGap, strings.Join(lines[eg:min(id+1, len(lines))], "\n"))
+	if gap := logIdx - eg; gap > maxGap || gap < 1 {
+		t.Errorf("quota row spans %d lines, want 1..%d (content hug violated):\n%s",
+			gap, maxGap, content)
 	}
 
-	keys, rot := lineOf(content, "quota (per key)"), lineOf(content, "rotation history")
-	if keys < 0 || rot < 0 {
-		t.Fatalf("missing titles (keys=%d rot=%d):\n%s", keys, rot, content)
+	// Mid: stacked quotas hug the same way — egress panel (1 row) ends at
+	// the keys title, keys panel (2 rows) ends at the log title.
+	nm, _ = update(t, m, tea.WindowSizeMsg{Width: 90, Height: 30})
+	content = nm.View().Content
+	eg, keys, logIdx := lineOf(content, "quota (per egress)"),
+		lineOf(content, "quota (per key)"), lineOf(content, "log tail")
+	if eg < 0 || keys < 0 || logIdx < 0 {
+		t.Fatalf("missing titles (eg=%d keys=%d log=%d):\n%s", eg, keys, logIdx, content)
 	}
-	if gap := rot - keys; gap > maxGap || gap < 1 {
+	if gap := keys - eg; gap > maxGap || gap < 1 {
+		t.Errorf("egress panel spans %d lines, want 1..%d (content hug violated)", gap, maxGap)
+	}
+	if gap := logIdx - keys; gap > maxGap || gap < 1 {
 		t.Errorf("keys panel spans %d lines, want 1..%d (content hug violated)", gap, maxGap)
 	}
 }
@@ -225,14 +213,15 @@ func TestLogPanelSitsBelowGridAndFooterLast(t *testing.T) {
 		content := nm.View().Content
 		lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 
-		logIdx, rotIdx := lineOf(content, "log tail"), lineOf(content, "rotation history")
+		logIdx, keys := lineOf(content, "log tail"), lineOf(content, "quota (per key)")
 		quitIdx := lineOf(content, "quit")
-		if logIdx < 0 || rotIdx < 0 || quitIdx < 0 {
-			t.Fatalf("%dx%d: missing log/rotation/help (log=%d rot=%d quit=%d):\n%s",
-				tc.w, tc.h, logIdx, rotIdx, quitIdx, content)
+		if logIdx < 0 || keys < 0 || quitIdx < 0 {
+			t.Fatalf("%dx%d: missing log/quota/help (log=%d keys=%d quit=%d):\n%s",
+				tc.w, tc.h, logIdx, keys, quitIdx, content)
 		}
-		if logIdx < rotIdx {
-			t.Errorf("%dx%d: log panel (line %d) above rotation (line %d)", tc.w, tc.h, logIdx, rotIdx)
+		if logIdx <= keys {
+			t.Errorf("%dx%d: log panel (line %d) not below quota row (line %d)",
+				tc.w, tc.h, logIdx, keys)
 		}
 		if quitIdx < logIdx {
 			t.Errorf("%dx%d: keys line (line %d) above log panel (line %d)", tc.w, tc.h, quitIdx, logIdx)
@@ -246,7 +235,7 @@ func TestLogPanelSitsBelowGridAndFooterLast(t *testing.T) {
 	// Pending action: footer = keys line + action line, action last.
 	m := dashboardModel(t)
 	m.pending = true
-	m.actionLabel = "rotate"
+	m.actionLabel = "stop daemon"
 	last := lastLine(m.View().Content)
 	if !strings.Contains(last, "in flight") {
 		t.Errorf("last line %q must be the transient action line while pending", last)
@@ -255,8 +244,8 @@ func TestLogPanelSitsBelowGridAndFooterLast(t *testing.T) {
 
 // TestViewFitsBreakpointSizes: frame fit (<= height) and explicit
 // truncation (<= width, ANSI-stripped, counted in runes) at every
-// breakpoint, including the tight 100x24 where rotation/history must shrink
-// first to make room.
+// breakpoint, including the tight 100x24 where the grid must shrink to
+// make room.
 func TestViewFitsBreakpointSizes(t *testing.T) {
 	for _, tc := range []struct{ w, h int }{
 		{120, 40},
@@ -276,29 +265,12 @@ func TestViewFitsBreakpointSizes(t *testing.T) {
 				t.Errorf("%dx%d: line of %d cells > width %d: %q", tc.w, tc.h, n, tc.w, line)
 			}
 		}
-		if !strings.Contains(content, "rotation-60") {
-			t.Errorf("%dx%d: newest rotation row missing:\n%s", tc.w, tc.h, content)
+		if !strings.Contains(content, "deadbeef") {
+			t.Errorf("%dx%d: key row missing:\n%s", tc.w, tc.h, content)
 		}
 		if !strings.Contains(content, "quit") {
 			t.Errorf("%dx%d: help line missing:\n%s", tc.w, tc.h, content)
 		}
-	}
-}
-
-// TestIdentityPanelExplainsEmptyPool: in production the pool is empty (no
-// reachable Cloudflare API); the panel must say so instead of showing a
-// bare column header (spec §14 data reality).
-func TestIdentityPanelExplainsEmptyPool(t *testing.T) {
-	st := statusFromJSON(t, `{"up":true,"mode":"auto","current":"direct","state":{"version":2,"mode":"auto","current":"direct","updatedAt":1759700000000,"egress":{},"keys":{},"identities":[],"active":0,"rotations":[]}}`)
-	m := New(newFake(fakeResult{status: st}), WithLogTail(&fakeLogSource{lines: []string{"boot"}}))
-	nm, _ := update(t, m, runCmd(t, m.Init()))
-	content := nm.View().Content
-
-	if !strings.Contains(content, "identity pool (0, active 0)") {
-		t.Errorf("empty pool title missing:\n%s", content)
-	}
-	if !strings.Contains(content, "no identities") {
-		t.Errorf("empty pool must explain itself (want \"no identities\"):\n%s", content)
 	}
 }
 

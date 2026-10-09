@@ -245,7 +245,8 @@ func TestNonStreamingToolCallAssembly(t *testing.T) {
 // 429s through the whole rotation budget gets the OpenAI error envelope
 // (nothing was written before the flush, so the pre-flush rotation gate
 // still applied) with the 429 status, metadata and Retry-After — and the
-// rotation really ran: all three attempts executed on k1→k2→k2.
+// rotation really ran: both attempts executed on k1→k2 (the single key
+// stage; the stage machine has no further stages).
 func TestNonStreamingBudgetExhausted429(t *testing.T) {
 	rot := newTestRotator(t)
 	up := newFakeUpstream(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
@@ -261,16 +262,16 @@ func TestNonStreamingBudgetExhausted429(t *testing.T) {
 		t.Fatalf("status = %d, want 429 (body %q)", rec.Code, truncate(rec.Body.Bytes()))
 	}
 	reqs := up.requests()
-	if len(reqs) != 3 {
-		t.Errorf("upstream requests = %d, want 3 (rotation budget executed pre-flush)", len(reqs))
+	if len(reqs) != 2 {
+		t.Errorf("upstream requests = %d, want 2 (key stage executed pre-flush, then exhausted)", len(reqs))
 	}
 	var keys []string
 	for _, ur := range reqs {
 		auth := ur.Header.Get("Authorization")
 		keys = append(keys, strings.TrimPrefix(auth, "Bearer "))
 	}
-	if len(keys) == 3 && !(keys[0] == "k1" && keys[1] == "k2" && keys[2] == "k2") {
-		t.Errorf("attempt keys = %v, want [k1 k2 k2] (key then identity rotation)", keys)
+	if len(keys) == 2 && !(keys[0] == "k1" && keys[1] == "k2") {
+		t.Errorf("attempt keys = %v, want [k1 k2] (one key re-issue)", keys)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra == "" {
 		t.Error("Retry-After missing on 429 envelope")

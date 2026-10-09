@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
 )
@@ -23,12 +22,9 @@ const ControlPrefix = "/_zenctl/"
 // Status is the JSON payload served by GET /_zenctl/status: the dashboard
 // header fields plus the redacted quota state (plan Task 1, spec §7).
 type Status struct {
-	Mode    string `json:"mode"`
-	Current string `json:"current"`
-	Up      bool   `json:"up"`
-	// State is the quota snapshot with identity credentials and raw API
-	// keys stripped by the control layer — state.json on disk keeps the
-	// full fidelity.
+	Up bool `json:"up"`
+	// State is the quota snapshot with raw API keys stripped by the
+	// control layer — state.json on disk keeps the full fidelity.
 	State quota.State `json:"state"`
 
 	// Listen is the resolved listen address ("host:port").
@@ -40,16 +36,6 @@ type Status struct {
 	Pid int `json:"pid"`
 	// UptimeSeconds is the daemon uptime (whole seconds, clamped at 0).
 	UptimeSeconds int64 `json:"uptime_seconds"`
-	// LastRotate is the RFC3339 stamp of the last rotation completed by
-	// THIS process ("" = none this run).
-	LastRotate string `json:"last_rotate"`
-	// Rotating reports an in-flight rotation.
-	Rotating bool `json:"rotating"`
-	// Registering reports an in-flight background spare registration.
-	Registering bool `json:"registering"`
-	// LastSpareError is the most recent spare-registration failure
-	// ("" = none since the last success).
-	LastSpareError string `json:"lastSpareError"`
 	// LatencyTTFB is the per-egress GATEWAY window (request start → 2xx
 	// response headers) — the dashboard number Task 5 renders.
 	LatencyTTFB map[string]router.EgressLatency `json:"latency_ttfb_ms"`
@@ -59,10 +45,9 @@ type Status struct {
 	LatencyStream map[string]router.EgressLatency `json:"latency_stream_ms"`
 	// EgressIP is the last observed public IP of the active egress
 	// ("" = unknown: echo disabled via config.EgressIPEcho, not yet
-	// performed, or the last attempt failed). Refreshed after each
-	// successful rotation and lazily on status reads, debounced by
-	// egressIPMinInterval — plan Task 2 (plan-local extra, no spec
-	// section; provenance D3).
+	// performed, or the last attempt failed). Refreshed on startup and
+	// lazily on status reads, debounced by egressIPMinInterval — plan
+	// Task 2 (plan-local extra, no spec section; provenance D3).
 	EgressIP string `json:"egress_ip"`
 }
 
@@ -100,10 +85,6 @@ func (c *Control) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case route == "status" && r.Method == http.MethodGet:
 		c.handleStatus(w)
-	case route == "rotate" && r.Method == http.MethodPost:
-		c.handleRotate(w)
-	case route == "use" && r.Method == http.MethodPost:
-		c.handleUse(w, r)
 	case route == "stop" && r.Method == http.MethodPost:
 		c.handleStop(w)
 	default:
@@ -123,16 +104,6 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 	// Control-layer redaction ONLY: state.json on disk keeps credentials,
 	// the loopback dashboard payload never sees them (plan Task 1).
 	snap := c.Router.Store().Snapshot()
-	for i, id := range snap.Identities {
-		if id != nil {
-			redacted := id.Redacted()
-			snap.Identities[i] = &redacted
-		}
-	}
-	if snap.Warp != nil {
-		redacted := snap.Warp.Redacted()
-		snap.Warp = &redacted
-	}
 	snap.Keys = fingerprintKeys(snap.Keys)
 
 	var uptime int64
@@ -141,25 +112,15 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 			uptime = u
 		}
 	}
-	lastRotate := ""
-	if t := c.Router.LastRotate(); !t.IsZero() {
-		lastRotate = t.Format(time.RFC3339)
-	}
 
 	writeJSON(w, http.StatusOK, Status{
-		Mode:           c.Router.Store().Mode(),
-		Current:        string(c.Router.Current()),
-		Up:             true,
-		State:          snap,
-		Listen:         c.Listen,
-		Pid:            os.Getpid(), // this very process serves the endpoint
-		UptimeSeconds:  uptime,
-		LastRotate:     lastRotate,
-		Rotating:       c.Router.Rotating(),
-		Registering:    c.Router.Registering(),
-		LastSpareError: c.Router.LastSpareError(),
-		LatencyTTFB:    c.Router.Latency(router.LatencyTTFB),
-		LatencyStream:  c.Router.Latency(router.LatencyStream),
+		Up:            true,
+		State:         snap,
+		Listen:        c.Listen,
+		Pid:           os.Getpid(), // this very process serves the endpoint
+		UptimeSeconds: uptime,
+		LatencyTTFB:   c.Router.Latency(router.LatencyTTFB),
+		LatencyStream: c.Router.Latency(router.LatencyStream),
 		// IP() also triggers the debounced lazy refresh when the value is
 		// stale; the echo itself runs asynchronously, so this read never
 		// blocks and a status-poll burst cannot fan out echo requests.
@@ -188,45 +149,6 @@ func fingerprintKeys(in map[string]*quota.KeyStats) map[string]*quota.KeyStats {
 func fingerprintKey(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:4])
-}
-
-func (c *Control) handleRotate(w http.ResponseWriter) {
-	to, err := c.Router.RotateNow("manual rotate via CLI")
-	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":   err.Error(),
-			"current": string(c.Router.Current()),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"rotated_to": string(to),
-		"mode":       c.Router.Store().Mode(),
-	})
-}
-
-func (c *Control) handleUse(w http.ResponseWriter, r *http.Request) {
-	mode := r.URL.Query().Get("mode")
-	var e proxy.Egress
-	switch mode {
-	case "direct":
-		e = proxy.EgressDirect
-	case "warp":
-		e = proxy.EgressWarp
-	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "mode must be direct or warp",
-		})
-		return
-	}
-	if err := c.Router.Use(r.Context(), e); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"current": string(c.Router.Current()),
-		"mode":    c.Router.Store().Mode(),
-	})
 }
 
 func (c *Control) handleStop(w http.ResponseWriter) {

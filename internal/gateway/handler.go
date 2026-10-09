@@ -269,7 +269,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 
 		// One attempt: fresh req_ id, per-attempt transport, watchdog-wrapped
 		// body, lane relay with flush-per-frame.
-		done, ue, workspace, metadata := func(att router.Attempt) (
+		done, ue, _, metadata := func(att router.Attempt) (
 			bool, *zen.UpstreamError, string, json.RawMessage) {
 			attemptCtx, cancel := context.WithCancel(ctx)
 			defer cancel() // watchdog handoff: cancel on any attempt exit
@@ -405,8 +405,6 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request) {
 			Key:        att.Key,
 			RetryAfter: ue.RetryAfter,
 			Step:       att.Step, // the FAILED attempt's stage
-			Type:       ue.Type,
-			Workspace:  workspace,
 		}
 		next, nextOK := h.Rot.NextAttempt(rep)
 

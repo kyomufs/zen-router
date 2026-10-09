@@ -96,9 +96,6 @@ type Config struct {
 	// ZEN_ROUTER_FAMILY.
 	Family               string        `json:"family"`
 	KeyPoolFile          string        `json:"keyPoolFile"` // "" = derive later
-	PoolSize             int           `json:"poolSize"`
-	PoolSpare            int           `json:"poolSpare"`
-	RotationCooldown     time.Duration `json:"rotationCooldown"`
 	FirstEventTimeout    time.Duration `json:"firstEventTimeout"`
 	IdleTimeout          time.Duration `json:"idleTimeout"`
 	ResponsesIdleTimeout time.Duration `json:"responsesIdleTimeout"`
@@ -116,9 +113,6 @@ func Default() *Config {
 		Upstream:             "https://opencode.ai",
 		Family:               "auto",
 		KeyPoolFile:          "",
-		PoolSize:             4,
-		PoolSpare:            1,
-		RotationCooldown:     30 * time.Second,
 		FirstEventTimeout:    30 * time.Second,
 		IdleTimeout:          120 * time.Second,
 		ResponsesIdleTimeout: 300 * time.Second,
@@ -149,9 +143,6 @@ type rawConfig struct {
 	Upstream             *string `json:"upstream"`
 	Family               *string `json:"family"`
 	KeyPoolFile          *string `json:"keyPoolFile"`
-	PoolSize             *int    `json:"poolSize"`
-	PoolSpare            *int    `json:"poolSpare"`
-	RotationCooldown     *string `json:"rotationCooldown"`
 	FirstEventTimeout    *string `json:"firstEventTimeout"`
 	IdleTimeout          *string `json:"idleTimeout"`
 	ResponsesIdleTimeout *string `json:"responsesIdleTimeout"`
@@ -175,12 +166,6 @@ func (r *rawConfig) apply(cfg *Config) error {
 	if r.KeyPoolFile != nil {
 		cfg.KeyPoolFile = *r.KeyPoolFile
 	}
-	if r.PoolSize != nil {
-		cfg.PoolSize = *r.PoolSize
-	}
-	if r.PoolSpare != nil {
-		cfg.PoolSpare = *r.PoolSpare
-	}
 	if r.EgressIPEcho != nil {
 		cfg.EgressIPEcho = *r.EgressIPEcho
 	}
@@ -189,7 +174,6 @@ func (r *rawConfig) apply(cfg *Config) error {
 		src  *string
 		dst  *time.Duration
 	}{
-		{"rotationCooldown", r.RotationCooldown, &cfg.RotationCooldown},
 		{"firstEventTimeout", r.FirstEventTimeout, &cfg.FirstEventTimeout},
 		{"idleTimeout", r.IdleTimeout, &cfg.IdleTimeout},
 		{"responsesIdleTimeout", r.ResponsesIdleTimeout, &cfg.ResponsesIdleTimeout},

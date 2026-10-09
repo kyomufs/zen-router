@@ -34,20 +34,9 @@ func writePoolFile(t *testing.T, ks []string) string {
 	return path
 }
 
-// fakeSwitch records which identity NextAttempt activated and hands back a
-// marker transport, so no WireGuard tunnel (root) is ever needed in tests.
-// calls counts invocations so churn can be asserted (finding 3).
-type fakeSwitch struct {
-	id    *quota.WarpIdentity
-	rt    http.RoundTripper
-	calls int
-}
-
 // testRouter bundles a Router with its test seams.
 type testRouter struct {
 	*Router
-	sw         *fakeSwitch
-	registered chan struct{}
 }
 
 func newTestRouter(t *testing.T, opts Options) *testRouter {
@@ -66,56 +55,22 @@ func newTestRouter(t *testing.T, opts Options) *testRouter {
 		opts.Pool = keys.New(writePoolFile(t, []string{"k1", "k2"}))
 	}
 
-	sw := &fakeSwitch{rt: &http.Transport{}}
-	opts.IdentitySwitch = func(id *quota.WarpIdentity) (http.RoundTripper, error) {
-		sw.id = id
-		sw.calls++
-		return sw.rt, nil
-	}
-	registered := make(chan struct{}, 8)
-	opts.SpareRegistrar = func(context.Context) error {
-		registered <- struct{}{}
-		return nil
-	}
-
 	r, err := New(opts)
 	if err != nil {
 		t.Fatalf("router.New: %v", err)
 	}
-	return &testRouter{Router: r, sw: sw, registered: registered}
+	return &testRouter{Router: r}
 }
 
-// setWarpEgress puts the router on the warp path without a tunnel.
-func (tr *testRouter) setWarpEgress(t *testing.T) {
-	t.Helper()
-	tr.mu.Lock()
-	tr.egress = proxy.EgressWarp
-	tr.warpRT = tr.sw.rt
-	tr.mu.Unlock()
-	tr.store.SetCurrent("warp")
-}
-
-func addIdentity(t *testing.T, st *quota.Manager, device string, spentUntil time.Time) {
-	t.Helper()
-	var spent int64 // 0 = not spent (quota semantics); only stamp real times
-	if !spentUntil.IsZero() {
-		spent = spentUntil.UnixMilli()
-	}
-	st.AddIdentity(&quota.WarpIdentity{
-		DeviceID:   device,
-		SpentUntil: spent,
-	})
-}
-
-// TestNextAttemptKeyStep: a daily-limit report on egress E with a pool of
-// >= 2 keys re-issues on the SAME egress with the next key (stage 1).
+// TestNextAttemptKeyStep: a daily-limit report with a pool of >= 2 keys
+// re-issues on the direct lane with the next key (stage 1); key-step reports
+// record both counters.
 func TestNextAttemptKeyStep(t *testing.T) {
 	tr := newTestRouter(t, Options{})
-	tr.setWarpEgress(t)
 
 	rep := Report{
 		Kind:       zen.KindDailyLimit,
-		Egress:     proxy.EgressWarp,
+		Egress:     proxy.EgressDirect,
 		Key:        "k1",
 		Step:       0,
 		RetryAfter: time.Hour,
@@ -127,388 +82,63 @@ func TestNextAttemptKeyStep(t *testing.T) {
 	if att.Step != 1 {
 		t.Errorf("Step = %d, want 1", att.Step)
 	}
-	if att.Egress != proxy.EgressWarp {
-		t.Errorf("Egress = %s, want warp (same egress)", att.Egress)
+	if att.Egress != proxy.EgressDirect {
+		t.Errorf("Egress = %s, want direct (same lane)", att.Egress)
 	}
 	if att.Key == "k1" || att.Key == "" {
 		t.Errorf("Key = %q, want a different pool key", att.Key)
 	}
-	if att.Transport != tr.sw.rt {
-		t.Errorf("Transport = %v, want the warp transport", att.Transport)
-	}
 	snap := tr.store.Snapshot()
-	if got := snap.Egress["warp"]; got == nil || got.Daily429 != 1 {
-		t.Errorf("egress warp Daily429 = %v, want 1", got)
+	if got := snap.Egress["direct"]; got == nil || got.Daily429 != 1 {
+		t.Errorf("egress direct Daily429 = %v, want 1", got)
 	}
 	if got := snap.Keys["k1"]; got == nil || got.Daily429 != 1 {
 		t.Errorf("key k1 Daily429 = %v, want 1", got)
 	}
-	if len(snap.Rotations) != 0 {
-		t.Errorf("Rotations = %d, want 0 (key step is not a rotation)", len(snap.Rotations))
-	}
 }
 
-// TestNextAttemptSkipsKeyStepWhenSingleKey: with pool ["public"] there is no
-// key re-issue — the decision skips straight to the rotation stage (Step 2).
-func TestNextAttemptSkipsKeyStepWhenSingleKey(t *testing.T) {
-	tr := newTestRouter(t, Options{Pool: keys.New(writePoolFile(t, []string{"public"}))})
-	addIdentity(t, tr.store, "id0", time.Time{})
-	addIdentity(t, tr.store, "id1", time.Time{})
+// TestNextAttemptDirectTransportRespectsFamily: the key step hands back the
+// direct transport, which honors the configured address family (v6 dials no
+// IPv4).
+func TestNextAttemptDirectTransportRespectsFamily(t *testing.T) {
+	tr := newTestRouter(t, Options{Family: "v6"})
 
-	rep := Report{
-		Kind:       zen.KindDailyLimit,
-		Egress:     proxy.EgressDirect,
-		Key:        "public",
-		Step:       0,
-		RetryAfter: time.Hour,
-	}
-	att, ok := tr.NextAttempt(rep)
+	att, ok := tr.NextAttempt(Report{
+		Kind:   zen.KindDailyLimit,
+		Egress: proxy.EgressDirect,
+		Key:    "k1",
+		Step:   0,
+	})
 	if !ok {
-		t.Fatal("NextAttempt: expected rotation to proceed, got false")
+		t.Fatal("NextAttempt: expected a key re-issue, got false")
 	}
-	if att.Step != 2 {
-		t.Errorf("Step = %d, want 2 (key stage skipped)", att.Step)
+	if att.Egress != proxy.EgressDirect {
+		t.Fatalf("Egress = %s, want direct", att.Egress)
 	}
-	if att.Egress != proxy.EgressWarp {
-		t.Errorf("Egress = %s, want warp", att.Egress)
+	rt, ok := att.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type = %T, want *http.Transport", att.Transport)
 	}
-	if att.Key != "public" {
-		t.Errorf("Key = %q, want %q (key unchanged across identity stage)", att.Key, "public")
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	if att.Transport != tr.sw.rt {
-		t.Errorf("Transport = %v, want the identity-switch transport", att.Transport)
-	}
-	if tr.sw.id == nil || tr.sw.id.DeviceID != "id1" {
-		t.Errorf("switched identity = %v, want fresh non-active id1", tr.sw.id)
-	}
-	if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
-		t.Errorf("active identity = %v, want id1", id)
-	}
-	if got := tr.store.Current(); got != "warp" {
-		t.Errorf("Current = %s, want warp", got)
+	defer ln.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := rt.DialContext(ctx, "tcp", ln.Addr().String()); err == nil {
+		t.Error("family=v6 direct transport dialed an IPv4 address; family not enforced")
 	}
 }
 
-// TestNextAttemptIdentityStep: after the key re-issue is also daily-limited
-// (Step 1), switch to WARP with a fresh identity (Step 2). Inside the 30s
-// cooldown: no re-issue for this request, but the rotation is persisted for
-// later requests.
-func TestNextAttemptIdentityStep(t *testing.T) {
-	t.Run("fresh identity outside cooldown", func(t *testing.T) {
-		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
-		addIdentity(t, tr.store, "id0", time.Time{}) // active
-		addIdentity(t, tr.store, "id1", time.Time{})
-		addIdentity(t, tr.store, "id2", time.Now().Add(time.Hour)) // spent spare
-
-		rep := Report{
-			Kind:       zen.KindDailyLimit,
-			Egress:     proxy.EgressDirect,
-			Key:        "k2",
-			Step:       1,
-			RetryAfter: time.Hour,
-		}
-		att, ok := tr.NextAttempt(rep)
-		if !ok {
-			t.Fatal("NextAttempt: expected identity re-issue, got false")
-		}
-		if att.Step != 2 {
-			t.Errorf("Step = %d, want 2", att.Step)
-		}
-		if att.Egress != proxy.EgressWarp {
-			t.Errorf("Egress = %s, want warp", att.Egress)
-		}
-		if att.Key != "k2" {
-			t.Errorf("Key = %q, want k2 (identity stage keeps the key)", att.Key)
-		}
-		if att.Transport != tr.sw.rt {
-			t.Errorf("Transport = %v, want the identity-switch transport", att.Transport)
-		}
-		if tr.sw.id == nil || tr.sw.id.DeviceID != "id1" {
-			t.Errorf("switched identity = %v, want unspent non-active id1", tr.sw.id)
-		}
-		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
-			t.Errorf("active identity = %v, want id1", id)
-		}
-		if got := tr.store.Current(); got != "warp" {
-			t.Errorf("Current = %s, want warp", got)
-		}
-		snap := tr.store.Snapshot()
-		if len(snap.Rotations) != 1 {
-			t.Errorf("Rotations = %d, want 1 persisted rotation", len(snap.Rotations))
-		}
-		tr.mu.Lock()
-		last := tr.lastRotate
-		tr.mu.Unlock()
-		if time.Since(last) > time.Minute {
-			t.Errorf("lastRotate not stamped, got %v", last)
-		}
-		// Background spare registration must be scheduled.
-		select {
-		case <-tr.registered:
-		case <-time.After(2 * time.Second):
-			t.Error("background spare registration was not scheduled")
-		}
-	})
-
-	t.Run("inside cooldown no reissue but rotation persisted", func(t *testing.T) {
-		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
-		addIdentity(t, tr.store, "id0", time.Time{}) // active
-		addIdentity(t, tr.store, "id1", time.Time{})
-
-		tr.mu.Lock()
-		tr.lastRotate = time.Now() // inside RotationCooldown
-		tr.mu.Unlock()
-
-		rep := Report{
-			Kind:       zen.KindDailyLimit,
-			Egress:     proxy.EgressDirect,
-			Key:        "k2",
-			Step:       1,
-			RetryAfter: time.Hour,
-		}
-		if _, ok := tr.NextAttempt(rep); ok {
-			t.Error("NextAttempt inside cooldown = true, want false (no re-issue)")
-		}
-		// The rotation itself is still persisted for later requests.
-		if tr.sw.id == nil || tr.sw.id.DeviceID != "id1" {
-			t.Errorf("switched identity = %v, want id1 persisted despite cooldown", tr.sw.id)
-		}
-		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
-			t.Errorf("active identity = %v, want id1", id)
-		}
-		if got := tr.store.Current(); got != "warp" {
-			t.Errorf("Current = %s, want warp", got)
-		}
-		if snap := tr.store.Snapshot(); len(snap.Rotations) != 1 {
-			t.Errorf("Rotations = %d, want 1 persisted rotation", len(snap.Rotations))
-		}
-		// No Cloudflare-facing spare minting inside the cooldown.
-		select {
-		case <-tr.registered:
-			t.Error("spare registration scheduled inside cooldown")
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		// A second report inside the same window must NOT churn the tunnel
-		// again: only the first in-window switch is persisted.
-		if _, ok := tr.NextAttempt(rep); ok {
-			t.Error("second inside-cooldown NextAttempt = true, want false")
-		}
-		if tr.sw.calls != 1 {
-			t.Errorf("identity switch called %d times, want 1 (one switch per window)", tr.sw.calls)
-		}
-		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
-			t.Errorf("active identity after second report = %v, want id1 unchanged", id)
-		}
-		if got := tr.store.Current(); got != "warp" {
-			t.Errorf("Current after second report = %s, want warp", got)
-		}
-		if snap := tr.store.Snapshot(); len(snap.Rotations) != 1 {
-			t.Errorf("Rotations after second report = %d, want 1 (no ping-pong)", len(snap.Rotations))
-		}
-	})
-
-	t.Run("rotation stamp clears the latch for the next window", func(t *testing.T) {
-		// Regression (re-review F1): rotate()/RotateNow stamp lastRotate from
-		// their deferred critical sections WITHOUT an identity switch; that
-		// stamp must clear cooldownSwapped so a stale latch cannot suppress
-		// the FIRST switch of the next window.
-		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
-		addIdentity(t, tr.store, "id0", time.Time{}) // active
-		addIdentity(t, tr.store, "id1", time.Time{})
-
-		// Switch #1 inside a cooldown window (claimed latch, no re-issue).
-		tr.mu.Lock()
-		tr.lastRotate = time.Now()
-		tr.mu.Unlock()
-		rep := Report{
-			Kind:       zen.KindDailyLimit,
-			Egress:     proxy.EgressDirect,
-			Key:        "k2",
-			Step:       1,
-			RetryAfter: time.Hour,
-		}
-		if _, ok := tr.NextAttempt(rep); ok {
-			t.Fatal("in-window report: expected false (no re-issue)")
-		}
-		if tr.sw.calls != 1 {
-			t.Fatalf("identity switch calls = %d, want 1", tr.sw.calls)
-		}
-
-		// Window expires; rotate()/RotateNow re-stamp lastRotate via their
-		// deferred critical section — no identity switch involved.
-		tr.mu.Lock()
-		tr.lastRotate = time.Now().Add(-time.Minute)
-		tr.mu.Unlock()
-		tr.finishRotation() // seam: the rotate()/RotateNow defer body
-		if tr.sw.calls != 1 {
-			t.Fatalf("rotation stamp must not switch, calls = %d", tr.sw.calls)
-		}
-
-		// The new window's first report must still get its switch: the stale
-		// latch must have been cleared by the stamp.
-		if _, ok := tr.NextAttempt(rep); ok {
-			t.Error("first report of new window = true, want false (no re-issue)")
-		}
-		if tr.sw.calls != 2 {
-			t.Errorf("identity switch calls = %d, want 2 (latch cleared by rotation stamp)", tr.sw.calls)
-		}
-		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id0" {
-			t.Errorf("active identity = %v, want id0 after the new window's switch", id)
-		}
-	})
-
-	t.Run("warp reports spend identities so rotation reaches direct", func(t *testing.T) {
-		tr := newTestRouter(t, Options{RotationCooldown: 30 * time.Second})
-		addIdentity(t, tr.store, "id0", time.Time{}) // active
-		addIdentity(t, tr.store, "id1", time.Time{})
-		tr.setWarpEgress(t)
-
-		// Report 1 (step 0): key stage — and the warp 429 stamps the ACTIVE
-		// identity id0 spent (spec §6: the limited IP belongs to it).
-		if _, ok := tr.NextAttempt(Report{
-			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
-			Key: "k1", Step: 0, RetryAfter: time.Hour,
-		}); !ok {
-			t.Fatal("report 1: expected key re-issue")
-		}
-		id := tr.store.ActiveIdentity()
-		if id == nil || id.SpentUntil <= time.Now().UnixMilli() {
-			t.Fatalf("active identity not stamped spent: %v", id)
-		}
-
-		// Report 2 (step 1): rotation to id1 — id0 leaves the active slot
-		// already spent.
-		att, ok := tr.NextAttempt(Report{
-			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
-			Key: "k2", Step: 1, RetryAfter: time.Hour,
-		})
-		if !ok || att.Step != 2 {
-			t.Fatalf("report 2: attempt = %+v ok=%v, want step 2", att, ok)
-		}
-		if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id1" {
-			t.Fatalf("active identity after rotation = %v, want id1", id)
-		}
-
-		// Report 3 (step 0 again): stamps id1 spent too.
-		if _, ok := tr.NextAttempt(Report{
-			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
-			Key: "k1", Step: 0, RetryAfter: time.Hour,
-		}); !ok {
-			t.Fatal("report 3: expected key re-issue")
-		}
-
-		// Report 4 (step 1): id0 (non-active) spent and id1 (active on warp)
-		// spent → no fresh identity → stage 3 direct.
-		att, ok = tr.NextAttempt(Report{
-			Kind: zen.KindDailyLimit, Egress: proxy.EgressWarp,
-			Key: "k2", Step: 1, RetryAfter: time.Hour,
-		})
-		if !ok {
-			t.Fatal("report 4: expected direct attempt, got false")
-		}
-		if att.Step != 3 || att.Egress != proxy.EgressDirect {
-			t.Errorf("report 4: attempt = %+v, want step 3 direct", att)
-		}
-		if got := tr.store.Current(); got != "direct" {
-			t.Errorf("Current = %s, want direct", got)
-		}
-	})
-}
-
-// TestNextAttemptDirectStep: every identity is spent (spentUntil in the
-// future) — the step-2 decision falls through to direct (Step 3), respecting
-// the configured address family.
-func TestNextAttemptDirectStep(t *testing.T) {
-	t.Run("switches to direct", func(t *testing.T) {
-		tr := newTestRouter(t, Options{})
-		future := time.Now().Add(time.Hour)
-		addIdentity(t, tr.store, "id0", future) // active
-		addIdentity(t, tr.store, "id1", future)
-		addIdentity(t, tr.store, "id2", future)
-		tr.setWarpEgress(t)
-
-		rep := Report{
-			Kind:       zen.KindDailyLimit,
-			Egress:     proxy.EgressWarp,
-			Key:        "k1",
-			Step:       2,
-			RetryAfter: time.Hour,
-		}
-		att, ok := tr.NextAttempt(rep)
-		if !ok {
-			t.Fatal("NextAttempt: expected direct attempt, got false")
-		}
-		if att.Step != 3 {
-			t.Errorf("Step = %d, want 3", att.Step)
-		}
-		if att.Egress != proxy.EgressDirect {
-			t.Errorf("Egress = %s, want direct", att.Egress)
-		}
-		if att.Key != "k1" {
-			t.Errorf("Key = %q, want k1", att.Key)
-		}
-		if att.Transport == tr.sw.rt {
-			t.Error("Transport is still the warp transport, want the direct transport")
-		}
-		if tr.sw.id != nil {
-			t.Errorf("identity switch invoked (%v), want none (all spent)", tr.sw.id)
-		}
-		if got := tr.store.Current(); got != "direct" {
-			t.Errorf("Current = %s, want direct", got)
-		}
-		snap := tr.store.Snapshot()
-		if len(snap.Rotations) != 1 || snap.Rotations[0].To != "direct" {
-			t.Errorf("Rotations = %v, want one warp->direct rotation", snap.Rotations)
-		}
-	})
-
-	t.Run("direct transport respects family v6", func(t *testing.T) {
-		tr := newTestRouter(t, Options{Family: "v6"})
-		addIdentity(t, tr.store, "id0", time.Now().Add(time.Hour))
-		tr.setWarpEgress(t)
-
-		att, ok := tr.NextAttempt(Report{
-			Kind:   zen.KindDailyLimit,
-			Egress: proxy.EgressWarp,
-			Key:    "k1",
-			Step:   2,
-		})
-		if !ok {
-			t.Fatal("NextAttempt: expected direct attempt, got false")
-		}
-		if att.Egress != proxy.EgressDirect {
-			t.Fatalf("Egress = %s, want direct", att.Egress)
-		}
-		rt, ok := att.Transport.(*http.Transport)
-		if !ok {
-			t.Fatalf("Transport type = %T, want *http.Transport", att.Transport)
-		}
-		ln, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen: %v", err)
-		}
-		defer ln.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if _, err := rt.DialContext(ctx, "tcp", ln.Addr().String()); err == nil {
-			t.Error("family=v6 direct transport dialed an IPv4 address; family not enforced")
-		}
-	})
-}
-
-// TestKeyRateLimitNoIdentityRotate: KindKeyRateLimit rotates to the next key
-// only; never touches identity or egress. With no alternatives the caller
-// surfaces the 429 (host backoff).
-func TestKeyRateLimitNoIdentityRotate(t *testing.T) {
+// TestKeyRateLimitRotatesKeyOnly: KindKeyRateLimit rotates to the next key
+// only. With no alternatives the caller surfaces the 429 (host backoff).
+func TestKeyRateLimitRotatesKeyOnly(t *testing.T) {
 	tr := newTestRouter(t, Options{})
-	addIdentity(t, tr.store, "id0", time.Time{})
-	addIdentity(t, tr.store, "id1", time.Time{})
-	tr.setWarpEgress(t)
 
 	rep := Report{
 		Kind:   zen.KindKeyRateLimit,
-		Egress: proxy.EgressWarp,
+		Egress: proxy.EgressDirect,
 		Key:    "k1",
 		Step:   0,
 	}
@@ -519,101 +149,21 @@ func TestKeyRateLimitNoIdentityRotate(t *testing.T) {
 	if att.Step != 1 {
 		t.Errorf("Step = %d, want 1", att.Step)
 	}
-	if att.Egress != proxy.EgressWarp {
-		t.Errorf("Egress = %s, want warp (no egress switch)", att.Egress)
+	if att.Egress != proxy.EgressDirect {
+		t.Errorf("Egress = %s, want direct", att.Egress)
 	}
 	if att.Key == "k1" || att.Key == "" {
 		t.Errorf("Key = %q, want a different key", att.Key)
-	}
-	if tr.sw.id != nil {
-		t.Errorf("identity switch invoked (%v), want none", tr.sw.id)
-	}
-	if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id0" {
-		t.Errorf("active identity = %v, want id0 untouched", id)
-	}
-	if snap := tr.store.Snapshot(); len(snap.Rotations) != 0 {
-		t.Errorf("Rotations = %d, want 0", len(snap.Rotations))
-	}
-	if got := tr.store.Current(); got != "warp" {
-		t.Errorf("Current = %s, want warp", got)
 	}
 
 	// Budget exhausted: no further stages for a key rate limit.
 	if _, ok := tr.NextAttempt(Report{
 		Kind:   zen.KindKeyRateLimit,
-		Egress: proxy.EgressWarp,
+		Egress: proxy.EgressDirect,
 		Key:    att.Key,
 		Step:   1,
 	}); ok {
 		t.Error("NextAttempt at Step 1 = true, want false (host backoff)")
-	}
-	if tr.sw.id != nil {
-		t.Errorf("identity switch after key exhaustion (%v), want none", tr.sw.id)
-	}
-}
-
-// TestAccountLimitNoRotation: workspace-scoped account limits
-// (GoUsageLimitError / BlackUsageLimitError, different workspace) may only
-// rotate keys — identity/egress rotation never helps.
-func TestAccountLimitNoRotation(t *testing.T) {
-	for _, typ := range []string{"GoUsageLimitError", "BlackUsageLimitError"} {
-		t.Run(typ, func(t *testing.T) {
-			tr := newTestRouter(t, Options{})
-			addIdentity(t, tr.store, "id0", time.Time{})
-			addIdentity(t, tr.store, "id1", time.Time{})
-			tr.setWarpEgress(t)
-
-			att, ok := tr.NextAttempt(Report{
-				Kind:      zen.KindDailyLimit,
-				Type:      typ,
-				Workspace: "ws-other",
-				Egress:    proxy.EgressWarp,
-				Key:       "k1",
-				Step:      0,
-			})
-			if !ok {
-				t.Fatal("NextAttempt: expected key rotation, got false")
-			}
-			if att.Step != 1 {
-				t.Errorf("Step = %d, want 1", att.Step)
-			}
-			if att.Egress != proxy.EgressWarp {
-				t.Errorf("Egress = %s, want warp (key rotation only)", att.Egress)
-			}
-			if att.Key == "k1" || att.Key == "" {
-				t.Errorf("Key = %q, want a different key", att.Key)
-			}
-
-			// Step 1 exhausted: never escalate to identity rotation.
-			if _, ok := tr.NextAttempt(Report{
-				Kind:      zen.KindDailyLimit,
-				Type:      typ,
-				Workspace: "ws-other",
-				Egress:    proxy.EgressWarp,
-				Key:       att.Key,
-				Step:      1,
-			}); ok {
-				t.Error("NextAttempt at Step 1 = true, want false (no identity rotation)")
-			}
-			if tr.sw.id != nil {
-				t.Errorf("identity switch invoked (%v), want none", tr.sw.id)
-			}
-			if id := tr.store.ActiveIdentity(); id == nil || id.DeviceID != "id0" {
-				t.Errorf("active identity = %v, want id0 untouched", id)
-			}
-			// Pin the !accountScoped guard: a workspace-scoped report must
-			// NOT burn the active identity's IP window.
-			if id := tr.store.ActiveIdentity(); id != nil && (id.SpentUntil != 0 || id.Last429At != 0) {
-				t.Errorf("active identity stamped by account-scoped report: SpentUntil=%d Last429At=%d, want 0/0",
-					id.SpentUntil, id.Last429At)
-			}
-			if snap := tr.store.Snapshot(); len(snap.Rotations) != 0 {
-				t.Errorf("Rotations = %d, want 0", len(snap.Rotations))
-			}
-			if got := tr.store.Current(); got != "warp" {
-				t.Errorf("Current = %s, want warp", got)
-			}
-		})
 	}
 }
 
@@ -694,41 +244,16 @@ func TestReportRecordsBothCounters(t *testing.T) {
 		}
 	})
 
-	t.Run("warp report stamps the active identity", func(t *testing.T) {
-		tr := newTestRouter(t, Options{})
-		addIdentity(t, tr.store, "id0", time.Time{}) // active
-		tr.setWarpEgress(t)
-
-		before := time.Now()
-		tr.NextAttempt(Report{
-			Kind:       zen.KindDailyLimit,
-			Egress:     proxy.EgressWarp,
-			Key:        "k1",
-			Step:       0,
-			RetryAfter: 45 * time.Minute,
-		})
-		id := tr.store.ActiveIdentity()
-		if id == nil {
-			t.Fatal("active identity = nil")
-		}
-		if id.SpentUntil <= before.UnixMilli() {
-			t.Errorf("active identity SpentUntil = %d, want stamped to now+45m", id.SpentUntil)
-		}
-		if id.Last429At < before.UnixMilli() {
-			t.Errorf("active identity Last429At = %d, want stamped", id.Last429At)
-		}
-	})
-
 	t.Run("exhausted report still records both counters", func(t *testing.T) {
 		tr := newTestRouter(t, Options{})
 		if _, ok := tr.NextAttempt(Report{
 			Kind:       zen.KindDailyLimit,
 			Egress:     proxy.EgressDirect,
 			Key:        "k1",
-			Step:       3,
+			Step:       1,
 			RetryAfter: time.Hour,
 		}); ok {
-			t.Error("NextAttempt at Step 3 = true, want false")
+			t.Error("NextAttempt at Step 1 = true, want false")
 		}
 		snap := tr.store.Snapshot()
 		if eg := snap.Egress["direct"]; eg == nil || eg.Daily429 != 1 {

@@ -139,12 +139,6 @@ func TestWindowSizeSetsWidgetSizes(t *testing.T) {
 	if w := mm.keyTable.Width(); w != 60 {
 		t.Errorf("key table width = %d, want 60", w)
 	}
-	if w := mm.identityTable.Width(); w != 60 {
-		t.Errorf("identity table width = %d, want 60", w)
-	}
-	if w := mm.rotationTable.Width(); w != 60 {
-		t.Errorf("rotation table width = %d, want 60", w)
-	}
 	if w := mm.logVP.Width(); w != 60 {
 		t.Errorf("log viewport width = %d, want 60", w)
 	}
@@ -152,9 +146,9 @@ func TestWindowSizeSetsWidgetSizes(t *testing.T) {
 		t.Errorf("log viewport height = %d, want >= 3", h)
 	}
 	// table.Height() is the viewport height (SetHeight minus the header):
-	// at 30 rows the rotation table gets header + one visible row —
-	// header-only is allowed only under tighter pressure (F1 budget).
-	if h := mm.rotationTable.Height(); h < 1 {
-		t.Errorf("rotation table viewport height = %d, want >= 1", h)
+	// at 30 rows a table gets header + one visible row — header-only is
+	// allowed only under tighter pressure (F1 budget).
+	if h := mm.keyTable.Height(); h < 1 {
+		t.Errorf("key table viewport height = %d, want >= 1", h)
 	}
 }

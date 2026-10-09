@@ -1,14 +1,15 @@
 package tui
 
-// Task 6 (Phase C): spec §7 r/d/w/s actions — rotate / force direct|warp /
-// start-stop — through the injected ActionSource (asserted on the status
-// source) and the Spawner seam, with the in-flight guard, the spinner while
-// a request is pending, and action errors surfaced in the status area.
+// Task 6 (Phase C, direct-only revision): the `s` key — start/stop —
+// through the injected ActionSource (asserted on the status source) and the
+// Spawner seam, with the in-flight guard, the spinner while a request is
+// pending, and action errors surfaced in the status area. The removed r/d/w
+// keys are covered by direct_only_test.go (they must stay inert).
 //
 // Hermeticity contract (task brief):
-//   - the action fake records Rotate/Use/Stop calls, the recording spawner
-//     records spawn calls — no live daemon (127.0.0.1:8787), no network,
-//     no systemctl, and no process is ever launched (the recording fake is
+//   - the action fake records Stop calls, the recording spawner records
+//     spawn calls — no live daemon (127.0.0.1:8787), no network, no
+//     systemctl, and no process is ever launched (the recording fake is
 //     what runs instead of exec);
 //   - messages are fed straight into Update() — no tea.Program;
 //   - commands executed in tests: the action batch (spinner kick returns a
@@ -29,30 +30,12 @@ import (
 // --- fake ActionSource ------------------------------------------------------
 
 // actionFake records every control action. It satisfies StatusSource via
-// the embedded fakeSource AND the ActionSource seam (Rotate/Use/Stop), so
-// New discovers the actions by assertion — no network is ever touched.
+// the embedded fakeSource AND the ActionSource seam (Stop), so New
+// discovers the actions by assertion — no network is ever touched.
 type actionFake struct {
 	*fakeSource
-	rotateCalls int
-	useCalls    int
-	useModes    []string
-	stopCalls   int
-	rotateErr   error
-	stopErr     error
-}
-
-func (a *actionFake) Rotate(context.Context) (string, error) {
-	a.rotateCalls++
-	if a.rotateErr != nil {
-		return "", a.rotateErr
-	}
-	return "warp", nil
-}
-
-func (a *actionFake) Use(_ context.Context, mode string) (string, error) {
-	a.useCalls++
-	a.useModes = append(a.useModes, mode)
-	return mode, nil
+	stopCalls int
+	stopErr   error
 }
 
 func (a *actionFake) Stop(context.Context) error {
@@ -117,64 +100,23 @@ func inflightLine(t *testing.T, m Model) string {
 	return ""
 }
 
-// --- r / d / w / s(up) ------------------------------------------------------
+// --- s: stop (up daemon) / spawn (down daemon) -------------------------------
 
-// TestRotateKeyFiresRotateRequest: `r` (spec §7 "rotate now") fires exactly
-// one Rotate request through the seam. The command carries the I/O — until
-// it runs the fake records nothing — and while it is in flight the view
-// shows the spinner + label. Feeding the completion back clears the line,
-// lands the single call, and emits no further command (the 1s poll chain
-// owns its own ticks).
-func TestRotateKeyFiresRotateRequest(t *testing.T) {
-	af := newActionFake(fakeResult{status: upStatus()})
-	m := New(af)
-	m, _ = update(t, m, runCmd(t, m.Init()))
-
-	m, cmd := actionKey(t, m, "r")
+// stopPending arms the two-step confirmation and returns the model with
+// the stop request armed in flight plus the command to execute. Shared by
+// the in-flight guard / spinner / error tests: `s` is the only action key
+// left in direct-only mode.
+func stopPending(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	m, cmd := actionKey(t, m, "s")
+	if cmd != nil {
+		t.Fatal("first `s` must only arm the confirmation, not fire the stop")
+	}
+	m, cmd = actionKey(t, m, "s")
 	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
+		t.Fatal("second `s` must return the stop command when the daemon is up")
 	}
-	if af.rotateCalls != 0 {
-		t.Fatalf("Rotate calls = %d before the command ran, want 0 (I/O lives in the command)",
-			af.rotateCalls)
-	}
-	if line := inflightLine(t, m); !strings.Contains(line, "rotate") {
-		t.Errorf("in-flight line %q lacks the action label \"rotate\"", line)
-	}
-
-	done := runActionBatch(t, cmd)
-	m, fin := update(t, m, done)
-	if fin != nil {
-		t.Errorf("an action completion must not emit a command (poll chain owns ticks), got %v", fin)
-	}
-	if af.rotateCalls != 1 {
-		t.Errorf("Rotate calls = %d, want exactly 1", af.rotateCalls)
-	}
-	if strings.Contains(m.View().Content, "in flight") {
-		t.Errorf("in-flight line must disappear after completion:\n%s", m.View().Content)
-	}
-}
-
-// TestUseKeysForceDirectAndWarp: `d` forces direct, `w` forces warp
-// (spec §7), each through Use with the right mode argument.
-func TestUseKeysForceDirectAndWarp(t *testing.T) {
-	af := newActionFake(fakeResult{status: upStatus()})
-	m := New(af)
-	m, _ = update(t, m, runCmd(t, m.Init()))
-
-	for _, k := range []string{"d", "w"} {
-		m, cmd := actionKey(t, m, k)
-		if cmd == nil {
-			t.Fatalf("`%s` must return the use request command", k)
-		}
-		m, _ = update(t, m, runActionBatch(t, cmd))
-	}
-	if af.useCalls != 2 {
-		t.Errorf("Use calls = %d, want 2", af.useCalls)
-	}
-	if got := strings.Join(af.useModes, ","); got != "direct,warp" {
-		t.Errorf("Use modes = %q, want \"direct,warp\"", got)
-	}
+	return m, cmd
 }
 
 // TestStopWhenDaemonUp: `s` with the daemon up stops it through the seam
@@ -213,12 +155,9 @@ func TestActionInFlightGuardIgnoresKeys(t *testing.T) {
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, cmd := stopPending(t, m)
 	before := m.View().Content
-	for _, k := range []string{"r", "d", "w", "s"} {
+	for _, k := range []string{"s", "r", "d", "w"} {
 		m, second := actionKey(t, m, k)
 		if second != nil {
 			t.Errorf("key %q fired while a request was in flight (want ignored)", k)
@@ -228,38 +167,34 @@ func TestActionInFlightGuardIgnoresKeys(t *testing.T) {
 				k, before, after)
 		}
 	}
-	if af.rotateCalls != 0 || af.useCalls != 0 || af.stopCalls != 0 {
-		t.Fatalf("seam calls while in flight: rotate=%d use=%d stop=%d, want all 0",
-			af.rotateCalls, af.useCalls, af.stopCalls)
+	if af.stopCalls != 0 {
+		t.Fatalf("seam calls while in flight: stop=%d, want 0", af.stopCalls)
 	}
 
 	_ = runActionBatch(t, cmd)
-	if af.rotateCalls != 1 {
-		t.Errorf("Rotate calls = %d after completion, want exactly 1", af.rotateCalls)
+	if af.stopCalls != 1 {
+		t.Errorf("Stop calls = %d after completion, want exactly 1", af.stopCalls)
 	}
 }
 
 // --- errors -----------------------------------------------------------------
 
-// TestActionErrorSurfacesInView: a failed request (e.g. rotate hitting a
-// 409) renders in the status/error area — "rotate failed: … HTTP 409 …" —
-// and stays visible across a status poll result (the 1s cadence must not
-// swallow it before the user can read it).
+// TestActionErrorSurfacesInView: a failed stop renders in the status/error
+// area — "stop daemon failed: … HTTP 409 …" — and stays visible across a
+// status poll result (the 1s cadence must not swallow it before the user
+// can read it).
 func TestActionErrorSurfacesInView(t *testing.T) {
 	af := newActionFake(fakeResult{status: upStatus()})
-	af.rotateErr = errors.New("control POST rotate: HTTP 409: rotation already in progress")
+	af.stopErr = errors.New("control POST stop: HTTP 409: stop already in progress")
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, cmd := stopPending(t, m)
 	m, _ = update(t, m, runActionBatch(t, cmd))
 
-	for _, want := range []string{"rotate failed", "HTTP 409"} {
+	for _, want := range []string{"stop daemon failed", "HTTP 409"} {
 		if !strings.Contains(m.View().Content, want) {
-			t.Errorf("view lacks %q after a failed rotate:\n%s", want, m.View().Content)
+			t.Errorf("view lacks %q after a failed stop:\n%s", want, m.View().Content)
 		}
 	}
 
@@ -269,26 +204,23 @@ func TestActionErrorSurfacesInView(t *testing.T) {
 		t.Errorf("action error must survive a status poll:\n%s", m.View().Content)
 	}
 
-	// Clear-on-next-action (review F3): pressing `r` again drops the stale
-	// message the moment the new request is armed — not when it completes.
-	af.rotateErr = nil // second rotate succeeds
-	m, cmd2 := actionKey(t, m, "r")
-	if cmd2 == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	// Clear-on-next-action (review F3): starting a new request drops the
+	// stale message the moment it is armed — not when it completes.
+	af.stopErr = nil // second stop succeeds
+	m, cmd2 := stopPending(t, m)
 	content := m.View().Content
-	if strings.Contains(content, "HTTP 409") || strings.Contains(content, "rotate failed") {
+	if strings.Contains(content, "HTTP 409") || strings.Contains(content, "stop daemon failed") {
 		t.Errorf("stale action error must clear when the next action starts:\n%s", content)
 	}
 	if !strings.Contains(content, "in flight") {
-		t.Errorf("second rotate must be in flight:\n%s", content)
+		t.Errorf("second stop must be in flight:\n%s", content)
 	}
 
 	// Clear-on-success: a completed action with no error leaves no failure
 	// line at all.
 	m, _ = update(t, m, runActionBatch(t, cmd2))
 	content = m.View().Content
-	if strings.Contains(content, "rotate failed") || strings.Contains(content, "HTTP 409") {
+	if strings.Contains(content, "stop daemon failed") || strings.Contains(content, "HTTP 409") {
 		t.Errorf("successful action must leave no error line:\n%s", content)
 	}
 }
@@ -304,10 +236,7 @@ func TestSpinnerRunsWhileActionPending(t *testing.T) {
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, cmd := stopPending(t, m)
 
 	before := inflightLine(t, m)
 	m, rearm := update(t, m, spinner.TickMsg{})
@@ -338,10 +267,7 @@ func TestQuitWhileActionInFlight(t *testing.T) {
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, _ = stopPending(t, m)
 	m, quit := actionKey(t, m, "q")
 	if quit == nil {
 		t.Fatal("`q` must still quit while a request is in flight")
@@ -360,10 +286,7 @@ func TestPollChainKeepsRunningWhileActionPending(t *testing.T) {
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, cmd := stopPending(t, m)
 
 	m, fetch := update(t, m, pollMsg(time.Now()))
 	if fetch == nil {
@@ -378,14 +301,14 @@ func TestPollChainKeepsRunningWhileActionPending(t *testing.T) {
 	}
 
 	// Still guarded after the poll cycle.
-	m, second := actionKey(t, m, "r")
+	m, second := actionKey(t, m, "s")
 	if second != nil {
 		t.Error("the guard must stay armed across a poll cycle")
 	}
 
 	m, _ = update(t, m, runActionBatch(t, cmd))
-	if af.rotateCalls != 1 {
-		t.Errorf("Rotate calls = %d, want exactly 1", af.rotateCalls)
+	if af.stopCalls != 1 {
+		t.Errorf("Stop calls = %d, want exactly 1", af.stopCalls)
 	}
 	if strings.Contains(m.View().Content, "in flight") {
 		t.Errorf("in-flight line must disappear after completion:\n%s", m.View().Content)
@@ -401,12 +324,10 @@ func TestViewFitsTerminalSizeWhileActionPending(t *testing.T) {
 		&actionFake{fakeSource: newFake(fakeResult{status: st})},
 		WithLogTail(&fakeLogSource{lines: []string{"daemon starting"}}),
 	)
+	m, _ = update(t, m, runCmd(t, m.Init())) // status must land first: `s` is a no-op pre-poll
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, _ = stopPending(t, m)
 	content := m.View().Content
 	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 	if len(lines) > 24 {
@@ -481,9 +402,8 @@ func TestSpawnWhenDaemonDownViaSpawner(t *testing.T) {
 	if !sp.gotDeadline {
 		t.Error("spawn ctx must carry a deadline (actionTimeout)")
 	}
-	if sp.calls != af.rotateCalls+af.useCalls+af.stopCalls+1 {
-		t.Errorf("control actions fired during spawn: rotate=%d use=%d stop=%d, want 0",
-			af.rotateCalls, af.useCalls, af.stopCalls)
+	if sp.calls != af.stopCalls+1 {
+		t.Errorf("control actions fired during spawn: stop=%d, want 0", af.stopCalls)
 	}
 	if strings.Contains(m.View().Content, "in flight") {
 		t.Errorf("in-flight line must disappear after completion:\n%s", m.View().Content)
@@ -580,21 +500,18 @@ func TestFailedPollRoutesSpawnAfterUp(t *testing.T) {
 // echo raw response bodies (Router errors, HTML error pages) into the
 // action error line. The rendered line must drop control runes (ESC/NUL/
 // newlines) and truncate oversized text with an ellipsis — display hygiene
-// only, no content inspection (mirrors LastSpareError's bounded rendering).
+// only, no content inspection.
 func TestActionErrorLineSanitizedInView(t *testing.T) {
 	af := newActionFake(fakeResult{status: upStatus()})
-	af.rotateErr = errors.New("\x1b[31m" + strings.Repeat("<script>alert(1)</script>", 30) + "\x00DONE\r\n\x1b[0m")
+	af.stopErr = errors.New("\x1b[31m" + strings.Repeat("<script>alert(1)</script>", 30) + "\x00DONE\r\n\x1b[0m")
 	m := New(af)
 	m, _ = update(t, m, runCmd(t, m.Init()))
-	m, cmd := actionKey(t, m, "r")
-	if cmd == nil {
-		t.Fatal("`r` must return the rotate request command")
-	}
+	m, cmd := stopPending(t, m)
 	m, _ = update(t, m, runActionBatch(t, cmd))
 
 	var line string
 	for _, l := range strings.Split(m.View().Content, "\n") {
-		if strings.Contains(l, "rotate failed") {
+		if strings.Contains(l, "stop daemon failed") {
 			line = l
 			break
 		}
