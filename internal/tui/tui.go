@@ -20,12 +20,14 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/table"
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
@@ -55,6 +57,28 @@ type LogSource interface {
 // StatusSource fakes keep the action key a silent no-op.
 type ActionSource interface {
 	Stop(ctx context.Context) error
+}
+
+// StatsSource is the request-history seam behind the stats tab (GET
+// /_zenctl/stats): *cli.ControlClient satisfies it in production, discovered
+// on the injected StatusSource exactly like ActionSource. A source without
+// it leaves the stats tab on its "not wired" notice (no fetch ever fires).
+type StatsSource interface {
+	Stats(ctx context.Context) (*cli.Stats, error)
+}
+
+// KeySource is the pool-key management seam behind the keys tab
+// (POST /_zenctl/keys and friends): *cli.ControlClient satisfies it in
+// production, discovered on the injected StatusSource like ActionSource.
+// The TUI only ever sees key FINGERPRINTS — raw keys travel through AddKey
+// and are never echoed back or stored in the model.
+type KeySource interface {
+	// Keys lists the pool file's key fingerprints.
+	Keys(ctx context.Context) ([]string, error)
+	// AddKey appends one raw key to the pool file and returns its fingerprint.
+	AddKey(ctx context.Context, raw string) (string, error)
+	// DeleteKey removes the pool-file key matching the fingerprint.
+	DeleteKey(ctx context.Context, fingerprint string) error
 }
 
 // Option customises a Model at construction time (New).
@@ -116,6 +140,29 @@ const (
 	// `s`-down spawn; the real detach path ignores the context and relies
 	// on that internal bound instead.
 	actionTimeout = 60 * time.Second
+
+	// tabCount is the number of `1`-`4` dashboard tabs (tui.go key
+	// handling, view.go tab strip).
+	tabCount = 4
+)
+
+// Dashboard tabs, switched by the digit keys `1`-`4` (view.go renders the
+// strip; the tab index drives layout and View). tabDashboard is the boot
+// default so every legacy layout test keeps its frame.
+const (
+	tabDashboard = iota
+	tabLogs
+	tabStats
+	tabKeys
+)
+
+// Log-level filter states on the logs tab (`f` cycles all → error → warn →
+// all). "error" keeps lines containing "error", "warn" keeps "error" OR
+// "warn:" lines (severity-sorted filter, case-insensitive).
+const (
+	logLevelAll = iota
+	logLevelError
+	logLevelWarn
 )
 
 // pollMsg is produced by the 1s tea.Tick timer; Update answers it with the
@@ -130,6 +177,20 @@ type statusMsg struct {
 	err     error
 	logTail []string
 	logErr  error
+}
+
+// statsMsg carries one stats-tab fetch (GET /_zenctl/stats) back into
+// Update: the rollups and the fetch error, mirroring statusMsg's shape.
+type statsMsg struct {
+	stats *cli.Stats
+	err   error
+}
+
+// keysMsg carries one keys-tab listing (GET /_zenctl/keys) back into
+// Update: pool-file key fingerprints (never raw keys) and the fetch error.
+type keysMsg struct {
+	fps []string
+	err error
 }
 
 // keyMap is the direct-only key set surfaced through bubbles help. `s` is
@@ -214,6 +275,59 @@ type Model struct {
 	egressCols []table.Column
 	keyCols    []table.Column
 
+	// Tab state (spec §7 four-tab redesign): tab is the active tab index
+	// (tabDashboard = boot default, digit keys 1-4 switch). statsSrc/keySrc
+	// are optional control-API seams discovered on src in New; a nil seam
+	// leaves its tab on a static notice (no fetch is ever attempted).
+	tab      int
+	statsSrc StatsSource
+	keySrc   KeySource
+
+	// stats-tab state: last /_zenctl/stats result. stats==nil && statsErr==
+	// nil means "no fetch yet" (loading), err non-nil renders the failure.
+	stats    *cli.Stats
+	statsErr error
+
+	// keys-tab state: the pool file's key FINGERPRINTS (raw keys never
+	// reach the model) and the last listing error. keyListErr/rendering
+	// of add/delete happens through startAction like `s`.
+	keyFPs     []string
+	keyListErr error
+
+	// Log-filter state (logs tab): logLevel cycles via `f`, logQuery is the
+	// committed `/` text filter (case-insensitive substring, "" = off),
+	// logFilterOn marks the text-input as active (keys route to it), and
+	// logFollow pins the viewport to the newest line — cleared by scrolling
+	// up, restored by `G` or by switching back to the dashboard tab.
+	logLevel    int
+	logQuery    string
+	logFilterOn bool
+	logFollow   bool
+	logInput    textinput.Model
+
+	// Keys-tab editing state: keyInput is the MASKED raw-key entry (the
+	// raw key exists only inside this widget and the AddKey call — it is
+	// never rendered by View, never stored in a field); keyInputOn routes
+	// key presses to it; confirmDelete arms the two-step `d` (the first
+	// press prompts in the action line, the second fires). keyRowFPs maps
+	// the keyTable cursor row back to the fingerprint being deleted.
+	keyInput      textinput.Model
+	keyInputOn    bool
+	confirmDelete bool
+	keyRowFPs     []string
+
+	// bandBG toggles the header band background (`b`): true = the
+	// surface-fill band (boot default), false = bare terminal background
+	// behind title and pill (view.go bandLine).
+	bandBG bool
+
+	// dayTable/ipTable render the stats tab (stacked day + IP rollups);
+	// dayCols/ipCols are their pristine columns for layout's fitColumns.
+	dayTable table.Model
+	ipTable  table.Model
+	dayCols  []table.Column
+	ipCols   []table.Column
+
 	logLines []string
 	logErr   error
 }
@@ -238,6 +352,26 @@ func New(src StatusSource, opts ...Option) Model {
 		{Title: "429", Width: 6},
 		{Title: "Resets in", Width: 12},
 	}
+	dayCols := []table.Column{
+		{Title: "Day", Width: 11},
+		{Title: "OK", Width: 7},
+		{Title: "429", Width: 6},
+	}
+	ipCols := []table.Column{
+		{Title: "IP", Width: 16},
+		{Title: "OK", Width: 7},
+		{Title: "429", Width: 6},
+		{Title: "Last seen", Width: 14},
+	}
+	logInput := textinput.New()
+	logInput.Prompt = "/ "
+	logInput.Placeholder = "type to filter, enter applies, esc cancels"
+	keyInput := textinput.New()
+	keyInput.Prompt = "api key: "
+	keyInput.Placeholder = "paste the raw key (masked)"
+	keyInput.EchoMode = textinput.EchoPassword
+	keyInput.EchoCharacter = '*'
+	keyInput.CharLimit = 512
 	m := Model{
 		src:     src,
 		act:     discoverActions(src),
@@ -246,8 +380,16 @@ func New(src StatusSource, opts ...Option) Model {
 		th:      newTheme(detectBackground()),
 		spinner: spinner.New(), // Line frames; advanced only while pending
 
+		statsSrc:   discoverStats(src),
+		keySrc:     discoverKeys(src),
+		logFollow:  true, // tail pinned to the newest line until scrolled up
+		bandBG:     true, // header band background on (toggle with `b`)
+		logInput:   logInput,
+		keyInput:   keyInput,
 		egressCols: egressCols,
 		keyCols:    keyCols,
+		dayCols:    dayCols,
+		ipCols:     ipCols,
 		egressTable: table.New(
 			table.WithColumns(egressCols),
 			table.WithWidth(defaultWidth),
@@ -255,6 +397,16 @@ func New(src StatusSource, opts ...Option) Model {
 		),
 		keyTable: table.New(
 			table.WithColumns(keyCols),
+			table.WithWidth(defaultWidth),
+			table.WithHeight(defaultTableH),
+		),
+		dayTable: table.New(
+			table.WithColumns(dayCols),
+			table.WithWidth(defaultWidth),
+			table.WithHeight(defaultTableH),
+		),
+		ipTable: table.New(
+			table.WithColumns(ipCols),
 			table.WithWidth(defaultWidth),
 			table.WithHeight(defaultTableH),
 		),
@@ -280,6 +432,20 @@ func New(src StatusSource, opts ...Option) Model {
 func discoverActions(src StatusSource) ActionSource {
 	act, _ := src.(ActionSource)
 	return act
+}
+
+// discoverStats returns the StatsSource exposed by src, or nil when the
+// source only polls (plain fakes → stats tab shows its static notice).
+func discoverStats(src StatusSource) StatsSource {
+	st, _ := src.(StatsSource)
+	return st
+}
+
+// discoverKeys returns the KeySource exposed by src, or nil when the
+// source only polls (plain fakes → keys tab is read-only via status).
+func discoverKeys(src StatusSource) KeySource {
+	ks, _ := src.(KeySource)
+	return ks
 }
 
 // actionDoneMsg carries one spec §7 action's result back into Update: it
@@ -354,6 +520,37 @@ func (m Model) tick() tea.Cmd {
 	return tea.Tick(pollInterval, func(t time.Time) tea.Msg { return pollMsg(t) })
 }
 
+// fetchStats loads the stats tab rollups (entering tab 3 or `r`). One
+// request per invocation, guarded by the caller — the poll chain never
+// re-fires it. A nil seam returns no command (tab stays on its notice).
+func (m Model) fetchStats() tea.Cmd {
+	src := m.statsSrc
+	if src == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+		defer cancel()
+		st, err := src.Stats(ctx)
+		return statsMsg{stats: st, err: err}
+	}
+}
+
+// fetchKeys lists the pool file's key fingerprints (entering tab 4, `r`,
+// or after a successful add/delete). A nil seam returns no command.
+func (m Model) fetchKeys() tea.Cmd {
+	src := m.keySrc
+	if src == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+		defer cancel()
+		fps, err := src.Keys(ctx)
+		return keysMsg{fps: fps, err: err}
+	}
+}
+
 // Update is the single I/O/decision point of the model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -392,16 +589,82 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// No command: the poll chain keeps its own tick schedule — an
 		// action result neither pauses nor re-arms it.
 		return m, nil
+	case statsMsg:
+		m.stats, m.statsErr = msg.stats, msg.err
+		m.applyStats()
+		m.relayout()
+		return m, nil
+	case keysMsg:
+		m.keyFPs, m.keyListErr = msg.fps, msg.err
+		m.applyKeys()
+		m.relayout()
+		return m, nil
 	case tea.KeyPressMsg:
+		// Text input active (logs `/` filter or keys `a` add): every key
+		// belongs to the input — enter commits and re-lays out, esc
+		// cancels, ctrl+c quits. `q`, digits and friends are typed, not
+		// bound.
+		if m.logFilterOn || m.keyInputOn {
+			switch msg.String() {
+			case "enter":
+				if m.logFilterOn {
+					m.logQuery = strings.ToLower(strings.TrimSpace(m.logInput.Value()))
+					m.logFilterOn = false
+					m.logInput.Blur()
+					m.logInput.Reset()
+					m.applyLog()
+					m.relayout()
+					return m, nil
+				}
+				// keys add: commit the masked value through KeySource.AddKey
+				raw := strings.TrimSpace(m.keyInput.Value())
+				m.keyInputOn = false
+				m.keyInput.Blur()
+				m.keyInput.Reset()
+				m.relayout()
+				if raw == "" {
+					return m, nil
+				}
+				src := m.keySrc
+				return m.startAction(src != nil, "add key", func(ctx context.Context) error {
+					_, err := src.AddKey(ctx, raw)
+					return err
+				})
+			case "esc":
+				if m.logFilterOn {
+					m.logFilterOn = false
+					m.logInput.Blur()
+					m.logInput.Reset()
+				} else {
+					m.keyInputOn = false
+					m.keyInput.Blur()
+					m.keyInput.Reset()
+				}
+				m.relayout()
+				return m, nil
+			case "ctrl+c":
+				return m, tea.Quit
+			}
+			if m.logFilterOn {
+				var cmd tea.Cmd
+				m.logInput, cmd = m.logInput.Update(msg)
+				return m, cmd
+			}
+			var cmd tea.Cmd
+			m.keyInput, cmd = m.keyInput.Update(msg)
+			return m, cmd
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "1", "2", "3", "4":
+			return m.switchTab(int(msg.String()[0] - '1'))
 		case "tab":
-			m.focus = (m.focus + 1) % focusablePanels
+			m.focus = (m.focus + 1) % panelsOn(m.tab)
 			m.confirmStop = false
 			return m, nil
 		case "shift+tab":
-			m.focus = (m.focus + focusablePanels - 1) % focusablePanels
+			m.focus = (m.focus + panelsOn(m.tab) - 1) % panelsOn(m.tab)
 			m.confirmStop = false
 			return m, nil
 		case "?":
@@ -409,7 +672,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmStop = false
 			return m, nil
 		case "esc":
-			m.confirmStop = false
+			// Priority: open filter input (handled above) → reset the
+			// logs-tab filters → disarm delete then stop confirmation.
+			if m.tab == tabLogs && (m.logLevel != logLevelAll || m.logQuery != "") {
+				m.logLevel = logLevelAll
+				m.logQuery = ""
+				m.applyLog()
+				m.relayout()
+				return m, nil
+			}
+			m.confirmStop, m.confirmDelete = false, false
+			return m, nil
+		case "b":
+			// Header band background on/off — pure display state, no
+			// layout change (the band line stays one line either way).
+			m.bandBG = !m.bandBG
 			return m, nil
 		case "s":
 			// Spec §7: s = start/stop. Daemon down → spawn `up --detach`
@@ -441,8 +718,138 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		return m.handleTabKey(msg)
 	}
 	return m, nil
+}
+
+// panelsOn reports the focusable panel count of a tab (tab/shift+tab cycle
+// length): the dashboard walks its 3 panels, the stats tab walks day/ip,
+// logs and keys are single-panel.
+func panelsOn(tab int) int {
+	switch tab {
+	case tabDashboard:
+		return focusablePanels
+	case tabStats:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// switchTab moves to tab n (digit keys 1-4), resets focus, disarms the
+// stop confirmation, and re-budgets the frame. Entering stats/keys fires
+// their fetch; every move re-pins the log tail (scroll position belongs to
+// the logs tab only — the dashboard mini-viewport is always bottom-anchored).
+func (m Model) switchTab(n int) (tea.Model, tea.Cmd) {
+	m.tab = n
+	m.focus = 0
+	m.confirmStop, m.confirmDelete = false, false
+	m.showHelp = false
+	m.logFollow = true
+	m.relayout()
+	switch n {
+	case tabStats:
+		return m, m.fetchStats()
+	case tabKeys:
+		return m, m.fetchKeys()
+	}
+	return m, nil
+}
+
+// handleTabKey routes the keys only one tab binds: logs (scroll, `f`,
+// `/`), stats (`r` refresh), keys (`a` add, `d` delete, `r` refresh).
+// Unbound keys are a silent no-op (nil command, no state change). The
+// receiver is a VALUE: viewport mutations land on the returned model.
+func (m Model) handleTabKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	k := msg.String()
+	switch m.tab {
+	case tabLogs:
+		switch k {
+		case "up":
+			m.logFollow = false
+			m.logVP.ScrollUp(1)
+		case "down":
+			m.logVP.ScrollDown(1)
+			m.logFollow = m.logVP.AtBottom()
+		case "pgup":
+			m.logFollow = false
+			m.logVP.PageUp()
+		case "pgdown":
+			m.logVP.PageDown()
+			m.logFollow = m.logVP.AtBottom()
+		case "g":
+			m.logFollow = false
+			m.logVP.GotoTop()
+		case "G":
+			m.logFollow = true
+			m.logVP.GotoBottom()
+		case "f":
+			m.logLevel = (m.logLevel + 1) % 3
+			m.applyLog()
+			m.relayout()
+		case "/":
+			m.logFilterOn = true
+			m.relayout()
+			return m, m.logInput.Focus()
+		}
+		return m, nil
+	case tabStats:
+		switch k {
+		case "r":
+			return m, m.fetchStats()
+		case "up", "down":
+			m.dayTable, _ = m.dayTable.Update(msg)
+		}
+		return m, nil
+	case tabKeys:
+		switch k {
+		case "r":
+			return m, m.fetchKeys()
+		case "up", "down":
+			m.keyTable, _ = m.keyTable.Update(msg)
+		case "a":
+			if m.keySrc == nil || m.pending || m.keyInputOn {
+				return m, nil
+			}
+			m.keyInputOn = true
+			m.confirmDelete, m.confirmStop = false, false
+			m.relayout()
+			return m, m.keyInput.Focus()
+		case "d":
+			return m.deleteSelectedKey()
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// deleteSelectedKey is the two-step keys-tab delete: the first press arms
+// confirmDelete (prompt line, no command), the second fires KeySource.
+// DeleteKey for the fingerprint of the cursor row; esc cancels (Update's
+// esc priority). Disabled without a KeySource or while pending.
+func (m Model) deleteSelectedKey() (tea.Model, tea.Cmd) {
+	if m.keySrc == nil || m.pending || m.keyInputOn {
+		return m, nil
+	}
+	rows := m.keyTable.Rows()
+	idx := m.keyTable.Cursor()
+	if idx < 0 {
+		idx = 0 // bubbles' table cursor is -1 until the first selection
+	}
+	if idx >= len(rows) || idx >= len(m.keyRowFPs) {
+		return m, nil
+	}
+	if !m.confirmDelete {
+		m.confirmDelete = true
+		m.confirmStop = false
+		return m, nil
+	}
+	fp := m.keyRowFPs[idx]
+	m.confirmDelete = false
+	return m.startAction(true, "delete key", func(ctx context.Context) error {
+		return m.keySrc.DeleteKey(ctx, fp)
+	})
 }
 
 // fmtUptime renders the daemon uptime the way the header line shows it.

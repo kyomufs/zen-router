@@ -50,6 +50,10 @@ const focusablePanels = focusLog + 1
 // fires on the second press, esc cancels (focus_help_confirm_test).
 const confirmPrompt = "stop the daemon? press s again to confirm, esc cancels"
 
+// confirmDeletePrompt is the first-press `d` line on the keys tab: the
+// delete fires on the second press, esc cancels (tabs_test).
+const confirmDeletePrompt = "delete key? press d again to confirm, esc cancels"
+
 // panelStyle returns the border/title styles for focusable panel idx: the
 // focused panel gets the accent focus ring (theme.accent), every other
 // panel keeps its dim border. Titles stay bold accent either way.
@@ -121,29 +125,41 @@ func panelWidths(mode layoutMode, w int) (egW, keyW int) {
 // (widget content was pushed in Update). Line budget: layout() decides
 // every widget height (coreLineCount measures the non-widget lines here),
 // so the help line stays on-screen — the altscreen clips the bottom
-// (TestViewFitsTerminalSize).
+// (TestViewFitsTerminalSize). The tab strip is the third header line
+// (design_test pins only lines[0]/lines[1]); below it each tab renders
+// its own body — dashboard grid, full-screen log, stats rollups, keys.
 func (m Model) View() tea.View {
 	vw := m.viewWidth()
 
-	lines := []string{m.bandLine(), headerPoll}
+	lines := []string{m.bandLine(), headerPoll, m.tabStrip()}
 	if m.showHelp {
 		// `?` overlay: the dashboard is replaced by the full key list.
 		lines = append(lines, renderPanel("keyboard shortcuts", vw,
 			helpOverlayRows(), lipgloss.NewStyle().Foreground(m.th.accent),
 			m.th.header)...)
 	} else {
-		if m.err != nil {
-			// Daemon down: no grid at all — the status block becomes a
-			// full-width bordered panel (hardening's absent markers).
-			lines = append(lines, renderPanel("daemon status", vw, m.statusLines(),
-				m.th.dimText, m.th.panelTitle)...)
-		} else {
-			lines = append(lines, m.statusLines()...)
-			if m.gridPresent() {
-				lines = append(lines, m.gridLines()...)
+		switch m.tab {
+		case tabLogs:
+			lines = append(lines, m.logFilterLine())
+			lines = append(lines, m.logPanelLines()...)
+		case tabStats:
+			lines = append(lines, m.statsLines()...)
+		case tabKeys:
+			lines = append(lines, m.keysTabLines()...)
+		default:
+			if m.err != nil {
+				// Daemon down: no grid at all — the status block becomes a
+				// full-width bordered panel (hardening's absent markers).
+				lines = append(lines, renderPanel("daemon status", vw, m.statusLines(),
+					m.th.dimText, m.th.panelTitle)...)
+			} else {
+				lines = append(lines, m.statusLines()...)
+				if m.gridPresent() {
+					lines = append(lines, m.gridLines()...)
+				}
 			}
+			lines = append(lines, m.logPanelLines()...)
 		}
-		lines = append(lines, m.logPanelLines()...)
 		lines = append(lines, m.help.View(m.keys))
 	}
 	if al := m.actionLine(); al != "" {
@@ -154,6 +170,25 @@ func (m Model) View() tea.View {
 	v.SetContent(strings.Join(lines, "\n"))
 	v.AltScreen = true
 	return v
+}
+
+// tabStrip renders the third header line: one label per tab, the active
+// one in the header style, the rest dim. SGR-only styling (hardening's
+// escape audit), clipped to the view width on narrow terminals.
+func (m Model) tabStrip() string {
+	labels := [tabCount]string{"1 dashboard", "2 logs", "3 stats", "4 keys"}
+	var b strings.Builder
+	for i, label := range labels {
+		if i > 0 {
+			b.WriteString("  ")
+		}
+		if i == m.tab {
+			b.WriteString(m.th.header.Render(label))
+		} else {
+			b.WriteString(m.th.dimText.Render(label))
+		}
+	}
+	return clipLine(b.String(), m.viewWidth())
 }
 
 // statusPill is the header state chip: green while the poll answers, red
@@ -173,30 +208,50 @@ func (m Model) statusPill() string {
 // bandLine renders header line one: a full-width band (surface background)
 // with the dashboard title on the left and the state pill right-aligned.
 // It stays exactly one line — clipLine enforces the width budget even on
-// windows too narrow for title and pill side by side.
+// windows too narrow for title and pill side by side. `b` (bandBG) drops
+// the background: terminal-native text with a raw-space gap instead of the
+// band fill; the cell width stays the view width either way.
 func (m Model) bandLine() string {
 	vw := m.viewWidth()
 	title := m.th.bandTitle.Render(headerTitle)
+	gapStyle := m.th.bandGap
+	if !m.bandBG {
+		title = m.th.header.Render(headerTitle)
+		gapStyle = lipgloss.NewStyle()
+	}
 	pill := m.statusPill()
 	gap := vw - cells(title) - cells(pill) - 1 // one band cell after the pill
 	if gap < 0 {
 		gap = 0
 	}
 	line := title +
-		m.th.bandGap.Render(strings.Repeat(" ", gap)) + pill +
-		m.th.bandGap.Render(" ")
+		gapStyle.Render(strings.Repeat(" ", gap)) + pill +
+		gapStyle.Render(" ")
 	return clipLine(line, vw)
 }
 
 // helpOverlayRows lists every binding rendered by the `?` overlay — kept
 // next to defaultKeyMap (compact help line) and the tab handling in tui.go.
 // The %-10s column keeps the two-column layout even for "shift+tab".
+// forbidden-string guard: no removed-panel phrases (rotate now / direct
+// egress / warp egress / quota (per egress)...) — only live bindings.
 func helpOverlayRows() []string {
 	bindings := [][2]string{
 		{"q", "quit"},
 		{"s", "start/stop daemon"},
+		{"1-4", "switch tab"},
 		{"tab", "next panel"},
 		{"shift+tab", "previous panel"},
+		{"up/down", "log scroll line"},
+		{"pgup/pgdn", "log page scroll"},
+		{"g / G", "log top / bottom"},
+		{"f", "log level filter"},
+		{"/", "search log lines"},
+		{"esc", "reset filters / cancel"},
+		{"r", "refresh stats"},
+		{"a", "add api key"},
+		{"d", "delete api key"},
+		{"b", "toggle band background"},
 		{"?", "close help"},
 	}
 	out := make([]string, len(bindings))
@@ -234,7 +289,10 @@ func (m Model) gridLines() []string {
 }
 
 // logPanelLines renders the full-width log panel: the viewport body when
-// a tail is visible, one notice line otherwise.
+// a tail is visible, one notice line otherwise. The title carries the
+// active filter state (suffix after the literal "log tail" — Contains
+// markers still match). Filtered-empty tails notice instead of an empty
+// box (only reachable on the logs tab; the dashboard is unfiltered).
 func (m Model) logPanelLines() []string {
 	var body []string
 	switch {
@@ -243,10 +301,121 @@ func (m Model) logPanelLines() []string {
 	case len(m.logLines) == 0:
 		body = []string{"no log output yet"}
 	default:
-		body = splitBody(m.logVP.View())
+		filtered := m.filteredLogLines()
+		if len(filtered) == 0 {
+			body = []string{m.th.dimText.Render("no log lines match the filter")}
+		} else {
+			body = splitBody(m.logVP.View())
+		}
 	}
 	logB, logT := m.panelStyle(focusLog)
-	return renderPanel("log tail", m.viewWidth(), body, logB, logT)
+	return renderPanel("log tail"+m.logFilterSuffix(), m.viewWidth(), body, logB, logT)
+}
+
+// logFilterSuffix tags the log panel title with the active filters, e.g.
+// " [level=error] [/timeout]". Empty when nothing is filtered — the
+// dashboard frame keeps its byte-identical title.
+func (m Model) logFilterSuffix() string {
+	var parts []string
+	switch m.logLevel {
+	case logLevelError:
+		parts = append(parts, "level=error")
+	case logLevelWarn:
+		parts = append(parts, "level=warn")
+	}
+	if m.logQuery != "" {
+		parts = append(parts, "/"+m.logQuery)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(parts, " ") + "]"
+}
+
+// logFilterLine is the logs-tab chrome line under the tab strip: the text
+// filter input while it is open, otherwise a one-line hint of the active
+// state (f cycles, / searches, esc resets). Exactly one line — the tab's
+// coreLineCount accounts for it.
+func (m Model) logFilterLine() string {
+	if m.logFilterOn {
+		return m.logInput.View()
+	}
+	return m.th.dimText.Render(fmt.Sprintf(
+		"filter: level=%s text=%s (f cycle, / search, esc reset)",
+		logLevelName(m.logLevel), orEmpty(m.logQuery)))
+}
+
+// logLevelName maps the level constant to its hint token.
+func logLevelName(level int) string {
+	switch level {
+	case logLevelError:
+		return "error"
+	case logLevelWarn:
+		return "warn"
+	default:
+		return "all"
+	}
+}
+
+// orEmpty renders the active text query for the hint line.
+func orEmpty(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// statsLines renders the stats tab: the two rollup tables (day, IP) as
+// stacked full-width panels, or one notice panel before the first load.
+// Rows arrive pre-sorted from /_zenctl/stats (day DESC, IP by last
+// request) and pre-formatted in applyStats (view purity).
+func (m Model) statsLines() []string {
+	vw := m.viewWidth()
+	notice := m.statsNotice()
+	if notice != nil {
+		return renderPanel("request stats", vw, notice, m.th.dimText, m.th.panelTitle)
+	}
+	dayB, dayT := m.panelStyle(0)
+	out := renderPanel("requests by day", vw, tableLines(m.dayTable), dayB, dayT)
+	ipB, ipT := m.panelStyle(1)
+	return append(out, renderPanel("requests by ip", vw, tableLines(m.ipTable), ipB, ipT)...)
+}
+
+// statsNotice is the stats tab's pre-load body: nil once data landed.
+// Seam absent → static notice (no fetch ever fires), loading → spinner
+// line, fetch error → styled error line, empty rollups → hint.
+func (m Model) statsNotice() []string {
+	switch {
+	case m.statsSrc == nil:
+		return []string{m.th.dimText.Render("stats source not wired")}
+	case m.statsErr != nil:
+		return []string{m.logLevelStyle(fmt.Sprintf("stats error: %v", m.statsErr))}
+	case m.stats == nil:
+		return []string{m.th.dimText.Render("loading stats...")}
+	case len(m.stats.Days) == 0 && len(m.stats.IPs) == 0:
+		return []string{m.th.dimText.Render("no requests recorded in the last 30 days")}
+	}
+	return nil
+}
+
+// keysTabLines renders the keys tab: the masked add-key input when open,
+// then the full-width key table (fingerprint counters merged with the
+// pool listing — same rows as the dashboard's quota panel, full height).
+func (m Model) keysTabLines() []string {
+	vw := m.viewWidth()
+	var out []string
+	if m.keyInputOn {
+		out = append(out, m.keyInput.View())
+	}
+	keyB, keyT := m.panelStyle(0)
+	body := tableLines(m.keyTable)
+	switch {
+	case m.keyListErr != nil:
+		body = []string{m.logLevelStyle(fmt.Sprintf("keys error: %v", m.keyListErr))}
+	case len(body) == 0:
+		body = []string{m.th.dimText.Render("no api keys yet (a to add one)")}
+	}
+	return append(out, renderPanel("api keys", vw, body, keyB, keyT)...)
 }
 
 // tableLines splits a table render into body lines (table.View may end
@@ -438,16 +607,18 @@ func (m Model) upStatusLines(st *cli.Status) []string {
 }
 
 // actionLine is the transient footer line — the spinner while a request
-// is in flight, the last request error otherwise. A poll result never
-// clears an error; only the next action start does. It renders as the
-// very last line of the frame (below the keys line) and disappears when
-// idle.
+// is in flight, the last request error otherwise, plus the two-step
+// confirm prompts. A poll result never clears an error; only the next
+// action start does. It renders as the very last line of the frame
+// (below the keys line) and disappears when idle.
 func (m Model) actionLine() string {
 	switch {
 	case m.pending:
 		return m.wrap(fmt.Sprintf("%s %s in flight", m.spinner.View(), m.actionLabel))
 	case m.confirmStop:
 		return m.wrap(confirmPrompt)
+	case m.confirmDelete:
+		return m.wrap(confirmDeletePrompt)
 	case m.actionErr != nil:
 		return m.wrap(fmt.Sprintf("%s failed: %s",
 			m.actionLabel, sanitizeActionErr(m.actionErr)))
@@ -494,16 +665,32 @@ func (m Model) logViewportVisible() bool {
 }
 
 // coreLineCount is the number of lines layout() must reserve that are NOT
-// panel bodies: header (2), the status block (bordered only in the down
-// case — those borders are counted as chrome by layout), the footer help
-// line and the transient action line. Panel chrome (grid/log/down borders)
-// lives in layout's frameTotal; titles are embedded in the top borders and
-// therefore part of the panels. It shares statusLines/actionLine with
-// View so the budget cannot drift from what is rendered.
+// panel bodies: header (band + poll + tab strip), the status block
+// (dashboard only — bordered in the down case, counted as chrome by
+// layout), the per-tab chrome line (logs filter hint / keys add input),
+// the footer help line and the transient action line. Panel chrome
+// (grid/log/down/stats/keys borders) lives in layout's frameTotal; titles
+// are embedded in the top borders and therefore part of the panels. It
+// shares statusLines/actionLine/View's tab structure with View so the
+// budget cannot drift from what is rendered.
 func (m Model) coreLineCount() int {
-	n := 2 // header title + poll line
-	for _, line := range m.statusLines() {
-		n += linesOf(line)
+	n := 3 // band title + poll line + tab strip
+	if m.tab == tabDashboard {
+		for _, line := range m.statusLines() {
+			n += linesOf(line)
+		}
+	}
+	switch m.tab {
+	case tabLogs:
+		if m.logFilterOn {
+			n += linesOf(m.logInput.View())
+		} else {
+			n += 1 // the filter hint line
+		}
+	case tabKeys:
+		if m.keyInputOn {
+			n += linesOf(m.keyInput.View())
+		}
 	}
 	n += linesOf(m.help.View(m.keys))
 	if al := m.actionLine(); al != "" {
@@ -542,8 +729,109 @@ func (m Model) wrapAt(s string, w int) string {
 	return lipgloss.NewStyle().Width(w).Render(s)
 }
 
-// layout sizes every widget from the last tea.WindowSizeMsg. The panel
-// grid invariants (panelgrid_test.go):
+// layout sizes every widget from the last tea.WindowSizeMsg. Per tab:
+// the dashboard keeps the panel-grid invariants (panelgrid_test.go —
+// content hug, frame fit, shrink order log -> keys -> egress); the logs
+// tab gives the viewport everything below its chrome; stats/keys hug
+// their tables and shrink to fit. Heights land here (Update), View stays
+// a pure render.
+func (m *Model) layout() {
+	vw := m.viewWidth()
+	h := m.height
+	if h < minLayoutHeight {
+		h = minLayoutHeight
+	}
+	m.logVP.SetWidth(vw)
+	m.help.SetWidth(vw)
+
+	switch m.tab {
+	case tabLogs:
+		m.layoutLogs(vw, h)
+	case tabStats:
+		m.layoutStats(vw, h)
+	case tabKeys:
+		m.layoutKeys(vw, h)
+	default:
+		m.layoutDashboard(vw, h)
+	}
+}
+
+// layoutLogs gives the log viewport every line between the chrome and
+// the panel borders (a real fullscreen tail), pinned when following.
+func (m *Model) layoutLogs(vw, h int) {
+	core := m.coreLineCount()
+	body := h - core - 2 // panel borders
+	if body < 1 {
+		body = 1
+	}
+	m.logVP.SetHeight(body)
+	if m.logFollow {
+		m.logVP.GotoBottom()
+	}
+}
+
+// layoutStats stacks the two rollup panels: each hugs its rows (header
+// included), and the pair shrinks the taller table first until the frame
+// fits; leftover height goes back, capped at content. The notice state
+// (no data yet) needs only its single body line.
+func (m *Model) layoutStats(vw, h int) {
+	m.dayTable.SetWidth(vw)
+	m.dayTable.SetColumns(fitColumns(m.dayCols, vw-2))
+	m.ipTable.SetWidth(vw)
+	m.ipTable.SetColumns(fitColumns(m.ipCols, vw-2))
+
+	core := m.coreLineCount()
+	if m.statsNotice() != nil {
+		return // frame = core + borders + one notice line; no heights to set
+	}
+	nDay, nIp := len(m.dayTable.Rows()), len(m.ipTable.Rows())
+	dayT, ipT := 1+nDay, 1+nIp
+	total := func() int { return core + 4 + dayT + ipT } // two panel borders × 2
+	for total() > h && (dayT > 1 || ipT > 1) {
+		if dayT >= ipT && dayT > 1 {
+			dayT--
+		} else {
+			ipT--
+		}
+	}
+	if spare := h - total(); spare > 0 {
+		if g := min(spare, 1+nDay-dayT); g > 0 {
+			dayT += g
+			spare -= g
+		}
+		if g := min(spare, 1+nIp-ipT); g > 0 {
+			ipT += g
+		}
+	}
+	m.dayTable.SetHeight(dayT)
+	m.ipTable.SetHeight(ipT)
+}
+
+// layoutKeys hugs the full-width key table: exact rows when they fit,
+// shrunk from the bottom when the frame would overflow. The add-key
+// input (coreLineCount) is already accounted.
+func (m *Model) layoutKeys(vw, h int) {
+	m.keyTable.SetWidth(vw)
+	m.keyTable.SetColumns(fitColumns(m.keyCols, vw-2))
+
+	core := m.coreLineCount()
+	nKey := len(m.keyTable.Rows())
+	keyT := 1 + nKey
+	if keyT < 1 {
+		keyT = 1
+	}
+	total := func() int { return core + 2 + keyT }
+	for total() > h && keyT > 1 {
+		keyT--
+	}
+	if spare := h - total(); spare > 0 {
+		keyT += min(spare, 1+nKey-keyT)
+	}
+	m.keyTable.SetHeight(keyT)
+}
+
+// layoutDashboard sizes the panel grid and the dashboard's mini log tail
+// (panelgrid_test.go invariants):
 //
 //   - content hug: each table gets exactly its rows (+ header), leftover
 //     height goes back to the quota tables (capped at content) and then
@@ -551,14 +839,7 @@ func (m Model) wrapAt(s string, w int) string {
 //   - frame fit: core + chrome + body lines <= terminal height at every
 //     breakpoint; the shrink order is log -> keys -> egress, floors be
 //     damned only at degenerate sizes.
-//
-// Heights land here (Update), View stays a pure render.
-func (m *Model) layout() {
-	vw := m.viewWidth()
-	h := m.height
-	if h < minLayoutHeight {
-		h = minLayoutHeight
-	}
+func (m *Model) layoutDashboard(vw, h int) {
 	mode := m.gridMode()
 	grid := m.gridPresent()
 
@@ -571,8 +852,6 @@ func (m *Model) layout() {
 		m.keyTable.SetWidth(vw)
 		m.keyTable.SetColumns(fitColumns(m.keyCols, keyW-2))
 	}
-	m.logVP.SetWidth(vw)
-	m.help.SetWidth(vw)
 
 	logVisible := m.logViewportVisible()
 	logSet := 0
@@ -591,7 +870,7 @@ func (m *Model) layout() {
 		if !logVisible {
 			return 1 // the notice/error line replaces the viewport body
 		}
-		return min(logSet, len(m.logLines))
+		return min(logSet, m.visibleLogLines())
 	}
 
 	// frameTotal mirrors View() line-for-line for the current heights.
@@ -653,7 +932,7 @@ func (m *Model) layout() {
 			}
 		}
 		if spare > 0 && logVisible {
-			if g := min(spare, len(m.logLines)-logSet); g > 0 {
+			if g := min(spare, m.visibleLogLines()-logSet); g > 0 {
 				logSet += g
 			}
 		}
@@ -744,23 +1023,128 @@ func fitColumns(base []table.Column, interior int) []table.Column {
 // m.now so View never touches the clock.
 func (m *Model) applyStatus(st *cli.Status) {
 	m.egressTable.SetRows(egressRows(st, m.now))
-	m.keyTable.SetRows(keyRows(st, m.now))
+	m.rebuildKeyTable()
 }
 
-// applyLog pushes the fetched tail into the viewport (still inside Update;
-// View only renders the widget). Lines are colored by level here — before
-// the viewport sees them — so each line reaches it as one whole run.
+// applyStats pushes one stats result into both rollup tables (row
+// building is pure and sorted; called from Update only).
+func (m *Model) applyStats() {
+	if m.stats == nil {
+		m.dayTable.SetRows(nil)
+		m.ipTable.SetRows(nil)
+		return
+	}
+	m.dayTable.SetRows(dayRows(m.stats))
+	m.ipTable.SetRows(ipRows(m.stats))
+}
+
+// applyKeys pushes the pool listing into the merged key table.
+func (m *Model) applyKeys() {
+	m.rebuildKeyTable()
+}
+
+// keyCounters is the TUI-local view of one quota key state: the two
+// counters the table shows plus the reset stamp, copied out of the
+// status snapshot (the quota type stays unnamed — import boundary).
+type keyCounters struct {
+	ok      int64
+	n429    int64
+	spentAt int64
+	seen    bool // false = pool-only key the status has not counted yet
+}
+
+// rebuildKeyTable merges the status quota counters with the pool-file
+// listing: every fingerprint from either source gets one row (counters
+// fall back to 0 / "-" when the status has not seen the key yet) and
+// keyRowFPs mirrors the row order for the keys-tab delete cursor.
+func (m *Model) rebuildKeyTable() {
+	counters := make(map[string]keyCounters)
+	if m.status != nil {
+		for fp, ks := range m.status.State.Keys {
+			if ks == nil {
+				continue
+			}
+			counters[fp] = keyCounters{ok: ks.OK, n429: ks.Daily429, spentAt: ks.SpentUntil, seen: true}
+		}
+	}
+	for _, fp := range m.keyFPs {
+		if _, ok := counters[fp]; !ok {
+			counters[fp] = keyCounters{}
+		}
+	}
+	rows := make([]table.Row, 0, len(counters))
+	m.keyRowFPs = make([]string, 0, len(counters))
+	for _, fp := range sortedKeys(counters) {
+		c := counters[fp]
+		m.keyRowFPs = append(m.keyRowFPs, fp)
+		if !c.seen {
+			rows = append(rows, table.Row{fp, "0", "0", "-"})
+			continue
+		}
+		rows = append(rows, table.Row{
+			fp,
+			strconv.FormatInt(c.ok, 10),
+			strconv.FormatInt(c.n429, 10),
+			resetCountdown(c.spentAt, m.now),
+		})
+	}
+	m.keyTable.SetRows(rows)
+}
+
+// filteredLogLines applies the logs-tab filters to the tail in render
+// order: level first (case-sensitive severity substrings, matching the
+// coloring rules), then the lowercased text query as a substring match.
+// An empty query means no text filter (the fallback keeps everything).
+func (m Model) filteredLogLines() []string {
+	if m.logLevel == logLevelAll && m.logQuery == "" {
+		return m.logLines
+	}
+	out := make([]string, 0, len(m.logLines))
+	for _, line := range m.logLines {
+		switch m.logLevel {
+		case logLevelError:
+			if !strings.Contains(line, "error") {
+				continue
+			}
+		case logLevelWarn:
+			if !strings.Contains(line, "error") && !strings.Contains(line, "warn:") {
+				continue
+			}
+		}
+		if m.logQuery != "" && !strings.Contains(strings.ToLower(line), m.logQuery) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// visibleLogLines is the filtered tail length (the line budget in
+// layout reads the same list View renders).
+func (m Model) visibleLogLines() int {
+	return len(m.filteredLogLines())
+}
+
+// applyLog pushes the FILTERED tail into the viewport (still inside
+// Update; View only renders the widget). Lines are colored by level here
+// — before the viewport sees them — so each line reaches it as one whole
+// run. Scroll pin: the dashboard's mini tail is always bottom-anchored;
+// the logs tab follows only while logFollow is set (cleared by scrolling
+// up, restored by `G` or a tab switch).
 func (m *Model) applyLog() {
-	if m.logErr != nil || len(m.logLines) == 0 {
+	visible := m.filteredLogLines()
+	if m.logErr != nil || len(visible) == 0 {
 		m.logVP.SetContent("")
 		return
 	}
-	colored := make([]string, len(m.logLines))
-	for i, line := range m.logLines {
+	colored := make([]string, len(visible))
+	for i, line := range visible {
 		colored[i] = m.logLevelStyle(line)
 	}
 	m.logVP.SetContent(strings.Join(colored, "\n"))
-	m.logVP.GotoBottom()
+	if m.tab == tabDashboard || m.logFollow {
+		m.logVP.GotoBottom()
+	}
 }
 
 // egressRows renders one row per quota egress with its reset countdown.
@@ -782,21 +1166,34 @@ func egressRows(st *cli.Status, now time.Time) []table.Row {
 }
 
 // keyRows renders one row per fingerprinted API key with its reset
-// countdown. The key column is the fingerprint only — the raw key never
-// exists in the decoded status (control-layer fingerprinting) and never
-// reaches the table.
-func keyRows(st *cli.Status, now time.Time) []table.Row {
-	rows := make([]table.Row, 0, len(st.State.Keys))
-	for _, fp := range sortedKeys(st.State.Keys) {
-		ks := st.State.Keys[fp]
-		if ks == nil {
-			continue
+// countdown — the status-only variant folded into rebuildKeyTable above
+// (kept conceptually: fingerprint + counters + countdown).
+//
+// dayRows renders the stats "by day" rollup (already sorted by the
+// store: newest day first). Columns mirror the quota tables' OK/429.
+func dayRows(st *cli.Stats) []table.Row {
+	rows := make([]table.Row, 0, len(st.Days))
+	for _, d := range st.Days {
+		rows = append(rows, table.Row{d.Day, strconv.FormatInt(d.OK, 10), strconv.FormatInt(d.N429, 10)})
+	}
+	return rows
+}
+
+// ipRows renders the stats "by ip" rollup (sorted by last request). The
+// LastTS stamp is formatted ONCE here (Update-side precompute — View
+// stays pure); cells clip in the table, never wrap.
+func ipRows(st *cli.Stats) []table.Row {
+	rows := make([]table.Row, 0, len(st.IPs))
+	for _, p := range st.IPs {
+		last := "-"
+		if p.LastTS > 0 {
+			last = time.UnixMilli(p.LastTS).Format("2006-01-02 15:04")
 		}
 		rows = append(rows, table.Row{
-			fp,
-			strconv.FormatInt(ks.OK, 10),
-			strconv.FormatInt(ks.Daily429, 10),
-			resetCountdown(ks.SpentUntil, now),
+			p.IP,
+			strconv.FormatInt(p.OK, 10),
+			strconv.FormatInt(p.N429, 10),
+			last,
 		})
 	}
 	return rows

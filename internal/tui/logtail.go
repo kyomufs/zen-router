@@ -14,9 +14,11 @@ import (
 
 const (
 	// logTailLines is how many trailing lines one fetch cycle returns.
-	logTailLines = 500
+	// Large enough for the logs tab's scrollback + level/text filters
+	// (Phase 2) — the whole tail is kept client-side.
+	logTailLines = 5000
 	// logTailBytes bounds how much of the file tail is read per cycle.
-	logTailBytes = 256 << 10
+	logTailBytes = 1 << 20
 )
 
 // NewFileLogTail returns a LogSource for the daemon log file at path.
