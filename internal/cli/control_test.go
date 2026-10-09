@@ -7,6 +7,7 @@ package cli
 // no daemon.
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
+	"zen-router/internal/store"
 )
 
 // --- fixtures ---------------------------------------------------------------
@@ -57,6 +59,27 @@ func newTestControl(rot *router.Router) *Control {
 		Listen:    "127.0.0.1:8787",
 		StartedAt: time.Now().Add(-5 * time.Second),
 	}
+}
+
+// newTestRouterWithHistory is newTestRouter with a history store attached
+// (stats endpoint fixture).
+func newTestRouterWithHistory(t *testing.T, hist *store.Store) *router.Router {
+	t.Helper()
+	t.Setenv("OPENCODE_ZEN_API_KEY", "")
+	t.Setenv("OPENCODE_GO_API_KEY", "")
+	st, err := quota.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("quota.Open: %v", err)
+	}
+	rot, err := router.New(router.Options{
+		Store:   st,
+		Logger:  log.New(io.Discard, "", 0),
+		History: hist,
+	})
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+	return rot
 }
 
 // newChatUpstream serves a scripted 2xx chat SSE stream after an optional
@@ -301,6 +324,60 @@ func TestGateway3xxNotRecorded(t *testing.T) {
 	}
 	if lat := st.LatencyTTFB["direct"]; lat.Count != 0 {
 		t.Errorf("status.latency_ttfb_ms.direct.count = %d, want 0 (3xx must not be recorded)", lat.Count)
+	}
+}
+
+// --- TestStatsEndpoint -------------------------------------------------------
+
+// TestStatsEndpoint: GET /_zenctl/stats serves OK/429 rollups from the
+// history store (per day, per IP), and ControlClient.Stats decodes the same
+// payload through a live loopback server. A daemon without history storage
+// reports empty arrays (200, not 404/500) so the TUI never special-cases it.
+func TestStatsEndpoint(t *testing.T) {
+	// Router WITH history: one gateway 2xx (RecordSuccess), one daily 429
+	// (OnResult), IP stamp from a fixed getter.
+	hist, err := store.Open(filepath.Join(t.TempDir(), "stats.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer hist.Close()
+	hist.SetIPGetter(func() string { return "198.51.100.9" })
+	rot := newTestRouterWithHistory(t, hist)
+
+	rot.RecordSuccess("direct", "secret-key", 5)
+	rot.OnResult(proxy.Result{Egress: proxy.EgressDirect, DailyLimit: true, Status: 429})
+
+	srv := httptest.NewServer(newTestControl(rot).Handler(http.NewServeMux()))
+	defer srv.Close()
+	client := NewControlClient(srv.Listener.Addr().String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := client.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats(): %v", err)
+	}
+	if len(st.Days) != 1 || st.Days[0].OK != 1 || st.Days[0].N429 != 1 {
+		t.Fatalf("stats.days = %+v, want one row ok:1 429:1", st.Days)
+	}
+	if len(st.IPs) != 1 || st.IPs[0].IP != "198.51.100.9" || st.IPs[0].OK != 1 || st.IPs[0].N429 != 1 {
+		t.Fatalf("stats.ips = %+v, want 198.51.100.9 ok:1 429:1", st.IPs)
+	}
+
+	// Router WITHOUT history: empty arrays, HTTP 200.
+	plain := newTestRouter(t)
+	rec := httptest.NewRecorder()
+	newTestControl(plain).Handler(http.NewServeMux()).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/_zenctl/stats", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /_zenctl/stats (no history): HTTP %d, want 200", rec.Code)
+	}
+	var payload Stats
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode empty stats: %v", err)
+	}
+	if payload.Days == nil || payload.IPs == nil || len(payload.Days) != 0 || len(payload.IPs) != 0 {
+		t.Errorf("empty stats payload = %s, want non-null empty arrays", truncate(rec.Body.Bytes()))
 	}
 }
 

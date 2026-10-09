@@ -11,6 +11,7 @@ import (
 	"zen-router/internal/keys"
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
+	"zen-router/internal/store"
 )
 
 // Router owns the egress decision. The gateway is DIRECT-ONLY: the single
@@ -19,6 +20,12 @@ import (
 type Router struct {
 	log   *log.Logger
 	store *quota.Manager
+
+	// history is the SQLite request-event store feeding the TUI stats
+	// views (per-day / per-IP OK+429). Optional: nil disables history
+	// recording without touching the quota counters; recording failures
+	// are logged, never surfaced to the request path.
+	history *store.Store
 
 	mu       sync.Mutex
 	directRT http.RoundTripper
@@ -40,6 +47,8 @@ type Options struct {
 	Pool *keys.Pool
 	// Family pins the direct transport's dialing to "auto", "v4" or "v6".
 	Family string
+	// History is the SQLite request-event store (nil = no history).
+	History *store.Store
 }
 
 // New builds a Router on the direct lane.
@@ -60,10 +69,27 @@ func New(opts Options) (*Router, error) {
 	return &Router{
 		log:      opts.Logger,
 		store:    opts.Store,
+		history:  opts.History,
 		directRT: directTransportFor(opts.Family),
 		pool:     opts.Pool,
 		latency:  seedLatency(),
 	}, nil
+}
+
+// History exposes the SQLite request-event store for the control API
+// (GET /_zenctl/stats). May be nil when history recording is disabled.
+func (r *Router) History() *store.Store { return r.history }
+
+// recordHistory appends one outcome event to the SQLite history store.
+// Nil-safe and failure-tolerant: history is dashboard data and must never
+// delay or fail a request.
+func (r *Router) recordHistory(kind, key string) {
+	if r.history == nil {
+		return
+	}
+	if err := r.history.Record(kind, key); err != nil {
+		r.log.Printf("warn: history record: %v", err)
+	}
 }
 
 // directTransportFor builds the direct transport, pinning its dialer to the
@@ -113,6 +139,7 @@ func (r *Router) OnResult(res proxy.Result) {
 	switch {
 	case res.DailyLimit:
 		r.store.RecordDaily429(string(res.Egress), quota.NextReset(time.Now()))
+		r.recordHistory(store.Kind429, "")
 		r.log.Printf("[%s] daily quota exhausted (status %d, retry-after %q)",
 			res.Egress, res.Status, res.RetryAfter)
 	case res.Status >= 200 && res.Status < 300:
@@ -124,6 +151,7 @@ func (r *Router) OnResult(res proxy.Result) {
 		// (review F1).
 		r.store.RecordRequestSuccess(string(res.Egress), "")
 		r.recordLatency(string(res.Egress), LatencyStream, res.LatencyMS)
+		r.recordHistory(store.KindOK, "")
 	}
 }
 
@@ -183,6 +211,7 @@ func seedLatency() map[latencyKey]*latencyEntry {
 func (r *Router) RecordSuccess(egress proxy.Egress, key string, latencyMS int64) {
 	r.store.RecordRequestSuccess(string(egress), key)
 	r.recordLatency(string(egress), LatencyTTFB, latencyMS)
+	r.recordHistory(store.KindOK, key)
 }
 
 // recordLatency folds one 2xx observation into its (kind, egress)

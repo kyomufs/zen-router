@@ -25,6 +25,7 @@ import (
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
+	"zen-router/internal/store"
 	"zen-router/internal/systemd"
 	"zen-router/internal/tui"
 
@@ -327,15 +328,27 @@ func cmdUp(args []string) error {
 		return fmt.Errorf("migrate legacy state: %w", err)
 	}
 
-	store, err := quota.Open("")
+	quotaState, err := quota.Open("")
 	if err != nil {
 		return err
 	}
+	// Request-history SQLite store (TUI stats: per-day / per-IP OK+429).
+	// Auxiliary: if it cannot open, the daemon still starts, but history
+	// recording stays off for the whole run (nil-safe recorders) — the
+	// stats endpoint then reports empty rollups.
+	var history *store.Store
+	if h, herr := store.Open(paths.StatsFile); herr != nil {
+		logger.Printf("warn: history store disabled: %v", herr)
+	} else {
+		history = h
+		defer history.Close()
+	}
 	r, err := router.New(router.Options{
-		Store:  store,
-		Logger: logger,
-		Pool:   keys.New(cfg.KeyPoolFile),
-		Family: cfg.Family,
+		Store:   quotaState,
+		Logger:  logger,
+		Pool:    keys.New(cfg.KeyPoolFile),
+		Family:  cfg.Family,
+		History: history,
 	})
 	if err != nil {
 		return err
@@ -353,6 +366,9 @@ func cmdUp(args []string) error {
 	})
 	egressIP := cli.NewEgressIPTracker(echoer)
 	egressIP.Refresh()
+	// Stamp every history event with the observed public IP (the plan's
+	// per-IP stats dimension); "" from the tracker records as "unknown".
+	history.SetIPGetter(egressIP.IP)
 
 	srv, err := proxy.New(proxy.Config{
 		Listen:   listen,
@@ -426,11 +442,11 @@ func cmdStatus(args []string) error {
 	st, err := cli.NewControlClient(listen).Status(ctx)
 	if err != nil {
 		// Daemon down: report from persisted state so the command still works.
-		store, serr := quota.Open("")
+		qst, serr := quota.Open("")
 		if serr != nil {
 			return fmt.Errorf("%v (and state unreadable: %v)", err, serr)
 		}
-		snap := store.Snapshot()
+		snap := qst.Snapshot()
 		fmt.Printf("daemon: down (reporting persisted state)\n")
 		printEgress(snap)
 		return nil

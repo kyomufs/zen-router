@@ -93,6 +93,19 @@ func (c *ControlClient) Status(ctx context.Context) (*Status, error) {
 	return &st, nil
 }
 
+// Stats fetches the daemon's request-history rollups (GET /_zenctl/stats).
+func (c *ControlClient) Stats(ctx context.Context) (*Stats, error) {
+	data, err := c.do(ctx, http.MethodGet, "stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	var st Stats
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("decode stats: %w", err)
+	}
+	return &st, nil
+}
+
 // Stop asks the daemon to shut down gracefully.
 func (c *ControlClient) Stop(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodPost, "stop", nil)

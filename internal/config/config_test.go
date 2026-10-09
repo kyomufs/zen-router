@@ -48,6 +48,7 @@ func TestDefaultPaths(t *testing.T) {
 			StateDir:  filepath.Join(stateHome, "zen-router"),
 			StateFile: filepath.Join(stateHome, "zen-router", "state.json"),
 			LogFile:   filepath.Join(stateHome, "zen-router", "zen.log"),
+			StatsFile: filepath.Join(stateHome, "zen-router", "stats.db"),
 		}
 		if got != want {
 			t.Errorf("DefaultPaths() = %+v, want %+v", got, want)
@@ -68,6 +69,7 @@ func TestDefaultPaths(t *testing.T) {
 			StateDir:  filepath.Join(home, ".local", "state", "zen-router"),
 			StateFile: filepath.Join(home, ".local", "state", "zen-router", "state.json"),
 			LogFile:   filepath.Join(home, ".local", "state", "zen-router", "zen.log"),
+			StatsFile: filepath.Join(home, ".local", "state", "zen-router", "stats.db"),
 		}
 		if got != want {
 			t.Errorf("DefaultPaths() = %+v, want %+v", got, want)

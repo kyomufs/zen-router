@@ -12,12 +12,25 @@ import (
 
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
+	"zen-router/internal/store"
 )
 
 // ControlPrefix reserves a path namespace on the proxy listener for the CLI.
 // The plugin only ever targets /zen/..., so this never collides with upstream
 // traffic, and it keeps control on the same localhost-only port.
 const ControlPrefix = "/_zenctl/"
+
+// StatsWindowDays is the aggregation window of GET /_zenctl/stats: how many
+// trailing calendar days (including today) the day and IP rollups cover.
+const StatsWindowDays = 30
+
+// Stats is the JSON payload served by GET /_zenctl/stats: OK/429 rollups
+// per local calendar day and per observed egress IP, computed by the daemon
+// from the SQLite request-history store (the TUI stays a plain HTTP client).
+type Stats struct {
+	Days []store.DayStat `json:"days"`
+	IPs  []store.IPStat  `json:"ips"`
+}
 
 // Status is the JSON payload served by GET /_zenctl/status: the dashboard
 // header fields plus the redacted quota state (plan Task 1, spec §7).
@@ -85,6 +98,8 @@ func (c *Control) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case route == "status" && r.Method == http.MethodGet:
 		c.handleStatus(w)
+	case route == "stats" && r.Method == http.MethodGet:
+		c.handleStats(w)
 	case route == "stop" && r.Method == http.MethodPost:
 		c.handleStop(w)
 	default:
@@ -126,6 +141,30 @@ func (c *Control) handleStatus(w http.ResponseWriter) {
 		// blocks and a status-poll burst cannot fan out echo requests.
 		EgressIP: c.IPTracker.IP(),
 	})
+}
+
+// handleStats serves the request-history rollups (GET /_zenctl/stats).
+// The router owns the SQLite handle; a daemon started without history
+// storage reports empty rollups rather than an error.
+func (c *Control) handleStats(w http.ResponseWriter) {
+	h := c.Router.History()
+	days, err := h.ByDay(StatsWindowDays)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	ips, err := h.ByIP(StatsWindowDays)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if days == nil {
+		days = []store.DayStat{}
+	}
+	if ips == nil {
+		ips = []store.IPStat{}
+	}
+	writeJSON(w, http.StatusOK, Stats{Days: days, IPs: ips})
 }
 
 // fingerprintKeys replaces every raw API key in state.keys with a display

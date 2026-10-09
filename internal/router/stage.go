@@ -15,6 +15,7 @@ import (
 
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
+	"zen-router/internal/store"
 	"zen-router/internal/zen"
 )
 
@@ -82,11 +83,15 @@ func (r *Router) NextAttempt(rep Report) (Attempt, bool) {
 	switch rep.Kind {
 	case zen.KindDailyLimit:
 		r.recordReport(rep, now)
+		r.recordHistory(store.Kind429, rep.Key)
 		if rep.Step != 0 {
 			return Attempt{}, false
 		}
 		return r.keyStep(rep)
 	case zen.KindKeyRateLimit:
+		// Per-key rate 429: quota counters deliberately unchanged (key
+		// rotation only), but the history store still counts it as a 429.
+		r.recordHistory(store.Kind429, rep.Key)
 		if rep.Step != 0 {
 			return Attempt{}, false
 		}

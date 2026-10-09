@@ -15,12 +15,14 @@ import (
 
 // Paths holds every filesystem location the daemon uses. StateFile is the
 // default state location; ZEN_ROUTER_STATE overrides it at runtime and is
-// read through StateFile (consumed by internal/quota).
+// read through StateFile (consumed by internal/quota). StatsFile is the
+// SQLite request-history database backing the TUI stats views.
 type Paths struct {
 	ConfigDir string
 	StateDir  string
 	StateFile string
 	LogFile   string
+	StatsFile string
 }
 
 // DefaultPaths resolves the XDG base directories: $XDG_CONFIG_HOME/zen-router
@@ -50,6 +52,7 @@ func DefaultPaths() (Paths, error) {
 		StateDir:  stateDir,
 		StateFile: filepath.Join(stateDir, "state.json"),
 		LogFile:   filepath.Join(stateDir, "zen.log"),
+		StatsFile: filepath.Join(stateDir, "stats.db"),
 	}, nil
 }
 
