@@ -43,6 +43,7 @@ func TestNewThemeAdaptsToBackground(t *testing.T) {
 		{"warn", dark.warn, light.warn},
 		{"err", dark.err, light.err},
 		{"dim", dark.dim, light.dim},
+		{"surface", dark.surface, light.surface},
 	} {
 		if tc.d == nil || tc.l == nil {
 			t.Errorf("%s: missing palette color (dark=%v light=%v)", tc.name, tc.d, tc.l)
@@ -79,6 +80,29 @@ func TestThemeStylesDeriveFromPalette(t *testing.T) {
 		}
 		if !th.panelTitle.GetBold() {
 			t.Errorf("%s: panel title style must be bold", prefix)
+		}
+		// Header band (approved redesign): title paints bold accent on the
+		// band background; the filler keeps only the background so the band
+		// reads as one continuous strip.
+		if !th.bandTitle.GetBold() {
+			t.Errorf("%s: band title style must be bold", prefix)
+		}
+		if got, want := fmt.Sprint(th.bandTitle.GetForeground()), fmt.Sprint(th.accent); got != want {
+			t.Errorf("%s: band title foreground = %s, want accent %s", prefix, got, want)
+		}
+		if got, want := fmt.Sprint(th.bandTitle.GetBackground()), fmt.Sprint(th.surface); got != want {
+			t.Errorf("%s: band title background = %s, want surface %s", prefix, got, want)
+		}
+		if got, want := fmt.Sprint(th.bandGap.GetBackground()), fmt.Sprint(th.surface); got != want {
+			t.Errorf("%s: band gap background = %s, want surface %s", prefix, got, want)
+		}
+		// Stats values: accent-bold emphasis (bold + accent, byte-equal to
+		// the header weight — design_test pins the run through it).
+		if !th.value.GetBold() {
+			t.Errorf("%s: value style must be bold", prefix)
+		}
+		if got, want := fmt.Sprint(th.value.GetForeground()), fmt.Sprint(th.accent); got != want {
+			t.Errorf("%s: value foreground = %s, want accent %s", prefix, got, want)
 		}
 	}
 }

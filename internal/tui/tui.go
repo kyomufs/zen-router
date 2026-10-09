@@ -90,6 +90,10 @@ const (
 	// headerTitle is the dashboard header line asserted by the tests.
 	headerTitle = "zen-router control dashboard"
 	headerPoll  = "poll: 1s (control API)"
+	// Status pill glyphs: the right-aligned state chip on the header band.
+	pillUp   = "● UP"
+	pillDown = "● DOWN"
+	pillWait = "● WAIT"
 	// startOffer is the spec §7:219 daemon-down offer, verbatim in
 	// substance: start it with `zen-router up` detached, log file in XDG
 	// state.
@@ -259,6 +263,12 @@ func New(src StatusSource, opts ...Option) Model {
 			viewport.WithHeight(defaultLogHeight),
 		),
 	}
+	// Help footer styling from the theme (approved redesign): keys in the
+	// accent-bold weight, descriptions and the " • " separator dimmed —
+	// never the bubbles defaults.
+	m.help.Styles.ShortKey = m.th.header
+	m.help.Styles.ShortDesc = m.th.dimText
+	m.help.Styles.ShortSeparator = m.th.dimText
 	for _, opt := range opts {
 		opt(&m)
 	}

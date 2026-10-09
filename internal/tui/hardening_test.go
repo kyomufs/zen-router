@@ -438,6 +438,11 @@ func assertCell(t *testing.T, phase string, content string, dc hcDaemon, lc hcLo
 	}
 
 	// --- markers: header + common frame + state-specific content ---------
+	// Markers assert display text: the redesign styles labels, values and
+	// state chunks as separate runs, so a pinned line may span several
+	// SGR runs. Escape discipline (assertOnlyStylingEscapes), the action
+	// marker battery and secret canaries below all stay on raw content.
+	display := stripANSI(content)
 	want := []string{headerTitle, headerPoll, "log tail", "quit"}
 	want = append(want, dc.want...)
 	want = append(want, lc.want...)
@@ -447,12 +452,12 @@ func assertCell(t *testing.T, phase string, content string, dc hcDaemon, lc hcLo
 		want = append(want, dc.wantWide...) // row content only at default sizes
 	}
 	for _, w := range want {
-		if !strings.Contains(content, w) {
+		if !strings.Contains(display, w) {
 			t.Errorf("[%s] marker %q missing from Content", phase, w)
 		}
 	}
 	for _, a := range dc.wantAbsent {
-		if strings.Contains(content, a) {
+		if strings.Contains(display, a) {
 			t.Errorf("[%s] marker %q must be absent in state %s", phase, a, dc.name)
 		}
 	}
@@ -663,12 +668,14 @@ func TestRecoveringDownToUpKeepsStateComposed(t *testing.T) {
 	m, _ = update(t, m, runCmd(t, fetchCmd))
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	c = assertStableView(t, "recovery/recovered", m)
+	// Display text: the up-line marker spans label/value style runs.
+	d := stripANSI(c)
 	for _, want := range []string{
 		"daemon: up | listen: 127.0.0.1:8787",
 		"quota (per egress)", "quota (per key)",
 		"stop daemon failed: ", hcErr409Body, "quit",
 	} {
-		if !strings.Contains(c, want) {
+		if !strings.Contains(d, want) {
 			t.Errorf("[recovery/recovered] marker %q missing", want)
 		}
 	}

@@ -25,12 +25,13 @@ type theme struct {
 	isDark bool
 
 	// Palette (Catppuccin Mocha / Latte).
-	accent color.Color // mauve — focus ring, header
-	direct color.Color // green — direct-egress badge
-	ok     color.Color // green — quota within limits
-	warn   color.Color // yellow — 429 seen today
-	err    color.Color // red — key/egress exhausted
-	dim    color.Color // subtext — secondary labels
+	accent  color.Color // mauve — focus ring, header
+	direct  color.Color // green — direct-egress badge
+	ok      color.Color // green — quota within limits
+	warn    color.Color // yellow — 429 seen today
+	err     color.Color // red — key/egress exhausted
+	dim     color.Color // subtext — secondary labels
+	surface color.Color // surface0 — header band background
 
 	// Styles composed from the palette.
 	header     lipgloss.Style // bold accent header line
@@ -39,6 +40,9 @@ type theme struct {
 	statusWarn lipgloss.Style
 	statusErr  lipgloss.Style
 	dimText    lipgloss.Style
+	value      lipgloss.Style // accent-bold emphasis — stats values
+	bandTitle  lipgloss.Style // bold accent on the band background
+	bandGap    lipgloss.Style // band background filler
 }
 
 // newTheme builds the style set for one background. Dark and light palettes
@@ -49,13 +53,14 @@ func newTheme(isDark bool) theme {
 		return lipgloss.LightDark(isDark)(lipgloss.Color(light), lipgloss.Color(dark))
 	}
 	th := theme{
-		isDark: isDark,
-		accent: pick("#8839ef", "#cba6f7"), // mauve
-		direct: pick("#40a02b", "#a6e3a1"), // green
-		ok:     pick("#40a02b", "#a6e3a1"), // green
-		warn:   pick("#df8e1d", "#f9e2af"), // yellow
-		err:    pick("#d20f39", "#f38ba8"), // red
-		dim:    pick("#6c6f85", "#a6adc8"), // subtext
+		isDark:  isDark,
+		accent:  pick("#8839ef", "#cba6f7"), // mauve
+		direct:  pick("#40a02b", "#a6e3a1"), // green
+		ok:      pick("#40a02b", "#a6e3a1"), // green
+		warn:    pick("#df8e1d", "#f9e2af"), // yellow
+		err:     pick("#d20f39", "#f38ba8"), // red
+		dim:     pick("#6c6f85", "#a6adc8"), // subtext
+		surface: pick("#dce0e8", "#313244"), // surface0
 	}
 	th.header = lipgloss.NewStyle().Bold(true).Foreground(th.accent)
 	th.panelTitle = lipgloss.NewStyle().Bold(true).Foreground(th.accent)
@@ -63,6 +68,10 @@ func newTheme(isDark bool) theme {
 	th.statusWarn = lipgloss.NewStyle().Foreground(th.warn)
 	th.statusErr = lipgloss.NewStyle().Foreground(th.err)
 	th.dimText = lipgloss.NewStyle().Foreground(th.dim)
+	th.value = lipgloss.NewStyle().Bold(true).Foreground(th.accent)
+	th.bandTitle = lipgloss.NewStyle().Bold(true).
+		Foreground(th.accent).Background(th.surface)
+	th.bandGap = lipgloss.NewStyle().Background(th.surface)
 	return th
 }
 

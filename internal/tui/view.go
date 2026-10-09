@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
@@ -124,7 +125,7 @@ func panelWidths(mode layoutMode, w int) (egW, keyW int) {
 func (m Model) View() tea.View {
 	vw := m.viewWidth()
 
-	lines := []string{m.th.header.Render(headerTitle), headerPoll}
+	lines := []string{m.bandLine(), headerPoll}
 	if m.showHelp {
 		// `?` overlay: the dashboard is replaced by the full key list.
 		lines = append(lines, renderPanel("keyboard shortcuts", vw,
@@ -153,6 +154,38 @@ func (m Model) View() tea.View {
 	v.SetContent(strings.Join(lines, "\n"))
 	v.AltScreen = true
 	return v
+}
+
+// statusPill is the header state chip: green while the poll answers, red
+// when the daemon is unreachable, yellow before the first poll. The glyph
+// runs through the theme's status styles so the state reads at a glance.
+func (m Model) statusPill() string {
+	switch {
+	case m.err != nil:
+		return m.th.statusErr.Render(pillDown)
+	case m.status == nil:
+		return m.th.statusWarn.Render(pillWait)
+	default:
+		return m.th.statusOK.Render(pillUp)
+	}
+}
+
+// bandLine renders header line one: a full-width band (surface background)
+// with the dashboard title on the left and the state pill right-aligned.
+// It stays exactly one line — clipLine enforces the width budget even on
+// windows too narrow for title and pill side by side.
+func (m Model) bandLine() string {
+	vw := m.viewWidth()
+	title := m.th.bandTitle.Render(headerTitle)
+	pill := m.statusPill()
+	gap := vw - cells(title) - cells(pill) - 1 // one band cell after the pill
+	if gap < 0 {
+		gap = 0
+	}
+	line := title +
+		m.th.bandGap.Render(strings.Repeat(" ", gap)) + pill +
+		m.th.bandGap.Render(" ")
+	return clipLine(line, vw)
 }
 
 // helpOverlayRows lists every binding rendered by the `?` overlay — kept
@@ -206,7 +239,7 @@ func (m Model) logPanelLines() []string {
 	var body []string
 	switch {
 	case m.logErr != nil:
-		body = []string{fmt.Sprintf("log tail error: %v", m.logErr)}
+		body = []string{m.logLevelStyle(fmt.Sprintf("log tail error: %v", m.logErr))}
 	case len(m.logLines) == 0:
 		body = []string{"no log output yet"}
 	default:
@@ -227,6 +260,21 @@ func splitBody(rendered string) []string {
 		return nil
 	}
 	return strings.Split(raw, "\n")
+}
+
+// logLevelStyle colors one log line by substring: "error" first (severity
+// order), then "warn:", everything else stays raw text. It runs when the
+// tail is pushed into the viewport (applyLog) and on the tail-error
+// notice, so every line stays one whole style run through viewport
+// wrapping and panel padding.
+func (m Model) logLevelStyle(line string) string {
+	switch {
+	case strings.Contains(line, "error"):
+		return m.th.statusErr.Render(line)
+	case strings.Contains(line, "warn:"):
+		return m.th.statusWarn.Render(line)
+	}
+	return line
 }
 
 // joinRow places two panels side by side with a one-cell gutter: both
@@ -345,32 +393,48 @@ func padCells(s string, w int) string {
 // statusLines renders the block between the header and the first panel —
 // one entry per line (wrapped entries may span several rendered lines).
 // View and coreLineCount share it so the layout budget can never drift
-// from what is actually rendered.
+// from what is actually rendered. Labels and values render as separate
+// style runs; the runs reassemble the historical display text verbatim,
+// so pinned markers still match on display text (stripANSI).
 func (m Model) statusLines() []string {
 	var lines []string
 	switch {
 	case m.err != nil:
 		// Inside the full-width down panel: wrap at the panel interior so
-		// renderPanel never has to clip a status line (hardening markers
-		// must stay whole).
+		// renderPanel never has to clip a status line (the down marker
+		// stays one whole style run, text unchanged).
 		interior := m.viewWidth() - 2
 		lines = []string{
-			m.wrapAt(fmt.Sprintf("daemon: down (%v)", m.err), interior),
+			m.wrapAt(m.th.statusErr.Render(fmt.Sprintf("daemon: down (%v)", m.err)), interior),
 			m.wrapAt(startOffer, interior),
 		}
 	case m.status == nil:
-		lines = []string{m.wrap("daemon: waiting for the first status poll...")}
+		lines = []string{m.wrap(m.th.statusWarn.Render(
+			"daemon: waiting for the first status poll..."))}
 	default:
-		st := m.status
-		lines = []string{
-			m.wrap(fmt.Sprintf("daemon: up | listen: %s | pid: %d | uptime: %s",
-				orDash(st.Listen), st.Pid, fmtUptime(st.UptimeSeconds))),
-			m.wrap(fmt.Sprintf("ip: %s", orDash(st.EgressIP))),
-			m.wrap(latencyLine(st, "ttfb", false)),
-			m.wrap(latencyLine(st, "stream", true)),
-		}
+		lines = m.upStatusLines(m.status)
 	}
 	return lines
+}
+
+// upStatusLines renders the up-state stats block: the state/listen/pid/
+// uptime line, the observed egress IP, and both latency windows sharing
+// one stats line. Labels render dim, values accent-bold (th.value), the
+// state chunk carries the ok color. Each run wraps whole substrings —
+// concatenating the runs reproduces the pinned markers character for
+// character (design_test.go pins both directions).
+func (m Model) upStatusLines(st *cli.Status) []string {
+	dim, val := m.th.dimText, m.th.value
+	line1 := m.th.statusOK.Render("daemon: up") +
+		dim.Render(" | listen: ") + val.Render(orDash(st.Listen)) +
+		dim.Render(" | pid: ") + val.Render(strconv.Itoa(st.Pid)) +
+		dim.Render(" | uptime: ") + val.Render(fmtUptime(st.UptimeSeconds))
+	line2 := dim.Render("ip: ") + val.Render(orDash(st.EgressIP))
+	ttfbLabel, ttfb := latencyRuns(st, "ttfb", false)
+	streamLabel, stream := latencyRuns(st, "stream", true)
+	line3 := dim.Render(ttfbLabel) + val.Render(ttfb) +
+		dim.Render("  ") + dim.Render(streamLabel) + val.Render(stream)
+	return []string{m.wrap(line1), m.wrap(line2), m.wrap(line3)}
 }
 
 // actionLine is the transient footer line — the spinner while a request
@@ -613,45 +677,64 @@ func fitColumns(base []table.Column, interior int) []table.Column {
 	if n == 0 || interior <= 0 {
 		return base
 	}
-	total := 0
-	for _, c := range base {
-		total += c.Width
-	}
 	target := interior - 2*n
 	if target < n {
 		target = n
 	}
-	if total <= target {
-		return base
-	}
+
+	// Titles never ellipsize: every column keeps at least its title's
+	// rune width. The layout clamps viewWidth to >=30, where the egress
+	// title floors (6+2+3+9 = 20) exactly fit the minimum target of 20,
+	// so the floors always fit the budget.
+	mins := make([]int, n)
 	out := make([]table.Column, n)
 	copy(out, base)
+	total := 0
+	for i := range base {
+		mins[i] = utf8.RuneCountInString(base[i].Title)
+		if out[i].Width < mins[i] {
+			out[i].Width = mins[i]
+		}
+		total += out[i].Width
+	}
+	if total <= target {
+		return out
+	}
+
 	sum := 0
 	for i := range out {
-		w := out[i].Width * target / total // proportional shrink, floored at 1
-		if w < 1 {
-			w = 1
+		w := out[i].Width * target / total // proportional shrink, floored at the title
+		if w < mins[i] {
+			w = mins[i]
 		}
 		out[i].Width = w
 		sum += w
 	}
 	for sum != target { // rounding drift lands on the widest column
-		widest := 0
+		if sum < target {
+			widest := 0
+			for i := range out {
+				if out[i].Width > out[widest].Width {
+					widest = i
+				}
+			}
+			out[widest].Width++
+			sum++
+			continue
+		}
+		// Shrink the widest column that still sits above its title floor;
+		// when every column is at its floor, accept the overflow.
+		widest := -1
 		for i := range out {
-			if out[i].Width > out[widest].Width {
+			if out[i].Width > mins[i] && (widest < 0 || out[i].Width > out[widest].Width) {
 				widest = i
 			}
 		}
-		if sum < target {
-			out[widest].Width++
-			sum++
-		} else {
-			if out[widest].Width <= 1 {
-				break
-			}
-			out[widest].Width--
-			sum--
+		if widest < 0 {
+			break
 		}
+		out[widest].Width--
+		sum--
 	}
 	return out
 }
@@ -665,13 +748,18 @@ func (m *Model) applyStatus(st *cli.Status) {
 }
 
 // applyLog pushes the fetched tail into the viewport (still inside Update;
-// View only renders the widget).
+// View only renders the widget). Lines are colored by level here — before
+// the viewport sees them — so each line reaches it as one whole run.
 func (m *Model) applyLog() {
 	if m.logErr != nil || len(m.logLines) == 0 {
 		m.logVP.SetContent("")
 		return
 	}
-	m.logVP.SetContent(strings.Join(m.logLines, "\n"))
+	colored := make([]string, len(m.logLines))
+	for i, line := range m.logLines {
+		colored[i] = m.logLevelStyle(line)
+	}
+	m.logVP.SetContent(strings.Join(colored, "\n"))
 	m.logVP.GotoBottom()
 }
 
@@ -714,31 +802,33 @@ func keyRows(st *cli.Status, now time.Time) []table.Row {
 	return rows
 }
 
-// latencyLine renders one latency window per egress as last/avg/sample
-// count, e.g. "latency ttfb: direct 12/14ms (n=3)".
-// The ttfb and stream windows stay separate lines — never a merged number.
-func latencyLine(st *cli.Status, kind string, stream bool) string {
+// latencyRuns splits one latency window per egress into a dim label and
+// a value run, e.g. "latency ttfb: " + "direct 12/14ms (n=3)". The
+// concatenation equals the historical latencyLine text character for
+// character — label+value styling never changes the display text, and
+// the windows still render as separate windows (never a merged number).
+func latencyRuns(st *cli.Status, kind string, stream bool) (label, value string) {
 	lat := st.LatencyTTFB
 	if stream {
 		lat = st.LatencyStream
 	}
+	label = fmt.Sprintf("latency %s: ", kind)
 	if len(lat) == 0 {
-		return fmt.Sprintf("latency %s: no samples", kind)
+		return label, "no samples"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "latency %s:", kind)
 	for i, eg := range sortedKeys(lat) {
 		e := lat[eg]
 		if i > 0 {
-			b.WriteByte(',')
+			b.WriteString(", ")
 		}
 		if e.Count == 0 {
-			fmt.Fprintf(&b, " %s none (n=0)", eg)
+			fmt.Fprintf(&b, "%s none (n=0)", eg)
 			continue
 		}
-		fmt.Fprintf(&b, " %s %d/%dms (n=%d)", eg, e.LastMS, e.AvgMS, e.Count)
+		fmt.Fprintf(&b, "%s %d/%dms (n=%d)", eg, e.LastMS, e.AvgMS, e.Count)
 	}
-	return b.String()
+	return label, b.String()
 }
 
 // resetCountdown is the time until the quota window resets: the key/egress

@@ -237,7 +237,9 @@ func TestViewHeader(t *testing.T) {
 	msg := runCmd(t, m.Init())
 	m, _ = update(t, m, msg)
 	content := m.View().Content
-	for _, want := range []string{"daemon: up", "127.0.0.1:8787", "pid: 4242"} {
+	// "pid: 4242" spans a label/value style-run boundary (dim label,
+	// accent-bold value) — pin the display text at run granularity.
+	for _, want := range []string{"daemon: up", "127.0.0.1:8787", "pid:", "4242"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("up view must contain %q, got:\n%s", want, content)
 		}
