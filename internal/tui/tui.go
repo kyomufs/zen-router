@@ -20,6 +20,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -586,7 +587,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pending = false
 		m.actionLabel, m.actionErr = msg.label, msg.err
 		m.relayout() // the status block loses the action line
-		// No command: the poll chain keeps its own tick schedule — an
+		// A successful pool mutation refreshes the listing so the table
+		// matches the file (the added row appears, the deleted one goes)
+		// without waiting for the next tab entry or `r`. Failures keep
+		// the old rows — the error line already explains why.
+		if msg.err == nil && (msg.label == "add key" || msg.label == "delete key") {
+			return m, m.fetchKeys()
+		}
+		// Otherwise: the poll chain keeps its own tick schedule — an
 		// action result neither pauses nor re-arms it.
 		return m, nil
 	case statsMsg:
@@ -827,7 +835,10 @@ func (m Model) handleTabKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // deleteSelectedKey is the two-step keys-tab delete: the first press arms
 // confirmDelete (prompt line, no command), the second fires KeySource.
 // DeleteKey for the fingerprint of the cursor row; esc cancels (Update's
-// esc priority). Disabled without a KeySource or while pending.
+// esc priority). Disabled without a KeySource or while pending. The table
+// also merges status-only quota fingerprints (the "public" fallback etc.)
+// which live in no pool file — those rows refuse to arm with an inline
+// error instead of firing a request the daemon must 404.
 func (m Model) deleteSelectedKey() (tea.Model, tea.Cmd) {
 	if m.keySrc == nil || m.pending || m.keyInputOn {
 		return m, nil
@@ -840,12 +851,19 @@ func (m Model) deleteSelectedKey() (tea.Model, tea.Cmd) {
 	if idx >= len(rows) || idx >= len(m.keyRowFPs) {
 		return m, nil
 	}
+	fp := m.keyRowFPs[idx]
+	if !slices.Contains(m.keyFPs, fp) {
+		m.confirmDelete = false
+		m.actionLabel, m.actionErr = "delete key",
+			fmt.Errorf("%s is a status-only key (not in the pool file)", fp)
+		m.relayout()
+		return m, nil
+	}
 	if !m.confirmDelete {
 		m.confirmDelete = true
 		m.confirmStop = false
 		return m, nil
 	}
-	fp := m.keyRowFPs[idx]
 	m.confirmDelete = false
 	return m.startAction(true, "delete key", func(ctx context.Context) error {
 		return m.keySrc.DeleteKey(ctx, fp)

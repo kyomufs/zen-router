@@ -23,10 +23,10 @@ type fullFake struct {
 	stats *cli.Stats
 	fps   []string
 
-	added    []string
-	deleted  []string
-	addErr   error
-	delErr   error
+	added   []string
+	deleted []string
+	addErr  error
+	delErr  error
 }
 
 func (f *fullFake) Stats(context.Context) (*cli.Stats, error) {
@@ -210,6 +210,40 @@ func TestKeysTabAddDelete(t *testing.T) {
 	m, _ = update(t, m, runActionBatch(t, cmd))
 	if len(f.deleted) != 1 || f.deleted[0] != "cafebabe" {
 		t.Fatalf("DeleteKey calls = %v, want [cafebabe] (first sorted fp)", f.deleted)
+	}
+}
+
+// TestKeysTabDeleteStatusOnlyRow: rows merged in from the quota status
+// (the "public" fallback etc.) live in no pool file — `d` must refuse to
+// arm with an inline error instead of firing a 404-prone DeleteKey.
+func TestKeysTabDeleteStatusOnlyRow(t *testing.T) {
+	f := newFullFake(t)
+	f.fps = nil // pool listing empty: every visible row is status-only
+	st := statusFromJSON(t, `{
+	  "up": true,
+	  "state": {"keys": {"efa1f375": {"ok": 3, "daily429": 1}}}
+	}`)
+	f.results[0].status = st
+
+	m := New(f)
+	m, _ = update(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m, _ = update(t, m, runCmd(t, m.Init()))
+	var cmd tea.Cmd
+	m, cmd = press(t, m, "4") // keys tab fires fetchKeys
+	m, _ = update(t, m, runCmd(t, cmd))
+
+	m, cmd = press(t, m, "d")
+	if cmd != nil {
+		t.Fatal("d on a status-only row must not fire a command")
+	}
+	if m.confirmDelete {
+		t.Fatal("d on a status-only row must not arm the confirm")
+	}
+	if !strings.Contains(m.actionLine(), "status-only") {
+		t.Fatalf("inline refusal missing: %q", m.actionLine())
+	}
+	if len(f.deleted) != 0 {
+		t.Fatalf("DeleteKey must not be called, got %v", f.deleted)
 	}
 }
 

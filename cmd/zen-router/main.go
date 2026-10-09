@@ -343,10 +343,17 @@ func cmdUp(args []string) error {
 		history = h
 		defer history.Close()
 	}
+	// Pool file: explicit config wins; otherwise the keys tab manages
+	// <ConfigDir>/pool-config.json (a missing file contributes nothing at
+	// draw time — pool.readKeys falls back to env, then "public").
+	poolFile := cfg.KeyPoolFile
+	if poolFile == "" {
+		poolFile = filepath.Join(paths.ConfigDir, "pool-config.json")
+	}
 	r, err := router.New(router.Options{
 		Store:   quotaState,
 		Logger:  logger,
-		Pool:    keys.New(cfg.KeyPoolFile),
+		Pool:    keys.New(poolFile),
 		Family:  cfg.Family,
 		History: history,
 	})
@@ -384,11 +391,12 @@ func cmdUp(args []string) error {
 	defer stop()
 
 	ctrl := &cli.Control{
-		Router:    r,
-		Shutdown:  stop,
-		Listen:    listen,
-		StartedAt: started,
-		IPTracker: egressIP,
+		Router:      r,
+		Shutdown:    stop,
+		Listen:      listen,
+		StartedAt:   started,
+		IPTracker:   egressIP,
+		KeyPoolFile: poolFile,
 	}
 	// Three surfaces, ONE listener (plan Task 13): control stays outermost
 	// and unchanged (it intercepts /_zenctl/* by prefix), the OpenAI

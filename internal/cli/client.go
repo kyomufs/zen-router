@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -104,6 +105,52 @@ func (c *ControlClient) Stats(ctx context.Context) (*Stats, error) {
 		return nil, fmt.Errorf("decode stats: %w", err)
 	}
 	return &st, nil
+}
+
+// Keys lists the pool file's key fingerprints (GET /_zenctl/keys).
+func (c *ControlClient) Keys(ctx context.Context) ([]string, error) {
+	data, err := c.do(ctx, http.MethodGet, "keys", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode keys: %w", err)
+	}
+	return resp.Keys, nil
+}
+
+// AddKey appends one raw key to the pool file (POST /_zenctl/keys) and
+// returns its fingerprint. The raw key exists only in the request body.
+func (c *ControlClient) AddKey(ctx context.Context, raw string) (string, error) {
+	body, err := json.Marshal(map[string]string{"key": raw})
+	if err != nil {
+		return "", err
+	}
+	data, err := c.do(ctx, http.MethodPost, "keys", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return "", fmt.Errorf("decode add key: %w", err)
+	}
+	return resp.Fingerprint, nil
+}
+
+// DeleteKey removes the pool-file key matching fp (POST
+// /_zenctl/keys/delete).
+func (c *ControlClient) DeleteKey(ctx context.Context, fingerprint string) error {
+	body, err := json.Marshal(map[string]string{"fingerprint": fingerprint})
+	if err != nil {
+		return err
+	}
+	_, err = c.do(ctx, http.MethodPost, "keys/delete", bytes.NewReader(body))
+	return err
 }
 
 // Stop asks the daemon to shut down gracefully.

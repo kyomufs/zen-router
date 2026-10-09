@@ -4,12 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"zen-router/internal/keys"
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
 	"zen-router/internal/store"
@@ -79,6 +82,11 @@ type Control struct {
 	// IPTracker observes the egress public IP for status.egress_ip
 	// (plan Task 2). Nil reports "" — no echo, no fan-out.
 	IPTracker *EgressIPTracker
+
+	// KeyPoolFile is the pool-config.json path the keys-management
+	// routes edit (GET/POST /_zenctl/keys, POST /_zenctl/keys/delete).
+	// Empty disables them with 405 (no pool file configured).
+	KeyPoolFile string
 }
 
 // Handler returns an http.Handler that routes ControlPrefix to the control
@@ -100,6 +108,12 @@ func (c *Control) serve(w http.ResponseWriter, r *http.Request) {
 		c.handleStatus(w)
 	case route == "stats" && r.Method == http.MethodGet:
 		c.handleStats(w)
+	case route == "keys" && r.Method == http.MethodGet:
+		c.handleKeysList(w)
+	case route == "keys" && r.Method == http.MethodPost:
+		c.handleKeyAdd(w, r)
+	case route == "keys/delete" && r.Method == http.MethodPost:
+		c.handleKeyDelete(w, r)
 	case route == "stop" && r.Method == http.MethodPost:
 		c.handleStop(w)
 	default:
@@ -165,6 +179,80 @@ func (c *Control) handleStats(w http.ResponseWriter) {
 		ips = []store.IPStat{}
 	}
 	writeJSON(w, http.StatusOK, Stats{Days: days, IPs: ips})
+}
+
+// handleKeysList serves GET /_zenctl/keys: the pool file's key
+// fingerprints (sorted, deduped), never raw keys. A missing pool file
+// reports an empty list, not an error.
+func (c *Control) handleKeysList(w http.ResponseWriter) {
+	if c.KeyPoolFile == "" {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "key pool file not configured"})
+		return
+	}
+	fps, err := keys.FingerprintSorted(c.KeyPoolFile)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if fps == nil {
+		fps = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": fps})
+}
+
+// handleKeyAdd serves POST /_zenctl/keys {"key": "<raw>"}: appends the
+// raw key to the pool file and answers its fingerprint. The raw key
+// travels only in the loopback request body and the file itself — the
+// response never echoes it.
+func (c *Control) handleKeyAdd(w http.ResponseWriter, r *http.Request) {
+	if c.KeyPoolFile == "" {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "key pool file not configured"})
+		return
+	}
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	fp, err := keys.AddFileKey(c.KeyPoolFile, strings.TrimSpace(req.Key))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"fingerprint": fp})
+}
+
+// handleKeyDelete serves POST /_zenctl/keys/delete {"fingerprint": fp}:
+// removes the matching pool-file key. ErrKeyNotFound reports 404 (the
+// TUI refetches and drops the stale row).
+func (c *Control) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
+	if c.KeyPoolFile == "" {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "key pool file not configured"})
+		return
+	}
+	var req struct {
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Fingerprint == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "fingerprint required"})
+		return
+	}
+	err := keys.RemoveFileKey(c.KeyPoolFile, req.Fingerprint)
+	if errors.Is(err, keys.ErrKeyNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 // fingerprintKeys replaces every raw API key in state.keys with a display
