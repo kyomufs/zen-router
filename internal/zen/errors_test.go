@@ -347,15 +347,21 @@ func TestClassifyMalformed(t *testing.T) {
 	})
 
 	t.Run("429 without gateway envelope", func(t *testing.T) {
-		// The gateway always types its 429s (spec §4); an untyped 429 is
-		// anomalous and falls into the 4xx catch-all rather than being
-		// guessed as a key-lane limit.
+		// A plain 429 carries no quota evidence: classified as the IP
+		// lane limit (KindIPLimit), retryable so the warp lane may rotate
+		// the egress identity — never guessed as a daily quota.
 		got := Classify(429, nil, "")
 		if got == nil {
 			t.Fatal("Classify returned nil, want *UpstreamError")
 		}
-		if got.Kind != KindClient {
-			t.Errorf("Kind = %v, want KindClient (status fallback 4xx catch-all)", got.Kind)
+		if got.Kind != KindIPLimit {
+			t.Errorf("Kind = %v, want KindIPLimit (bare 429 = ip lane)", got.Kind)
+		}
+		if !got.IsRetryable() {
+			t.Error("IsRetryable = false, want true (ip lane may rotate)")
+		}
+		if got.RetryAfter != 60*time.Second {
+			t.Errorf("RetryAfter = %v, want 60s default", got.RetryAfter)
 		}
 	})
 

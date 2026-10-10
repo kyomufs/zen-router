@@ -35,7 +35,11 @@ const peekLimit = 8 << 10
 type Egress string
 
 const (
+	// EgressDirect is the normal system path (FlClash TUN).
 	EgressDirect Egress = "direct"
+	// EgressWarp is the WARP SOCKS5 lane (warp-cli proxy mode on
+	// 127.0.0.1:40000): same gateway, different egress IP.
+	EgressWarp Egress = "warp"
 )
 
 // peekBody tees the first peekLimit bytes so the proxy can sniff the gateway's

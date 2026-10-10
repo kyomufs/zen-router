@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -107,6 +108,18 @@ type Config struct {
 	// populate status.egress_ip. Default false — §12 gate: the live call
 	// exists only after explicit user opt-in, never by default.
 	EgressIPEcho bool `json:"egressIPEcho"`
+	// Warp is the WARP egress-lane config (disabled by default: the lane
+	// only stages a warp attempt for rate-limit 429s when Enabled).
+	Warp WarpConfig `json:"warp"`
+}
+
+// WarpConfig is the on-disk "warp" section of config.json. Socks and CLI
+// fall back to the warp package defaults ("127.0.0.1:40000", "warp-cli")
+// when empty.
+type WarpConfig struct {
+	Enabled bool   `json:"enabled"`
+	Socks   string `json:"socks,omitempty"`
+	CLI     string `json:"cli,omitempty"`
 }
 
 // Default returns the built-in configuration defaults.
@@ -150,6 +163,11 @@ type rawConfig struct {
 	IdleTimeout          *string `json:"idleTimeout"`
 	ResponsesIdleTimeout *string `json:"responsesIdleTimeout"`
 	EgressIPEcho         *bool   `json:"egressIPEcho"`
+	Warp                 *struct {
+		Enabled *bool   `json:"enabled"`
+		Socks   *string `json:"socks"`
+		CLI     *string `json:"cli"`
+	} `json:"warp"`
 }
 
 func (r *rawConfig) apply(cfg *Config) error {
@@ -171,6 +189,17 @@ func (r *rawConfig) apply(cfg *Config) error {
 	}
 	if r.EgressIPEcho != nil {
 		cfg.EgressIPEcho = *r.EgressIPEcho
+	}
+	if r.Warp != nil {
+		if r.Warp.Enabled != nil {
+			cfg.Warp.Enabled = *r.Warp.Enabled
+		}
+		if r.Warp.Socks != nil {
+			cfg.Warp.Socks = *r.Warp.Socks
+		}
+		if r.Warp.CLI != nil {
+			cfg.Warp.CLI = *r.Warp.CLI
+		}
 	}
 	durations := []struct {
 		name string
@@ -241,6 +270,16 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("ZEN_ROUTER_FAMILY: %w", ferr)
 		}
 		cfg.Family = family
+	}
+	// ZEN_ROUTER_WARP toggles the warp lane without touching config.json
+	// ("1"/"true" enables, "0"/"false" disables, empty leaves the file
+	// value). The lane stays OFF unless explicitly enabled either way.
+	if v := os.Getenv("ZEN_ROUTER_WARP"); v != "" {
+		b, perr := strconv.ParseBool(v)
+		if perr != nil {
+			return nil, fmt.Errorf("ZEN_ROUTER_WARP: %w", perr)
+		}
+		cfg.Warp.Enabled = b
 	}
 	return cfg, nil
 }

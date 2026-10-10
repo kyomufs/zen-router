@@ -100,7 +100,14 @@ CREATE TABLE IF NOT EXISTS requests(
 	kind   TEXT    NOT NULL  -- "ok" | "429"
 );
 CREATE INDEX IF NOT EXISTS idx_requests_day ON requests(day);
-CREATE INDEX IF NOT EXISTS idx_requests_ip ON requests(ip);`
+CREATE INDEX IF NOT EXISTS idx_requests_ip ON requests(ip);
+CREATE TABLE IF NOT EXISTS warp_rotations(
+	id  INTEGER PRIMARY KEY,
+	ts  INTEGER NOT NULL, -- unix ms at rotation time
+	day TEXT    NOT NULL, -- YYYY-MM-DD (local)
+	ip  TEXT    NOT NULL  -- the new lane egress IP
+);
+CREATE INDEX IF NOT EXISTS idx_warp_rotations_day ON warp_rotations(day);`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: create schema: %w", err)
@@ -212,6 +219,46 @@ SELECT ip,
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// RecordWarpRotation appends one WARP identity-rotation event with the new
+// lane egress IP. Nil-safe and failure-tolerant like Record.
+func (s *Store) RecordWarpRotation(ip string) error {
+	if s == nil {
+		return nil
+	}
+	now := time.Now()
+	_, err := s.db.Exec(
+		`INSERT INTO warp_rotations(ts, day, ip) VALUES(?, ?, ?)`,
+		now.UnixMilli(), now.Format("2006-01-02"), ip,
+	)
+	if err != nil {
+		return fmt.Errorf("store: record warp rotation: %w", err)
+	}
+	return nil
+}
+
+// WarpRotationStat aggregates WARP rotations over the query window.
+type WarpRotationStat struct {
+	Count  int64  `json:"count"`
+	Last   int64  `json:"last"` // unix ms of the most recent rotation, 0 = none
+	LastIP string `json:"last_ip,omitempty"`
+}
+
+// WarpRotations summarizes recorded WARP rotations within the last `days`
+// local calendar days.
+func (s *Store) WarpRotations(days int) (WarpRotationStat, error) {
+	var out WarpRotationStat
+	if s == nil {
+		return out, nil
+	}
+	row := s.db.QueryRow(
+		`SELECT COUNT(*), COALESCE(MAX(ts), 0), COALESCE((SELECT ip FROM warp_rotations ORDER BY ts DESC LIMIT 1), '')
+		   FROM warp_rotations WHERE day >= ?`, cutoffDay(days))
+	if err := row.Scan(&out.Count, &out.Last, &out.LastIP); err != nil {
+		return out, fmt.Errorf("store: warp rotations: %w", err)
+	}
+	return out, nil
 }
 
 // Close releases the database handle (nil-safe).

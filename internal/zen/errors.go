@@ -30,6 +30,11 @@ const (
 	KindDailyLimit
 	// KindKeyRateLimit is the per-key request-rate 429 (RateLimitError).
 	KindKeyRateLimit
+	// KindIPLimit is a plain/untyped 429: no gateway error.type, no quota
+	// marker — treated as an egress-IP limit (the alztrk classifier's
+	// "429 with no quota evidence" case). Retryable: the rotator may swap
+	// the WARP lane's IP, unlike KindClient where a retry is pointless.
+	KindIPLimit
 	// KindAuth is a credential/account rejection
 	// (AuthError, CreditsError, MonthlyLimitError, UserLimitError, bare 401).
 	KindAuth
@@ -60,6 +65,8 @@ func (k Kind) String() string {
 		return "daily_limit"
 	case KindKeyRateLimit:
 		return "key_rate_limit"
+	case KindIPLimit:
+		return "ip_limit"
 	case KindAuth:
 		return "auth"
 	case KindModel:
@@ -133,15 +140,15 @@ func (e *UpstreamError) Error() string {
 }
 
 // IsRetryable reports whether the request may be re-issued (after rotation
-// or backoff) rather than surfaced as terminal. Daily/key/server/relay
-// failures rotate or wait; auth/model/region/client failures are terminal
-// for this attempt. Safe on a nil receiver.
+// or backoff) rather than surfaced as terminal. Daily/key/IP-limit/server/
+// relay failures rotate or wait; auth/model/region/client failures are
+// terminal for this attempt. Safe on a nil receiver.
 func (e *UpstreamError) IsRetryable() bool {
 	if e == nil {
 		return false
 	}
 	switch e.Kind {
-	case KindDailyLimit, KindKeyRateLimit, KindServer, KindProviderRelay, KindTransport:
+	case KindDailyLimit, KindKeyRateLimit, KindIPLimit, KindServer, KindProviderRelay, KindTransport:
 		return true
 	default:
 		return false
@@ -165,9 +172,10 @@ func (e *UpstreamError) IsRetryable() bool {
 //     relayed "Error from provider (Name): {…}" prefix so Type carries the
 //     raw upstream class even for relays;
 //  3. relay marker "Error from provider" → KindProviderRelay (status kept);
-//  4. status fallback: 5xx → KindServer, 401 → KindAuth, other → KindClient
-//     (a generic 403 is NOT a region gate — KindRegion requires the
-//     RegionError/DataPolicyError type).
+//  4. status fallback: 5xx → KindServer, 401 → KindAuth, 429 → KindIPLimit
+//     (plain 429 = IP-lane signal), other → KindClient (a generic 403 is
+//     NOT a region gate — KindRegion requires the RegionError/DataPolicyError
+//     type).
 //
 // 1xx/2xx returns nil (KindNone: not an error). The spec §4 trap holds by
 // construction: a 401 with error.type ModelError classifies in step 2 as
@@ -177,9 +185,8 @@ func (e *UpstreamError) IsRetryable() bool {
 // digits only, a decimal like 1.5 does not parse — or an RFC1123
 // HTTP-date, both clamped to a minimum of 1s like the plugin's
 // parseRetryAfter). When the header is absent or unparsable: KindDailyLimit
-// synthesizes seconds to the next UTC midnight (spec §4 line 161), a
-// KindKeyRateLimit defaults to 60s (key lane, 1000 req/min), everything
-// else stays 0.
+// synthesizes seconds to the next UTC midnight (spec §4 line 161),
+// KindKeyRateLimit and KindIPLimit default to 60s, everything else stays 0.
 func Classify(status int, body []byte, retryAfterHeader string) *UpstreamError {
 	return classify(time.Now(), status, body, retryAfterHeader)
 }
@@ -220,6 +227,8 @@ func classify(now time.Time, status int, body []byte, retryAfterHeader string) *
 			retry = secondsToUTCMidnight(now)
 		case KindKeyRateLimit:
 			retry = 60 * time.Second
+		case KindIPLimit:
+			retry = 60 * time.Second
 		}
 	}
 	return &UpstreamError{
@@ -233,16 +242,20 @@ func classify(now time.Time, status int, body []byte, retryAfterHeader string) *
 
 // kindByStatus is the fallback used when neither the daily regex nor a
 // known error.type applied: 5xx → server, 401 → auth (bare 401 = real auth
-// rejection, mirroring the plugin's INVALID_CREDENTIAL), everything else →
-// client catch-all. A bare 429 lands in the catch-all: the gateway always
-// types its 429s (spec §4), so an untyped one is anomalous — and guessing
-// key-lane there would fabricate a window the daemon does not know.
+// rejection, mirroring the plugin's INVALID_CREDENTIAL), a bare 429 → the
+// IP-limit kind (no quota evidence: the alztrk classifier treats a plain
+// 429 as an egress-IP rate block, the one case a WARP lane swap can fix),
+// everything else → client catch-all. The gateway always types its 429s
+// (spec §4), so an untyped one is anomalous — but unlike the client
+// catch-all it is still worth a lane rotation before surfacing.
 func kindByStatus(status int) Kind {
 	switch {
 	case status >= 500:
 		return KindServer
 	case status == 401:
 		return KindAuth
+	case status == 429:
+		return KindIPLimit
 	default:
 		return KindClient
 	}

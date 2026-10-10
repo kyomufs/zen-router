@@ -28,6 +28,7 @@ import (
 	"zen-router/internal/store"
 	"zen-router/internal/systemd"
 	"zen-router/internal/tui"
+	"zen-router/internal/warp"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -350,12 +351,31 @@ func cmdUp(args []string) error {
 	if poolFile == "" {
 		poolFile = filepath.Join(paths.ConfigDir, "pool-config.json")
 	}
+	// WARP egress lane (off unless config.warp.enabled): the manager is
+	// only built when enabled, so a disabled lane is a nil *warp.Manager
+	// the whole daemon treats as "no warp stage exists". Successful
+	// rotations land in the SQLite history for the stats views.
+	var warpLane *warp.Manager
+	if cfg.Warp.Enabled {
+		warpLane = warp.New(warp.Options{
+			Socks:  cfg.Warp.Socks,
+			CLI:    cfg.Warp.CLI,
+			Logger: logger,
+			OnRotated: func(ip string) {
+				if err := history.RecordWarpRotation(ip); err != nil {
+					logger.Printf("warn: warp rotation history: %v", err)
+				}
+			},
+		})
+		logger.Printf("warp lane enabled (socks=%s)", warpLane.Socks())
+	}
 	r, err := router.New(router.Options{
 		Store:   quotaState,
 		Logger:  logger,
 		Pool:    keys.New(poolFile),
 		Family:  cfg.Family,
 		History: history,
+		Warp:    warpLane,
 	})
 	if err != nil {
 		return err

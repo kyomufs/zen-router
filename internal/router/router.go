@@ -12,14 +12,22 @@ import (
 	"zen-router/internal/proxy"
 	"zen-router/internal/quota"
 	"zen-router/internal/store"
+	"zen-router/internal/warp"
 )
 
-// Router owns the egress decision. The gateway is DIRECT-ONLY: the single
-// rotation mechanism is the API key pool (stage-1 key rotation decided per
-// request by NextAttempt). The router itself never switches transports.
+// Router owns the egress decision. Stage 0 is always the DIRECT lane; a
+// classified 429 may stage-rotate either the API key (quota limits) or the
+// WARP identity lane (per-key/IP rate limits — see stage.go). The router
+// itself never switches transports mid-attempt: every attempt carries its
+// transport from NextAttempt.
 type Router struct {
 	log   *log.Logger
 	store *quota.Manager
+
+	// warp is the optional WARP SOCKS5 lane (nil = disabled lane; all
+	// warp paths are gated on r.warp != nil so tests and no-warp
+	// deployments keep the direct-only behavior).
+	warp *warp.Manager
 
 	// history is the SQLite request-event store feeding the TUI stats
 	// views (per-day / per-IP OK+429). Optional: nil disables history
@@ -49,9 +57,13 @@ type Options struct {
 	Family string
 	// History is the SQLite request-event store (nil = no history).
 	History *store.Store
+	// Warp is the WARP egress lane manager (nil = lane disabled; the
+	// stage machine then falls back to key rotation / surfacing).
+	Warp *warp.Manager
 }
 
-// New builds a Router on the direct lane.
+// New builds a Router: stage 0 always dials direct, opts.Warp only stages
+// an alternative lane for rate-limit 429s (nil = no warp lane).
 func New(opts Options) (*Router, error) {
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
@@ -70,11 +82,16 @@ func New(opts Options) (*Router, error) {
 		log:      opts.Logger,
 		store:    opts.Store,
 		history:  opts.History,
+		warp:     opts.Warp,
 		directRT: directTransportFor(opts.Family),
 		pool:     opts.Pool,
 		latency:  seedLatency(),
 	}, nil
 }
+
+// Warp exposes the WARP lane manager (nil when the lane is disabled) —
+// the control API's /_zenctl/warp routes read it from here.
+func (r *Router) Warp() *warp.Manager { return r.warp }
 
 // History exposes the SQLite request-event store for the control API
 // (GET /_zenctl/stats). May be nil when history recording is disabled.
@@ -131,6 +148,10 @@ func (r *Router) Current() proxy.Egress { return proxy.EgressDirect }
 
 // Store exposes the state manager for read-only commands.
 func (r *Router) Store() *quota.Manager { return r.store }
+
+// Log exposes the router's logger for control-layer messages (the warp
+// rotate handlers log async failures here).
+func (r *Router) Log() *log.Logger { return r.log }
 
 // OnResult is the proxy.ResultHook: it records outcomes. A daily-limit
 // observation stamps the spent window; it does NOT trigger any rotation —

@@ -16,6 +16,7 @@ import (
 	"zen-router/internal/quota"
 	"zen-router/internal/router"
 	"zen-router/internal/store"
+	"zen-router/internal/warp"
 )
 
 // ControlPrefix reserves a path namespace on the proxy listener for the CLI.
@@ -116,6 +117,10 @@ func (c *Control) serve(w http.ResponseWriter, r *http.Request) {
 		c.handleKeyDelete(w, r)
 	case route == "stop" && r.Method == http.MethodPost:
 		c.handleStop(w)
+	case route == "warp" && r.Method == http.MethodGet:
+		c.handleWarpStatus(w)
+	case route == "warp" && r.Method == http.MethodPost:
+		c.handleWarpRotate(w)
 	default:
 		http.Error(w, `{"error":"unknown control route"}`, http.StatusNotFound)
 	}
@@ -283,6 +288,46 @@ func (c *Control) handleStop(w http.ResponseWriter) {
 	if c.Shutdown != nil {
 		c.Shutdown()
 	}
+}
+
+// WarpStatus is the GET /_zenctl/warp payload: the live lane snapshot plus
+// the persisted rotation rollup from the SQLite history store (the daemon
+// stays the only component touching the database).
+type WarpStatus struct {
+	warp.Snapshot
+	Rotations30d store.WarpRotationStat `json:"rotations_30d"`
+}
+
+// handleWarpStatus reports the WARP lane state (GET /_zenctl/warp). A
+// daemon without a configured warp lane answers enabled=false rather than
+// an error, so the TUI can render a stable empty state.
+func (c *Control) handleWarpStatus(w http.ResponseWriter) {
+	st := WarpStatus{Snapshot: c.Router.Warp().Snapshot()}
+	if h := c.Router.History(); h != nil {
+		if roll, err := h.WarpRotations(StatsWindowDays); err == nil {
+			st.Rotations30d = roll
+		}
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// handleWarpRotate triggers one identity rotation (POST /_zenctl/warp).
+// The rotation runs asynchronously — warp-cli cycling takes seconds and
+// would otherwise hold the HTTP request open — and the response carries
+// the pre-rotation snapshot; poll GET /_zenctl/warp for the outcome.
+// 405 when the lane is not configured.
+func (c *Control) handleWarpRotate(w http.ResponseWriter) {
+	m := c.Router.Warp()
+	if m == nil {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "warp lane not configured"})
+		return
+	}
+	go func() {
+		if err := m.Rotate(); err != nil {
+			c.Router.Log().Printf("warp: manual rotation failed: %v", err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, m.Snapshot())
 }
 
 // ErrNotRunning is returned by client commands when the daemon is unreachable.

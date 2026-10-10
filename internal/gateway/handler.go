@@ -550,6 +550,11 @@ func errorClass(ue *zen.UpstreamError) string {
 		return "FreeUsageLimitError"
 	case zen.KindKeyRateLimit:
 		return "RateLimitError"
+	case zen.KindIPLimit:
+		// A plain 429 surfaced to the client: classified as an IP lane
+		// limit internally, but the wire type stays the OpenAI-compatible
+		// RateLimitError (clients retry on that class).
+		return "RateLimitError"
 	case zen.KindAuth:
 		return "AuthError"
 	case zen.KindModel:
