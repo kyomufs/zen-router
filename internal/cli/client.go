@@ -153,6 +153,35 @@ func (c *ControlClient) DeleteKey(ctx context.Context, fingerprint string) error
 	return err
 }
 
+// WarpStatus fetches the WARP lane snapshot (GET /_zenctl/warp). A daemon
+// without a configured lane answers enabled=false rather than an error.
+func (c *ControlClient) WarpStatus(ctx context.Context) (*WarpStatus, error) {
+	data, err := c.do(ctx, http.MethodGet, "warp", nil)
+	if err != nil {
+		return nil, err
+	}
+	var st WarpStatus
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("decode warp status: %w", err)
+	}
+	return &st, nil
+}
+
+// WarpRotate kicks one async identity rotation (POST /_zenctl/warp) and
+// returns the pre-rotation snapshot; poll WarpStatus for the new IP.
+// 405 (surfaced as an error) when the daemon has no lane configured.
+func (c *ControlClient) WarpRotate(ctx context.Context) (*WarpStatus, error) {
+	data, err := c.do(ctx, http.MethodPost, "warp", nil)
+	if err != nil {
+		return nil, err
+	}
+	var st WarpStatus
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("decode warp rotate: %w", err)
+	}
+	return &st, nil
+}
+
 // Stop asks the daemon to shut down gracefully.
 func (c *ControlClient) Stop(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodPost, "stop", nil)

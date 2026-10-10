@@ -53,6 +53,8 @@ func main() {
 		err = cmdInstallSystemd(args)
 	case "tui":
 		err = cmdTui(args)
+	case "warp":
+		err = cmdWarp(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -78,6 +80,10 @@ Usage:
                                          executable's foreground "up", then daemon-reload + enable --now;
                                          --remove disables (--now) and deletes the unit file
   zen-router tui     [--listen ADDR]     interactive control dashboard (1s poll of the control API)
+  zen-router warp    status|rotate [--listen ADDR]
+                                         manage the WARP egress lane: status shows the lane snapshot
+                                         (identity, IP, rotation counters), rotate kicks one async
+                                         identity rotation (warp lane must be enabled in config)
 
 OpenAI surface (on the same listener):
   GET /v1/models, POST /v1/chat/completions — OpenAI-compatible endpoints
@@ -481,7 +487,42 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("daemon: up\n")
 	printEgress(st.State)
+	printWarpLine(ctx, listen)
 	return nil
+}
+
+// printWarpLine appends one warp status line to `zen-router status`. Best
+// effort: an old daemon without the warp routes (404) simply skips the line.
+func printWarpLine(ctx context.Context, listen string) {
+	wst, err := cli.NewControlClient(listen).WarpStatus(ctx)
+	if err != nil || wst == nil {
+		return
+	}
+	fmt.Printf("warp: %s\n", formatWarp(wst))
+}
+
+// formatWarp renders one compact warp lane summary shared by `status` and
+// the bare `warp` command.
+func formatWarp(wst *cli.WarpStatus) string {
+	if wst == nil || !wst.Enabled {
+		return "disabled (set warp.enabled=true in config.json to arm the lane)"
+	}
+	connected := "disconnected"
+	if wst.Connected {
+		connected = "connected"
+	}
+	ip := wst.IP
+	if ip == "" {
+		ip = "?"
+	}
+	s := fmt.Sprintf("%s ip=%s rotations=%d", connected, ip, wst.Rotations)
+	if wst.Rotations30d.Count > 0 {
+		s += fmt.Sprintf(" (30d: %d)", wst.Rotations30d.Count)
+	}
+	if wst.LastError != "" {
+		s += " last_error=" + wst.LastError
+	}
+	return s
 }
 
 func printEgress(s quota.State) {
@@ -511,6 +552,56 @@ func cmdStop(args []string) error {
 	}
 	fmt.Println("stop requested")
 	return nil
+}
+
+// cmdWarp manages the WARP egress lane through the control API:
+//
+//	zen-router warp status  — lane snapshot (identity, IP, rotations)
+//	zen-router warp rotate  — kick one async identity rotation
+//
+// The lane itself must be enabled in config (warp.enabled / ZEN_ROUTER_WARP);
+// this command only inspects and drives it, never reconfigures.
+func cmdWarp(args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: zen-router warp status|rotate [--listen ADDR]")
+		return fmt.Errorf("missing warp subcommand (want status|rotate)")
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "status", "rotate":
+	default:
+		fmt.Fprintln(os.Stderr, "usage: zen-router warp status|rotate [--listen ADDR]")
+		return fmt.Errorf("unknown warp subcommand %q (want status|rotate)", sub)
+	}
+	listen, err := parseListen(rest)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c := cli.NewControlClient(listen)
+	switch sub {
+	case "status":
+		wst, err := c.WarpStatus(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("warp: %s\n", formatWarp(wst))
+		return nil
+	default: // "rotate"
+		wst, err := c.WarpRotate(ctx)
+		if err != nil {
+			return err
+		}
+		if wst == nil || !wst.Enabled {
+			// Lane disabled: the daemon answers 405, but keep the hint
+			// generic in case an older daemon mis-decodes.
+			return fmt.Errorf("warp lane not configured (set warp.enabled=true in config.json and restart the daemon)")
+		}
+		fmt.Println("rotation kicked (async); check `zen-router warp status` for the new IP")
+		return nil
+	}
 }
 
 // cmdInstallSystemd manages the systemd user unit (plan Task 8, spec §8,
